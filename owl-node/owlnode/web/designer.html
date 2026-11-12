@@ -45,7 +45,8 @@ body { background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -appl
 .node { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-width: 220px; font-size: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
 .node.selected, .react-flow__node.selected .node { outline: 2px solid var(--accent); }
 .node .hd { padding: 6px 10px; border-bottom: 1px solid var(--line); border-radius: 8px 8px 0 0; display: flex; align-items: baseline; gap: 6px; }
-.node .hd b { font-weight: 650; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node .hd b { font-weight: 650; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node .hd .badge, .node .hd .host { flex: none; }
 .node .hd .host { font-size: 10px; padding: 1px 6px; border-radius: 99px; color: #fff; }
 .node.hub .hd .host { background: var(--hub); } .node.sat .hd .host { background: var(--sat); } .node.proc .hd .host { background: var(--proc); }
 .node.down { opacity: .55; border-style: dashed; }
@@ -136,7 +137,7 @@ body { background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -appl
 }
 
 /* ---- Panels (D2): phone-first pages of named controls */
-.pan { display: flex; height: 100%; min-height: 0; }
+.pan { display: flex; height: 100%; min-height: 0; flex: 1; min-width: 0; }
 .pan .pages { width: 210px; border-right: 1px solid var(--line); padding: 10px; overflow: auto; background: var(--panel); flex: none; }
 .pan .body { flex: 1; overflow: auto; padding: 12px 14px; min-width: 0; }
 .pan .ctls { width: 290px; border-left: 1px solid var(--line); padding: 10px; overflow: auto; background: var(--panel); flex: none; }
@@ -202,7 +203,8 @@ body { background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -appl
 .names { font-size: 11px; color: var(--muted); } .names code { background: var(--hover); padding: 0 4px; border-radius: 3px; }
 @media (max-width: 800px) {
   .pan { flex-direction: column; }
-  .pan .pages { width: auto; border-right: 0; border-bottom: 1px solid var(--line); display: flex; gap: 4px; overflow-x: auto; padding: 6px 8px; }
+  .pan .pages { width: auto; min-width: 0; flex: none; border-right: 0; border-bottom: 1px solid var(--line); display: flex; gap: 4px; overflow-x: auto; padding: 6px 8px; }
+  .pan .body, .pan .ctls { min-width: 0; }
   .pan .pages h3 { display: none; } .pagebtn { width: auto; white-space: nowrap; }
   .pan .ctls { width: auto; border-left: 0; border-top: 1px solid var(--line); max-height: 42%; }
 }
@@ -602,8 +604,12 @@ function App() {
   const nodes = useMemo(() => {
     const counts = {};
     const layout = (design && design.layout) || {};
+    // auto-placed blocks never land on a position another block already holds (a remembered layout position and a
+    // fresh auto-placement in the same column used to stack two blocks exactly on top of each other)
+    const taken = blocks.map((b) => positions[b.id] || layout[b.id]).filter(Boolean);
+    const free = (p) => { let q = { ...p }; while (taken.some((t) => Math.abs(t.x - q.x) < 160 && Math.abs(t.y - q.y) < 120)) q = { x: q.x, y: q.y + 150 }; taken.push(q); return q; };
     return blocks.map((b, i) => {
-      const pos = positions[b.id] || layout[b.id] || autoPlace(b, i, counts, inv.hub);
+      const pos = positions[b.id] || layout[b.id] || free(autoPlace(b, i, counts, inv.hub));
       if (!layout[b.id] && !positions[b.id]) layout[b.id] = pos;
       const meters = {};
       for (const p of (b.kind === "proc" ? portsOf(types[b.type], b.params).inputs.concat(portsOf(types[b.type], b.params).outputs) : b.inputs.concat(b.outputs))) meters[p.id] = meterFor(b, p);

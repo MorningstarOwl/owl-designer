@@ -11,7 +11,7 @@
 name: owl-node
 
 x-node: &node
-  image: ${OWL_NODE_IMAGE:-owl-node:0.7.1}
+  image: ${OWL_NODE_IMAGE:-owl-node:0.7.2}
   network_mode: host
   user: "${OWL_UID:-1000}:${OWL_GID:-1000}"
   restart: ${OWL_RESTART:-no}   # install.sh --enable sets unless-stopped (comes back at boot); ask the household first

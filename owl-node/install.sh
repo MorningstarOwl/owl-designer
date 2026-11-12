@@ -41,7 +41,7 @@
 #   --ptp keep|grandmaster|follower|none   keep (default) = use the host's existing owl-ptp4l.service (N1's);
 #                          grandmaster/follower = install it like N1 does (L2 transport, hardware timestamps)
 #   --registry none        a node: drop the registry of an earlier install; the hub pairs it from the designer instead
-#   --image TAG            owl-node image already loaded on this host (default owl-node:0.7.1)
+#   --image TAG            owl-node image already loaded on this host (default owl-node:0.7.2)
 #   --mqtt URL             hub only (D2): Home Assistant over MQTT, mqtt://user:pass@host:1883 -> OWL_MQTT_URL in .env
 #                          (the dsp role publishes HA discovery for every control). Or write
 #                          /var/lib/owl-node/mqtt.json {host, port, username, password} instead; neither = bridge off
@@ -53,7 +53,7 @@
 # Never touches the host's PipeWire/WirePlumber daemons or their config.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.7.1 MQTT_URL=""
+NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.7.2 MQTT_URL=""
 TX=() RX=() VTX=() VRX=() VDEV=() DRY=0 REMOVE=0 ENABLE="" START=1 REPLACE_N1=0 YES=0 MODE="" BUILD=auto
 while [ $# -gt 0 ]; do
   case "$1" in
