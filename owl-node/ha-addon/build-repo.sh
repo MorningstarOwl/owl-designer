@@ -24,10 +24,17 @@ mkdir -p "$OUT"
 find "$OUT" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
 cp "$HERE/repository.yaml" "$OUT/"
 cp -r "$HERE/owl_designer" "$OUT/"
-A="$OUT/owl_designer/owlnode"
-mkdir -p "$A"
-cp "$SRC/owlnode/__init__.py" "$SRC/owlnode/__main__.py" "$SRC/owlnode/controller.py" "$A/"
-cp -r "$SRC/owlnode/web" "$A/"
+# The controller and its pages ship as ONE archive file (owlnode.tar.gz, unpacked by ADD in the Dockerfile): Home
+# Assistant's Supervisor (2026.11) built the add-on from a checkout that had the folder's top-level files but not its
+# subfolders, so a COPY of an owlnode/ folder failed there ("/owlnode": not found). Deterministic (sorted, fixed mtime
+# and owner) so an unchanged controller gives an unchanged file and no spurious commit.
+STAGE=$(mktemp -d)
+mkdir -p "$STAGE/owlnode"
+cp "$SRC/owlnode/__init__.py" "$SRC/owlnode/__main__.py" "$SRC/owlnode/controller.py" "$STAGE/owlnode/"
+cp -r "$SRC/owlnode/web" "$STAGE/owlnode/"
+find "$STAGE" -name __pycache__ -prune -exec rm -rf {} +
+tar -C "$STAGE" --sort=name --mtime=2026-01-01 --owner=0 --group=0 --numeric-owner -cf - owlnode | gzip -n -9 > "$OUT/owl_designer/owlnode.tar.gz"
+rm -rf "$STAGE"
 find "$OUT" -name __pycache__ -prune -exec rm -rf {} +
 echo "assembled $OUT (owl_designer $VERSION)"
 
