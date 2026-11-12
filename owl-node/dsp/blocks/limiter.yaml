@@ -1,0 +1,31 @@
+# Limiter: Steve Harris's Fast Lookahead Limiter (swh-plugins, LADSPA fast_lookahead_limiter_1913), stereo, ~5 ms
+# lookahead. Put it last before a speaker: nothing above `limit_db` gets through.
+type: limiter
+label: Limiter
+group: Dynamics
+description: Stereo brick-wall limiter with lookahead. Input gain, ceiling and release, all live.
+inputs:
+  - {id: in, label: in, channels: 2}
+outputs:
+  - {id: out, label: out, channels: 2}
+params:
+  input_gain_db: {label: Input gain (dB), type: number, default: 0, min: -20, max: 20, step: 0.5, unit: dB}
+  limit_db: {label: Ceiling (dB), type: number, default: -1, min: -20, max: 0, step: 0.5, unit: dB}
+  release_s: {label: Release (s), type: number, default: 0.1, min: 0.01, max: 2, step: 0.01, unit: s}
+engine: pipewire
+restart_on: []
+plugin:
+  type: ladspa
+  plugin: fast_lookahead_limiter_1913
+  label: fastLookaheadLimiter
+  audio_in: ["Input 1", "Input 2"]
+  audio_out: ["Output 1", "Output 2"]
+  controls:
+    "Input gain (dB)": "${p.input_gain_db}"
+    "Limit (dB)": "${p.limit_db}"
+    "Release time (s)": "${p.release_s}"
+test:
+  stimulus: {freq_hz: 1000, level_db: -6}
+  cases:
+    - {name: "ceiling 0 passes", params: {limit_db: 0}, expect: {rms_db: -9, tol: 1.5}}
+    - {name: "ceiling -20 holds the peak", params: {limit_db: -20}, expect: {peak_max_db: -19}}

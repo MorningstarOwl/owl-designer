@@ -1,0 +1,34 @@
+name: Owl Designer
+version: "0.7.1"
+slug: owl_designer
+description: >-
+  A Q-SYS-style designer for the audio of your whole house: every speaker,
+  microphone and app on every owl-node machine on one canvas, wired by drag
+  and drop, with DSP blocks, echo cancellation for a voice satellite, and
+  Home Assistant controls. This add-on runs the designer; the audio engine
+  runs on a machine you choose.
+url: https://github.com/MorningstarOwl/owl-designer
+arch:
+  - aarch64
+  - amd64
+init: false
+
+# The sidebar panel: Home Assistant signs people in (admins only, Home Assistant's default for add-on panels:
+# the designer changes the house's audio).
+ingress: true
+ingress_port: 8361
+panel_icon: mdi:sine-wave
+panel_title: Owl Designer
+
+# Optional: the designer on the network without a Home Assistant login. Off unless a port is set in the
+# Network section.
+ports:
+  8361/tcp: null
+ports_description:
+  8361/tcp: "Designer on your network without the Home Assistant login (optional)"
+
+options:
+  engine_url: ""
+schema:
+  engine_url: str
+  registry_url: str?

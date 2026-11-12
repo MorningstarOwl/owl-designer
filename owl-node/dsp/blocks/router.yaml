@@ -1,0 +1,67 @@
+# Router: 4 stereo inputs, one selected to the output: a mixer whose gains are 1 for the selected input and 0 for the
+# rest, switched live. Same layout as the mixer (one 8-channel sink, inputs are channel pairs).
+type: router
+label: Router 4:1
+group: Routing
+description: Selects one of four stereo inputs (live).
+inputs:
+  - {id: in1, label: in 1, channels: 2}
+  - {id: in2, label: in 2, channels: 2}
+  - {id: in3, label: in 3, channels: 2}
+  - {id: in4, label: in 4, channels: 2}
+outputs:
+  - {id: out, label: out, channels: 2}
+params:
+  select: {label: Selected input, type: select, options: ["1", "2", "3", "4"], default: "1", live: true}
+engine: pipewire
+restart_on: []
+nodes:
+  in1: {node: "owl-${id}-in", dir: in, ports: [0, 1]}
+  in2: {node: "owl-${id}-in", dir: in, ports: [2, 3]}
+  in3: {node: "owl-${id}-in", dir: in, ports: [4, 5]}
+  in4: {node: "owl-${id}-in", dir: in, ports: [6, 7]}
+  out: {node: "owl-${id}-out", dir: out}
+controls:
+  - {node: in1, control: "mL:Gain 1", value: "${eq:p.select:1:1:0}"}
+  - {node: in1, control: "mR:Gain 1", value: "${eq:p.select:1:1:0}"}
+  - {node: in1, control: "mL:Gain 2", value: "${eq:p.select:2:1:0}"}
+  - {node: in1, control: "mR:Gain 2", value: "${eq:p.select:2:1:0}"}
+  - {node: in1, control: "mL:Gain 3", value: "${eq:p.select:3:1:0}"}
+  - {node: in1, control: "mR:Gain 3", value: "${eq:p.select:3:1:0}"}
+  - {node: in1, control: "mL:Gain 4", value: "${eq:p.select:4:1:0}"}
+  - {node: in1, control: "mR:Gain 4", value: "${eq:p.select:4:1:0}"}
+conf: |
+  { name = libpipewire-module-filter-chain
+      args = {
+          node.description = "${label}"
+          media.name = "${label}"
+          filter.graph = {
+              nodes = [
+                  { type = builtin name = mL label = mixer control = { "Gain 1" = ${eq:p.select:1:1:0} "Gain 2" = ${eq:p.select:2:1:0} "Gain 3" = ${eq:p.select:3:1:0} "Gain 4" = ${eq:p.select:4:1:0} } }
+                  { type = builtin name = mR label = mixer control = { "Gain 1" = ${eq:p.select:1:1:0} "Gain 2" = ${eq:p.select:2:1:0} "Gain 3" = ${eq:p.select:3:1:0} "Gain 4" = ${eq:p.select:4:1:0} } }
+              ]
+              inputs = [ "mL:In 1" "mR:In 1" "mL:In 2" "mR:In 2" "mL:In 3" "mR:In 3" "mL:In 4" "mR:In 4" ]
+              outputs = [ "mL:Out" "mR:Out" ]
+          }
+          capture.props = {
+              node.name = "owl-${id}-in"
+              node.description = "${label}: inputs"
+              media.class = Audio/Sink
+              audio.channels = 8
+              audio.position = [ AUX0 AUX1 AUX2 AUX3 AUX4 AUX5 AUX6 AUX7 ]
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+          playback.props = {
+              node.name = "owl-${id}-out"
+              node.description = "${label}: out"
+              media.class = Audio/Source
+              audio.channels = 2
+              audio.position = [ FL FR ]
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+      }
+  }

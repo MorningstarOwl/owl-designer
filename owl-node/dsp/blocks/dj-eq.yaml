@@ -1,0 +1,30 @@
+# The smallest example of "a new plugin is a new file": Steve Harris's DJ EQ (swh-plugins, LADSPA dj_eq_1901), stereo,
+# three bands. Copy this file, change plugin/label/port names (analyseplugin /usr/lib/ladspa/X.so lists them) and
+# the params, and the block is in the palette with live controls, meters and HA entities. LSP's LADSPA builds
+# (/usr/lib/ladspa/lsp-plugins-ladspa.so, labels are URIs like http://lsp-plug.in/plugins/ladspa/compressor_stereo)
+# wrap the same way.
+type: dj-eq
+label: DJ EQ
+group: EQ
+description: Three-band EQ (lo/mid/hi), live. The template for wrapping any LADSPA plugin.
+inputs:
+  - {id: in, label: in, channels: 2}
+outputs:
+  - {id: out, label: out, channels: 2}
+params:
+  lo_db: {label: Lo (dB), type: number, default: 0, min: -24, max: 6, step: 0.5, unit: dB}
+  mid_db: {label: Mid (dB), type: number, default: 0, min: -24, max: 6, step: 0.5, unit: dB}
+  hi_db: {label: Hi (dB), type: number, default: 0, min: -24, max: 6, step: 0.5, unit: dB}
+engine: pipewire
+plugin:
+  type: ladspa
+  plugin: dj_eq_1901
+  label: dj_eq
+  audio_in: ["Input L", "Input R"]
+  audio_out: ["Output L", "Output R"]
+  controls: {"Lo gain (dB)": "${p.lo_db}", "Mid gain (dB)": "${p.mid_db}", "Hi gain (dB)": "${p.hi_db}"}
+test:
+  stimulus: {freq_hz: 1000, level_db: -30}
+  cases:
+    - {name: "flat passes", params: {}, expect: {rms_db: -33, tol: 1.5}}
+    - {name: "mid -12 dB", params: {mid_db: -12}, expect: {rms_db: -45, tol: 3}}

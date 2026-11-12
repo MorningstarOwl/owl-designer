@@ -1,0 +1,41 @@
+# Compressor: Steve Harris's SC4 (swh-plugins, LADSPA sc4_1882), stereo, RMS or peak detection. Every param is a
+# live filter-chain control. Written with the `plugin:` shorthand: nodes, controls and config are generated.
+type: compressor
+label: Compressor
+group: Dynamics
+description: "Stereo compressor (SC4): threshold, ratio, knee, attack/release, makeup. All live."
+inputs:
+  - {id: in, label: in, channels: 2}
+outputs:
+  - {id: out, label: out, channels: 2}
+params:
+  threshold_db: {label: Threshold (dB), type: number, default: -20, min: -30, max: 0, step: 0.5, unit: dB}
+  ratio: {label: Ratio (1:n), type: number, default: 4, min: 1, max: 20, step: 0.1}
+  knee_db: {label: Knee (dB), type: number, default: 3, min: 1, max: 10, step: 0.25, unit: dB}
+  attack_ms: {label: Attack (ms), type: number, default: 30, min: 1.5, max: 400, step: 0.5, unit: ms}
+  release_ms: {label: Release (ms), type: number, default: 200, min: 2, max: 800, step: 1, unit: ms}
+  makeup_db: {label: Makeup gain (dB), type: number, default: 0, min: 0, max: 24, step: 0.5, unit: dB}
+  detector: {label: Detector, type: select, options: ["RMS", "Peak"], default: "RMS"}
+engine: pipewire
+restart_on: []
+plugin:
+  type: ladspa
+  plugin: sc4_1882
+  label: sc4
+  audio_in: ["Left input", "Right input"]
+  audio_out: ["Left output", "Right output"]
+  controls:
+    "RMS/peak": "${eq:p.detector:Peak:1:0}"
+    "Attack time (ms)": "${p.attack_ms}"
+    "Release time (ms)": "${p.release_ms}"
+    "Threshold level (dB)": "${p.threshold_db}"
+    "Ratio (1:n)": "${p.ratio}"
+    "Knee radius (dB)": "${p.knee_db}"
+    "Makeup gain (dB)": "${p.makeup_db}"
+# scripts/checks/dsp-blocks.py: a Test Tone into `in`, the block's output level read from its meter tap
+test:
+  stimulus: {freq_hz: 1000, level_db: -10}        # a -10 dBFS sine has -13 dBFS rms
+  cases:
+    - {name: "ratio 1 passes", params: {ratio: 1, threshold_db: -30, knee_db: 1}, expect: {rms_db: -13, tol: 1.5}}
+    - {name: "17 dB over threshold at 4:1 -> about 13 dB reduction", params: {ratio: 4, threshold_db: -30, knee_db: 1, attack_ms: 1.5},
+       expect: {rms_db: -26, tol: 3}}

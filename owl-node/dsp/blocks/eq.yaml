@@ -1,0 +1,57 @@
+# Parametric EQ: Steve Harris's Triple-band parametric with shelves (swh-plugins, LADSPA triple_para_1204), one mono
+# instance per channel (per_channel), so every band is identical on L and R. Low shelf, three peaking bands
+# (gain, frequency, bandwidth in octaves), high shelf. All live.
+type: eq
+label: Parametric EQ
+group: EQ
+description: Low shelf + 3 parametric bands + high shelf, per channel. All live.
+inputs:
+  - {id: in, label: in, channels: $p.channels}
+outputs:
+  - {id: out, label: out, channels: $p.channels}
+params:
+  ls_gain_db: {label: Low shelf gain (dB), type: number, default: 0, min: -24, max: 12, step: 0.5, unit: dB}
+  ls_freq_hz: {label: Low shelf freq (Hz), type: number, default: 120, min: 20, max: 1000, step: 1, unit: Hz}
+  b1_gain_db: {label: Band 1 gain (dB), type: number, default: 0, min: -24, max: 12, step: 0.5, unit: dB}
+  b1_freq_hz: {label: Band 1 freq (Hz), type: number, default: 250, min: 20, max: 20000, step: 1, unit: Hz}
+  b1_bw_oct: {label: Band 1 width (oct), type: number, default: 1, min: 0.1, max: 4, step: 0.1}
+  b2_gain_db: {label: Band 2 gain (dB), type: number, default: 0, min: -24, max: 12, step: 0.5, unit: dB}
+  b2_freq_hz: {label: Band 2 freq (Hz), type: number, default: 1000, min: 20, max: 20000, step: 1, unit: Hz}
+  b2_bw_oct: {label: Band 2 width (oct), type: number, default: 1, min: 0.1, max: 4, step: 0.1}
+  b3_gain_db: {label: Band 3 gain (dB), type: number, default: 0, min: -24, max: 12, step: 0.5, unit: dB}
+  b3_freq_hz: {label: Band 3 freq (Hz), type: number, default: 4000, min: 20, max: 20000, step: 1, unit: Hz}
+  b3_bw_oct: {label: Band 3 width (oct), type: number, default: 1, min: 0.1, max: 4, step: 0.1}
+  hs_gain_db: {label: High shelf gain (dB), type: number, default: 0, min: -24, max: 12, step: 0.5, unit: dB}
+  hs_freq_hz: {label: High shelf freq (Hz), type: number, default: 8000, min: 1000, max: 20000, step: 1, unit: Hz}
+  channels: {label: Channels, type: int, default: 2, min: 1, max: 2}
+engine: pipewire
+restart_on: [channels]
+plugin:
+  type: ladspa
+  plugin: triple_para_1204
+  label: triplePara
+  per_channel: true
+  audio_in: ["Input"]
+  audio_out: ["Output"]
+  controls:
+    "Low-shelving gain (dB)": "${p.ls_gain_db}"
+    "Low-shelving frequency (Hz)": "${p.ls_freq_hz}"
+    "Low-shelving slope": "0.5"
+    "Band 1 gain (dB)": "${p.b1_gain_db}"
+    "Band 1 frequency (Hz)": "${p.b1_freq_hz}"
+    "Band 1 bandwidth (octaves)": "${p.b1_bw_oct}"
+    "Band 2 gain (dB)": "${p.b2_gain_db}"
+    "Band 2 frequency (Hz)": "${p.b2_freq_hz}"
+    "Band 2 bandwidth (octaves)": "${p.b2_bw_oct}"
+    "Band 3 gain (dB)": "${p.b3_gain_db}"
+    "Band 3 frequency (Hz)": "${p.b3_freq_hz}"
+    "Band 3 bandwidth (octaves)": "${p.b3_bw_oct}"
+    "High-shelving gain (dB)": "${p.hs_gain_db}"
+    "High-shelving frequency (Hz)": "${p.hs_freq_hz}"
+    "High-shelving slope": "0.5"
+test:
+  stimulus: {freq_hz: 1000, level_db: -30}
+  cases:
+    - {name: "flat passes", params: {}, expect: {rms_db: -33, tol: 1.5}}
+    - {name: "band 2 +12 dB at 1 kHz", params: {b2_gain_db: 12, b2_freq_hz: 1000, b2_bw_oct: 1}, expect: {rms_db: -21, tol: 2}}
+    - {name: "band 2 -12 dB at 1 kHz", params: {b2_gain_db: -12, b2_freq_hz: 1000, b2_bw_oct: 1}, expect: {rms_db: -45, tol: 2}}

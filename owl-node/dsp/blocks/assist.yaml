@@ -1,0 +1,20 @@
+# Voice assistant: the hub's Home Assistant voice satellite (Wyoming, owlnode/dsp/voice.py) as a block (engine voice).
+# No PipeWire process of its own. The two wires ARE its configuration:
+#   listen  what the assistant hears: wire the AEC's "clean mic" here (or any source, e.g. a mic for a quick test).
+#           The satellite records it with pw-record --target <that node> while the mic is live (wake word or PTT).
+#   reply   where its spoken answers and the wake cue play: wire it to the ducker's "sidechain" so the music dips,
+#           or straight to a speaker.
+# Hub only, at most one per design. A design without this block falls back to the old guess (the first block output
+# named owl-*-clean and the first owl-*-sc), and the Deploy dialog says so.
+type: assist
+label: Voice assistant
+group: Voice
+description: Home Assistant voice satellite (wake word chosen in HA). Wire what it should hear into "listen" (the AEC's clean mic) and "reply" to where answers play (the ducker's sidechain).
+engine: voice
+inputs:
+  - {id: listen, label: "listen (clean mic)", channels: 1}
+outputs:
+  - {id: reply, label: "reply (spoken answers)", channels: 1}
+params: {}
+restart_on: []
+nodes: {}

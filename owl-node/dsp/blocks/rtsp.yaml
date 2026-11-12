@@ -1,0 +1,30 @@
+# RTSP source: a network camera (or any RTSP stream) as a block (engine rtsp, hub only).
+#   audio  the stream's audio as a PipeWire source on the hub (owl-<id>-audio): wire it anywhere (meters, DSP, speakers,
+#          the AEC reference, the probe). owlnode/dsp/rtsp_audio.py pulls only the audio track, decodes it (AAC, G.711,
+#          Opus...) and is restarted by the deployer when the camera drops.
+#   video  pulled once by the hub's MediaMTX (path owl-cam-<id>) and re-served over SRT (MPEG-TS): wire it to any SRT
+#          video receiver (pinode's, PCNode's...): the deployer patches the receiver over IS-05 with a transport file
+#          that names MediaMTX's SRT read path. The designer previews it over WebRTC.
+# The URL holds credentials (UniFi Protect: the path is an access token): it is never logged, never a Home Assistant
+# entity, and shown masked in the designer.
+type: rtsp
+label: RTSP source
+group: Sources
+description: A network camera or any RTSP stream. Its audio is a source you can wire anywhere; its video can be previewed and routed to video receivers.
+engine: rtsp
+inputs: []
+outputs:
+  - {id: audio, label: audio, channels: 2}
+  - {id: video, label: video, media: video}
+params:
+  url: {label: RTSP URL, type: text, secret: true, default: "",
+        help: "rtsp://user:password@camera-ip:554/stream, or rtsps:// (self-signed certificates are fine: the hub pins the certificate's fingerprint on Deploy; redeploy after the camera's certificate changes). UniFi Protect: enable RTSP for the camera and paste its rtsps:// (7441) or rtsp:// (7447) link."}
+  audio: {label: Audio, type: bool, default: true}
+  video: {label: Video, type: bool, default: true}
+  latency_ms: {label: Latency (ms), type: int, default: 200, min: 50, max: 2000, step: 10,
+               help: "Jitter buffer for the audio pull and SRT latency for the video relay"}
+  video_codec: {label: Video codec, type: select, default: auto, options: [auto, h264, h265],
+                help: "auto = what the camera sends (read from MediaMTX)"}
+restart_on: [url, audio, latency_ms]
+nodes:
+  audio: {node: "owl-${id}-audio", dir: out}

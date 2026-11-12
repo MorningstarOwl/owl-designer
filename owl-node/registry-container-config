@@ -1,0 +1,8 @@
+# rhastie/nmos-cpp entrypoint settings for the owl-node hub registry: no hostname relabel, no Mellanox PTP probe
+# (it curls https://localhost/admin), no MQTT broker. mDNSResponder still starts inside the (bridged) container.
+registry_json=/home/registry.json
+node_json=/home/node.json
+log_output=FALSE
+update_label=FALSE
+update_ptp_domain=FALSE
+run_mqtt=FALSE

@@ -1,0 +1,91 @@
+# Ducker with a sidechain: the house's own LADSPA plugin (ladspa/owl_ducker.c, built into the image). Whenever the
+# sidechain is above the threshold the program dips by exactly `depth_db` (attack = time to the full depth, hold =
+# how long the dip stays after the sidechain goes quiet, release = time back to unity; linear ramps in dB, so the
+# times are what a meter measures). `mix_sidechain` adds the sidechain to the output: announcement over music in one
+# block. Everything live.
+# The sidechain input is a 2-channel sink of its own (owl-<id>-sc, FL/FR), linked by the deployer into channels
+# 3-4 of the filter's 4-channel capture sink: a stream *moved* into the sidechain (wire "move": true) then lands on the
+# right channels (WirePlumber maps a stereo stream onto a sink's FL/FR, never onto SL/SR).
+type: ducker
+label: Ducker
+group: Dynamics
+description: Dips the program by a fixed depth while the sidechain has signal (announcements over music). Live.
+inputs:
+  - {id: in, label: program, channels: 2}
+  - {id: sidechain, label: sidechain, channels: 2}
+outputs:
+  - {id: out, label: out, channels: 2}
+params:
+  depth_db: {label: Ducking depth (dB), type: number, default: 12, min: 0, max: 60, step: 0.5, unit: dB}
+  threshold_db: {label: Threshold (dB), type: number, default: -40, min: -60, max: 0, step: 1, unit: dB}
+  attack_ms: {label: Attack (ms), type: number, default: 50, min: 1, max: 5000, step: 1, unit: ms}
+  hold_ms: {label: Hold (ms), type: number, default: 300, min: 0, max: 10000, step: 10, unit: ms}
+  release_ms: {label: Release (ms), type: number, default: 800, min: 10, max: 10000, step: 10, unit: ms}
+  mix_sidechain: {label: Mix sidechain into output, type: bool, default: true}
+engine: pipewire
+restart_on: []
+nodes:
+  sidechain: {node: "owl-${id}-sc", dir: in}
+internal_links:
+  - {from: {node: "owl-${id}-scout"}, to: {node: "owl-${id}-in", ports: [2, 3]}}
+# a `pipewire -c` client cannot export context.objects, so the sidechain sink is a second filter-chain (two copies)
+# in the block's process: Audio/Sink owl-<id>-sc in, Audio/Source owl-<id>-scout out, linked into channels 3-4
+conf: |
+  { name = libpipewire-module-filter-chain
+      args = {
+          node.description = "${label}: sidechain"
+          media.name = "${label}: sidechain"
+          filter.graph = {
+              nodes = [ { type = builtin name = c0 label = copy } { type = builtin name = c1 label = copy } ]
+              inputs = [ "c0:In" "c1:In" ]
+              outputs = [ "c0:Out" "c1:Out" ]
+          }
+          capture.props = {
+              node.name = "owl-${id}-sc"
+              node.description = "${label}: sidechain"
+              media.class = Audio/Sink
+              audio.channels = 2
+              audio.position = [ FL FR ]
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+          playback.props = {
+              node.name = "owl-${id}-scout"
+              node.description = "${label}: sidechain feed"
+              media.class = Audio/Source
+              audio.channels = 2
+              audio.position = [ FL FR ]
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+              owl.dsp.internal = true
+          }
+      }
+  }
+plugin:
+  type: ladspa
+  plugin: owl_ducker
+  label: owl_ducker
+  audio_in: ["Program L", "Program R"]
+  sidechain_in: ["Sidechain L", "Sidechain R"]
+  audio_out: ["Out L", "Out R"]
+  controls:
+    "Threshold (dB)": "${p.threshold_db}"
+    "Depth (dB)": "${p.depth_db}"
+    "Attack (ms)": "${p.attack_ms}"
+    "Hold (ms)": "${p.hold_ms}"
+    "Release (ms)": "${p.release_ms}"
+    "Mix sidechain": "${bool01:p.mix_sidechain}"
+test:
+  stimulus: {freq_hz: 1000, level_db: -20}
+  sidechain: {freq_hz: 500, level_db: -20}
+  cases:
+    - {name: "sidechain quiet: program passes", params: {depth_db: 20, mix_sidechain: false}, sidechain_on: false, expect: {rms_db: -23, tol: 1.5}}
+    - {name: "sidechain on: program dips 20 dB", params: {depth_db: 20, mix_sidechain: false, attack_ms: 10}, sidechain_on: true, expect: {rms_db: -43, tol: 1.5}}
+    - {name: "mix: sidechain comes through over the dipped program", params: {depth_db: 20, mix_sidechain: true}, sidechain_on: true, expect: {rms_db: -23, tol: 1.5}}
+  # hold is counted from the moment the detector (instant attack, 20 ms release) falls below the threshold: with the
+  # sidechain 20 dB above it that is ~45 ms after the sidechain stops, plus ~30 ms until the first dB of lift at a
+  # 600 ms release, so the measured hold reads ~80 ms longer than the control (hold_extra_ms)
+  timing: {kind: ducker, params: {depth_db: 20, attack_ms: 200, hold_ms: 100, release_ms: 600, mix_sidechain: false},
+           expect: {attack_ms: 200, hold_ms: 100, release_ms: 600, depth_db: 20}, hold_extra_ms: 80, tol_ms: 60, tol_db: 1.5}

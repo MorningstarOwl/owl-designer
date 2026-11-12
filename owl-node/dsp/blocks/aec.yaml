@@ -1,0 +1,82 @@
+# AEC: PipeWire module-echo-cancel with the WebRTC audio-processing library (AEC3 in libwebrtc-audio-processing 1.x).
+# Four PipeWire nodes carry the block's ports; the compiler links whatever is wired to them:
+#   mic        owl-<id>-mic   (Stream/Input/Audio)   raw microphone in
+#   reference  owl-<id>-ref   (Audio/Sink)           what the room hears: wire the music stream, the speaker's monitor,
+#                                                    the TV line-in, ... (several wires mix)
+#   clean mic  owl-<id>-clean (Audio/Source)         the echo-cancelled mic, for Assist, recorders, meters
+#   ref out    owl-<id>-refout (Stream/Output/Audio) the reference, passed through (wire it to the speaker to let the
+#                                                    canceller see exactly what is played, or leave it unwired)
+type: aec
+label: AEC
+group: Voice
+description: "Echo canceller. MIC = the voice to keep (the room mic). REFERENCE = the sound to remove (what the speakers and the TV play). CLEAN MIC = the mic with that sound taken out: wire it to the Voice assistant."
+inputs:
+  - {id: mic, label: "mic (voice to keep)", channels: $p.mic_channels}
+  - {id: reference, label: "reference (sound to remove)", channels: 2}
+outputs:
+  - {id: clean, label: "clean mic", channels: $p.mic_channels}
+  - {id: refout, label: "reference pass-through", channels: 2}
+params:
+  aec3: {label: AEC3 (echo cancellation), type: bool, default: true}
+  ns: {label: Noise suppression, type: bool, default: true}
+  agc: {label: Gain control (AGC), type: bool, default: false}
+  hpf: {label: High-pass filter, type: bool, default: true}
+  transient: {label: Transient suppression, type: bool, default: false}
+  delay_ms: {label: Reference delay (ms), type: int, default: 0, min: 0, max: 500, step: 1,
+             help: "Extra delay on the reference before the canceller (buffer.play_delay). AEC3 estimates the rest itself."}
+  mic_channels: {label: Mic channels, type: int, default: 1, min: 1, max: 2,
+                 help: "Match the mic wired into 'mic': 1 for a USB mic like the onn, 2 for a stereo or array capture. Deploy warns when they differ."}
+engine: pipewire
+restart_on: [aec3, ns, agc, hpf, transient, delay_ms, mic_channels]   # any change = the process restarts (no live control)
+nodes:
+  mic: {node: "owl-${id}-mic", dir: in}
+  reference: {node: "owl-${id}-ref", dir: in}
+  clean: {node: "owl-${id}-clean", dir: out}
+  refout: {node: "owl-${id}-refout", dir: out}
+conf: |
+  { name = libpipewire-module-echo-cancel
+      args = {
+          library.name = ${sel:p.aec3:aec/libspa-aec-webrtc:aec/libspa-aec-null}
+          aec.args = {
+              webrtc.gain_control = ${p.agc}
+              webrtc.noise_suppression = ${p.ns}
+              webrtc.high_pass_filter = ${p.hpf}
+              webrtc.transient_suppression = ${p.transient}
+              webrtc.voice_detection = false
+          }
+          buffer.play_delay = ${ms2frac:p.delay_ms}
+          audio.rate = 48000
+          audio.channels = ${ch.mic}
+          audio.position = ${pos.mic}
+          capture.props = {
+              node.name = "owl-${id}-mic"
+              node.description = "${label}: mic"
+              node.autoconnect = false
+              node.dont-reconnect = true
+              owl.dsp.block = "${id}"
+          }
+          source.props = {
+              node.name = "owl-${id}-clean"
+              node.description = "${label}: clean mic"
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+          sink.props = {
+              node.name = "owl-${id}-ref"
+              node.description = "${label}: reference"
+              priority.session = 0
+              audio.channels = 2
+              audio.position = [ FL FR ]
+              owl.dsp.block = "${id}"
+          }
+          playback.props = {
+              node.name = "owl-${id}-refout"
+              node.description = "${label}: reference out"
+              node.autoconnect = false
+              node.dont-reconnect = true
+              audio.channels = 2
+              audio.position = [ FL FR ]
+              owl.dsp.block = "${id}"
+          }
+      }
+  }

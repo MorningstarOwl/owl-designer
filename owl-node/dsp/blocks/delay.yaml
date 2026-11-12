@@ -1,0 +1,29 @@
+# Delay: PipeWire's builtin filter-chain `delay` (one per channel), up to 5 s, the time live. For lip-sync offsets and
+# for lining up a satellite's speaker with the room's.
+type: delay
+label: Delay
+group: Routing
+description: Per-channel delay up to 5 s, time live (lip-sync, speaker alignment).
+inputs:
+  - {id: in, label: in, channels: $p.channels}
+outputs:
+  - {id: out, label: out, channels: $p.channels}
+params:
+  delay_ms: {label: Delay (ms), type: number, default: 0, min: 0, max: 5000, step: 1, unit: ms}
+  channels: {label: Channels, type: int, default: 2, min: 1, max: 2}
+engine: pipewire
+restart_on: [channels]
+plugin:
+  type: builtin
+  label: delay
+  per_channel: true
+  config: {"max-delay": 5.0}
+  audio_in: ["In"]
+  audio_out: ["Out"]
+  controls:
+    "Delay (s)": "${ms2s:p.delay_ms}"
+test:
+  stimulus: {freq_hz: 1000, level_db: -20}
+  cases:
+    - {name: "level unchanged at 250 ms", params: {delay_ms: 250}, expect: {rms_db: -23, tol: 1.5}}
+  timing: {kind: delay, params: {delay_ms: 250}, expect_ms: 250, tol_ms: 15}

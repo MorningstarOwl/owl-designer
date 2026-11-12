@@ -1,0 +1,15 @@
+# Meter: no PipeWire process. The DSP daemon taps whatever is wired into it (a passive pw-record stream linked to the
+# source node) and reports RMS/peak per channel in Run mode and in the health check.
+type: meter
+label: Meter
+group: Metering
+description: RMS and peak of what is wired into it (shown in Run mode and in the health check).
+inputs:
+  - {id: in, label: in, channels: 2}
+outputs: []
+params:
+  expect_signal: {label: Expect signal, type: bool, default: true, help: "The health check FAILs when this meter is silent"}
+engine: meter
+restart_on: []
+nodes:
+  in: {node: "owl-${id}-meter", dir: in}

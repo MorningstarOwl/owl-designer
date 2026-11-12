@@ -1,0 +1,25 @@
+# MediaMTX on the hub (owl-node N3): browser previews of the video senders. Written by install.sh; do not edit.
+# Each video-enc process publishes a 640x360 H.264 preview over SRT (MPEG-TS, streamid publish:<node>-<sender>);
+# browsers read it over WebRTC (WHEP) at http://@HUB_IP@:8889/<node>-<sender>/ . Nothing else is enabled.
+logLevel: info
+api: true
+apiAddress: 127.0.0.1:9997          # the controller (host network) reads which previews are live
+metrics: false
+pprof: false
+playback: false
+rtsp: false
+rtmp: false
+hls: false
+moq: false                          # v1.21 turns MoQ (ports 8892/8893) on by default
+webrtc: true
+webrtcAddress: :8889
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: ''
+webrtcIPsFromInterfaces: false      # host network: only the LAN address below, not docker bridges
+webrtcAdditionalHosts: [@HUB_IP@]
+webrtcICEServers2: []
+webrtcAllowOrigins: ['*']
+srt: true
+srtAddress: :8890
+paths:
+  all_others:

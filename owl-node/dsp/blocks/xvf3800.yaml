@@ -1,0 +1,39 @@
+# XVF3800 USB mic array (Seeed ReSpeaker XVF3800, XMOS): a DEVICE block (engine device). No PipeWire process of its
+# own: when the array is plugged in, its ALSA capture node matches `match:` and the block's `capture` output IS that
+# node, so a design can be drawn and deployed before the hardware arrives (the wire stays pending until it appears;
+# "Deploy anyway"), and the AEC block's mic input moves from the internal ALC269 mic to this block without touching
+# anything else (the design notes, "D3 as built": what changes in the Living room design when it is plugged in).
+#
+# Firmware modes (a USB descriptor fact, chosen when the array is flashed, not switchable at run time):
+#   48k-2ch   the "processed" firmware: 48 kHz, 2 channels (ch 0 = beamformed + on-chip AEC/NS, ch 1 = raw ref/mic)
+#   16k-6ch   the "raw + processed" firmware: 16 kHz, 6 channels (0 processed, 1-4 the four mics, 5 playback ref)
+# PipeWire resamples either to the graph's 48 kHz; `mode` sets the port's channel count, so the compiler pairs the
+# right number of ports (a 1-channel AEC mic input takes channel 0 either way).
+#
+# setup: commands the deployer runs on the hub when the device is present and whenever one of their params changes
+# (best effort: a missing tool is a warning in the events, never a failed deploy). The on-chip AEC/NS are controlled
+# by XMOS's host app (`xvf_host`, from the xvf3800 repo: build it into the image or on the host when the array is
+# here); the USB mixer gain by amixer (alsa-utils is in the image). ${card} = the node's ALSA card index.
+type: xvf3800
+label: XVF3800 mic array
+group: Devices
+description: ReSpeaker XVF3800 USB 4-mic array (beamforming, NS, optional on-chip AEC). Its capture appears here when it is plugged in.
+engine: device
+match:
+  node.name: "alsa_input.usb-*XVF3800*"      # also matches the ReSpeaker "XVF3800 Voice" descriptor name
+  media.class: Audio/Source
+inputs: []
+outputs:
+  - {id: capture, label: capture, channels: $p.channels}
+params:
+  mode: {label: Firmware mode, type: select, default: 48k-2ch, options: [48k-2ch, 16k-6ch], help: "What the array's USB descriptor says; sets the channel count"}
+  channels: {label: Channels, type: int, default: 2, min: 1, max: 6, help: "2 for 48k-2ch, 6 for 16k-6ch (set to match the mode)"}
+  onchip_aec: {label: On-chip AEC, type: bool, default: false, help: "XMOS AEC on the array (xvf_host AEC_ENABLE). Off = the PipeWire AEC3 block cancels; on = A/B against it"}
+  onchip_ns: {label: On-chip noise suppression, type: bool, default: true}
+  gain_db: {label: Capture gain (dB), type: number, default: 0, min: -20, max: 30, step: 1, help: "USB mixer capture gain (amixer)"}
+restart_on: [mode, channels]
+nodes: {}
+setup:
+  - {params: [onchip_aec], cmd: "xvf_host AEC_ENABLE ${bool01:p.onchip_aec}"}
+  - {params: [onchip_ns], cmd: "xvf_host NS_ENABLE ${bool01:p.onchip_ns}"}
+  - {params: [gain_db], cmd: "amixer -c ${card} sset Capture ${p.gain_db}dB"}

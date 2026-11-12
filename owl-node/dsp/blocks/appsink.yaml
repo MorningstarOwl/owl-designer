@@ -1,0 +1,53 @@
+# App Input: a named PipeWire sink that applications play into (squeezelite/Music Assistant, pw-play, a TTS player),
+# with the sink's monitor as the block's output. The way a program source enters a design without touching
+# WirePlumber: point the app at the sink by name (squeezelite -o <name>, PULSE_SINK=<name>, pw-play --target
+# <name>). Prefer a `move` wire from the app's own stream when the app already plays somewhere (squeezelite): it
+# needs no sink to exist at start. When this design is not deployed the sink does not exist.
+type: appsink
+label: App Input
+group: Sources
+description: "A named sink for an app to play into (squeezelite -o NAME); its monitor is the output."
+inputs: []
+outputs:
+  - {id: out, label: out, channels: $p.channels}
+params:
+  name: {label: Sink name (apps play into it), type: text, default: "", help: "Empty = owl-<block id>"}
+  channels: {label: Channels, type: int, default: 2, min: 1, max: 2}
+engine: pipewire
+restart_on: [name, channels]
+nodes:
+  out: {node: "${sel:p.name:${p.name}:owl-${id}}-out", dir: out}
+# a `pipewire -c` client cannot export a context.objects null sink, so the sink is a filter-chain of two copies:
+# the app plays into the Audio/Sink (node ${name}), the block's output is the Audio/Source ${name}-out
+conf: |
+  { name = libpipewire-module-filter-chain
+      args = {
+          node.description = "${label}"
+          media.name = "${label}"
+          filter.graph = {
+              nodes = [ @each(ch.out){ { type = builtin name = c# label = copy } } ]
+              inputs = [ @each(ch.out){ "c#:In" } ]
+              outputs = [ @each(ch.out){ "c#:Out" } ]
+          }
+          capture.props = {
+              node.name = "${sel:p.name:${p.name}:owl-${id}}"
+              node.description = "${label}"
+              media.class = Audio/Sink
+              audio.channels = ${ch.out}
+              audio.position = ${pos.out}
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+          playback.props = {
+              node.name = "${sel:p.name:${p.name}:owl-${id}}-out"
+              node.description = "${label}: out"
+              media.class = Audio/Source
+              audio.channels = ${ch.out}
+              audio.position = ${pos.out}
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+      }
+  }

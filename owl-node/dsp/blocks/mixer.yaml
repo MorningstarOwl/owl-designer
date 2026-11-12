@@ -1,0 +1,71 @@
+# Mixer: 4 stereo inputs summed to one stereo output, a live gain per input. One filter-chain whose capture side is an
+# 8-channel Audio/Sink; each block input is a pair of its channels (ports: [2n, 2n+1]). (PipeWire already sums several
+# wires into one input port for free; this block is for when each source needs its own level.)
+type: mixer
+label: Mixer 4x2
+group: Routing
+description: Four stereo inputs to one stereo output, with a live gain per input.
+inputs:
+  - {id: in1, label: in 1, channels: 2}
+  - {id: in2, label: in 2, channels: 2}
+  - {id: in3, label: in 3, channels: 2}
+  - {id: in4, label: in 4, channels: 2}
+outputs:
+  - {id: out, label: out, channels: 2}
+params:
+  gain1_db: {label: In 1 gain (dB), type: number, default: 0, min: -60, max: 20, step: 0.5, live: true}
+  gain2_db: {label: In 2 gain (dB), type: number, default: 0, min: -60, max: 20, step: 0.5, live: true}
+  gain3_db: {label: In 3 gain (dB), type: number, default: 0, min: -60, max: 20, step: 0.5, live: true}
+  gain4_db: {label: In 4 gain (dB), type: number, default: 0, min: -60, max: 20, step: 0.5, live: true}
+engine: pipewire
+restart_on: []
+nodes:
+  in1: {node: "owl-${id}-in", dir: in, ports: [0, 1]}
+  in2: {node: "owl-${id}-in", dir: in, ports: [2, 3]}
+  in3: {node: "owl-${id}-in", dir: in, ports: [4, 5]}
+  in4: {node: "owl-${id}-in", dir: in, ports: [6, 7]}
+  out: {node: "owl-${id}-out", dir: out}
+controls:
+  - {node: in1, control: "mL:Gain 1", value: "${lin:p.gain1_db}"}
+  - {node: in1, control: "mR:Gain 1", value: "${lin:p.gain1_db}"}
+  - {node: in1, control: "mL:Gain 2", value: "${lin:p.gain2_db}"}
+  - {node: in1, control: "mR:Gain 2", value: "${lin:p.gain2_db}"}
+  - {node: in1, control: "mL:Gain 3", value: "${lin:p.gain3_db}"}
+  - {node: in1, control: "mR:Gain 3", value: "${lin:p.gain3_db}"}
+  - {node: in1, control: "mL:Gain 4", value: "${lin:p.gain4_db}"}
+  - {node: in1, control: "mR:Gain 4", value: "${lin:p.gain4_db}"}
+conf: |
+  { name = libpipewire-module-filter-chain
+      args = {
+          node.description = "${label}"
+          media.name = "${label}"
+          filter.graph = {
+              nodes = [
+                  { type = builtin name = mL label = mixer control = { "Gain 1" = ${lin:p.gain1_db} "Gain 2" = ${lin:p.gain2_db} "Gain 3" = ${lin:p.gain3_db} "Gain 4" = ${lin:p.gain4_db} } }
+                  { type = builtin name = mR label = mixer control = { "Gain 1" = ${lin:p.gain1_db} "Gain 2" = ${lin:p.gain2_db} "Gain 3" = ${lin:p.gain3_db} "Gain 4" = ${lin:p.gain4_db} } }
+              ]
+              inputs = [ "mL:In 1" "mR:In 1" "mL:In 2" "mR:In 2" "mL:In 3" "mR:In 3" "mL:In 4" "mR:In 4" ]
+              outputs = [ "mL:Out" "mR:Out" ]
+          }
+          capture.props = {
+              node.name = "owl-${id}-in"
+              node.description = "${label}: inputs"
+              media.class = Audio/Sink
+              audio.channels = 8
+              audio.position = [ AUX0 AUX1 AUX2 AUX3 AUX4 AUX5 AUX6 AUX7 ]
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+          playback.props = {
+              node.name = "owl-${id}-out"
+              node.description = "${label}: out"
+              media.class = Audio/Source
+              audio.channels = 2
+              audio.position = [ FL FR ]
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+      }
+  }

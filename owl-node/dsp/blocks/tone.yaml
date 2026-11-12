@@ -1,0 +1,60 @@
+# Test Tone: filter-chain builtin sine generators (one per channel), level and frequency live.
+type: tone
+label: Test Tone
+group: Test
+description: Sine generator, frequency and level live. Output only.
+inputs: []
+outputs:
+  - {id: out, label: out, channels: $p.channels}
+params:
+  freq_hz: {label: Frequency (Hz), type: number, default: 997, min: 20, max: 20000, step: 1, live: true}
+  level_db: {label: Level (dBFS), type: number, default: -30, min: -80, max: 0, step: 1, live: true}
+  enabled: {label: "On", type: bool, default: true, live: true}
+  channels: {label: Channels, type: int, default: 2, min: 1, max: 2}
+engine: pipewire
+restart_on: [channels]
+nodes:
+  out: {node: "owl-${id}-out", dir: out}
+controls:
+  - {node: out, each: ch.out, control: "s#:Freq", value: "${p.freq_hz}"}
+  - {node: out, each: ch.out, control: "s#:Ampl", value: "${sel:p.enabled:${lin:p.level_db}:0}"}
+# the sine has no inputs: the capture side is a dummy sink nothing links to (PipeWire 1.6's filter-graph wants it to
+# have as many channels as the graph has outputs, or it refuses to start: "invalid ports"), and the playback side
+# (Audio/Source) carries the tone. The builtin sine's output level is Ampl.
+conf: |
+  { name = libpipewire-module-filter-chain
+      args = {
+          node.description = "${label}"
+          media.name = "${label}"
+          filter.graph = {
+              nodes = [
+                  @each(ch.out){ { type = builtin name = s# label = sine control = { "Freq" = ${p.freq_hz} "Ampl" = ${sel:p.enabled:${lin:p.level_db}:0} "Offset" = 0.0 } } }
+              ]
+              inputs = [ ]
+              outputs = [ @each(ch.out){ "s#:Out" } ]
+          }
+          capture.props = {
+              node.name = "owl-${id}-clock"
+              node.description = "${label}: clock"
+              media.class = Audio/Sink
+              audio.channels = ${ch.out}
+              audio.position = ${pos.out}
+              node.autoconnect = false
+              node.always-process = true
+              priority.session = 0
+              owl.dsp.block = "${id}"
+              owl.dsp.internal = true
+          }
+          playback.props = {
+              node.name = "owl-${id}-out"
+              node.description = "${label}: out"
+              media.class = Audio/Source
+              audio.channels = ${ch.out}
+              audio.position = ${pos.out}
+              node.autoconnect = false
+              node.always-process = true
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+      }
+  }

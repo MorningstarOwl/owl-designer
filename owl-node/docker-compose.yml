@@ -1,0 +1,147 @@
+# owl-node: one image, one service per role (docker compose profiles). install.sh writes .env next to this file, and
+# docker-compose.devices.yml (per-host video devices and groups), which every compose call adds with a second -f.
+#   satellite:  docker compose --profile audio up -d              agent + audio
+#   hub:        docker compose --profile audio --profile hub up -d  + registry + controller (designer + Routing page)
+#               + dsp (D1: the designer's compiler/deployer, in the host's PipeWire graph like audio) + mediamtx
+#   video (N3): --profile video-enc / --profile video-dec           GStreamer senders / receivers over SRT
+# Everything uses host networking (multicast, mDNS, PTP-timed RTP); nothing is published through Docker NAT
+# except the registry, which runs bridged so its own mDNS responder stays off the LAN (agents get its URL from
+# node.yaml). Restart policy: "no" by default, so nothing returns after a reboot until the household says so;
+# install.sh --enable writes OWL_RESTART=unless-stopped to .env.
+name: owl-node
+
+x-node: &node
+  image: ${OWL_NODE_IMAGE:-owl-node:0.7.1}
+  network_mode: host
+  user: "${OWL_UID:-1000}:${OWL_GID:-1000}"
+  restart: ${OWL_RESTART:-no}   # install.sh --enable sets unless-stopped (comes back at boot); ask the household first
+  init: false            # tini is the image's entrypoint
+  volumes:
+    - ${OWL_ETC:-/etc/owl-node}:/etc/owl-node:ro
+    - ${OWL_STATE:-/var/lib/owl-node}:/var/lib/owl-node   # state.json: IS-05 active state (patches survive restarts)
+    - ${OWL_RUN:-/run/owl-node}:/run/owl-node             # audio.json (audio role), ptp.json (host owl-node-ptpstat)
+  logging:
+    driver: json-file
+    options: {max-size: "5m", max-file: "2"}
+
+services:
+  agent:
+    <<: *node
+    command: ["agent"]
+
+  audio:
+    <<: *node
+    profiles: ["audio"]
+    command: ["audio"]
+    # PipeWire clients with real-time data threads, without root or rtkit: RLIMIT_RTPRIO/NICE/RTTIME
+    ulimits:
+      rtprio: 95
+      nice: 40
+      rttime: -1
+      memlock: -1
+    volumes:
+      - ${OWL_ETC:-/etc/owl-node}:/etc/owl-node:ro
+      - ${OWL_STATE:-/var/lib/owl-node}:/var/lib/owl-node
+      - ${OWL_RUN:-/run/owl-node}:/run/owl-node
+      # the host user's runtime dir, read-only: the PipeWire socket (connect() works on a read-only mount), and a
+      # restarted host PipeWire is picked up without recreating the container
+      - type: bind
+        source: /run/user/${OWL_UID:-1000}
+        target: /run/owl-host-user
+        read_only: true
+        bind: {create_host_path: false}
+      # NOT ptp4l's /var/run/ptp4lro: Ubuntu's ptp4l AppArmor profile denies clients in another mount namespace
+      # ("disconnected path"), so SAP announces ts-refclk traceable; the IS-05 SDP carries the GM ID from ptpstat
+    devices:
+      - ${OWL_PTP_DEV:-/dev/null}:${OWL_PTP_DEV:-/dev/null}   # the NIC's PHC (/dev/ptpN), read by the PTP driver node
+    environment:
+      PIPEWIRE_RUNTIME_DIR: /run/owl-host-user
+
+  # N3 video tier 1. Not real-time (GStreamer's own threads); one vpipe process per stream inside each container.
+  video-enc:
+    <<: *node
+    profiles: ["video-enc"]
+    command: ["video-enc"]
+    devices:
+      - ${OWL_PTP_DEV:-/dev/null}:${OWL_PTP_DEV:-/dev/null}   # frame stamps in PTP time (latency across nodes)
+      - /dev/dri:/dev/dri                                      # VA-API (vah265enc / vah264enc)
+    group_add: ["${OWL_RENDER_GID:-65534}", "${OWL_VIDEO_GID:-65534}"]
+    environment:
+      OWL_PTP_DEV: ${OWL_PTP_DEV:-/dev/null}
+
+  video-dec:
+    <<: *node
+    profiles: ["video-dec"]
+    command: ["video-dec"]
+    devices:
+      - ${OWL_PTP_DEV:-/dev/null}:${OWL_PTP_DEV:-/dev/null}
+      - /dev/dri:/dev/dri                                      # kmssink (cardN) and VA decode (renderD128)
+    group_add: ["${OWL_RENDER_GID:-65534}", "${OWL_VIDEO_GID:-65534}"]
+    environment:
+      OWL_PTP_DEV: ${OWL_PTP_DEV:-/dev/null}
+
+  controller:
+    <<: *node
+    profiles: ["hub"]
+    command: ["controller"]
+    depends_on: [registry]
+    environment:
+      OWL_DSP_API: http://127.0.0.1:8362
+
+  # D1: the designer's engine (owlnode.dsp): inventory from pw-dump + the registry, compiler, deployer, meters. Its
+  # block processes (echo-cancel, filter-chain) are `pipewire -c` clients of the host's daemon, like the audio role's,
+  # so it needs the same socket mount, real-time limits and the PHC (block nodes join the PTP graph when wired to AES67).
+  # D3: on a satellite (roles without hub; profile dsp, install.sh --roles agent,audio,dsp) the same service runs in
+  # satellite mode: the executor of the share the hub pushes to :8362 (blocks placed on this host in the designer).
+  dsp:
+    <<: *node
+    profiles: ["hub", "dsp"]
+    command: ["dsp"]
+    ulimits:
+      rtprio: 95
+      nice: 40
+      rttime: -1
+      memlock: -1
+    volumes:
+      - ${OWL_ETC:-/etc/owl-node}:/etc/owl-node:ro
+      - ${OWL_STATE:-/var/lib/owl-node}:/var/lib/owl-node   # dsp-design.json, dsp-design.prev.json, dsp-state.json, dsp-draft.json
+      - ${OWL_RUN:-/run/owl-node}:/run/owl-node             # dsp/*.conf (generated block configs)
+      - type: bind
+        source: /run/user/${OWL_UID:-1000}
+        target: /run/owl-host-user
+        read_only: true
+        bind: {create_host_path: false}
+    devices:
+      - ${OWL_PTP_DEV:-/dev/null}:${OWL_PTP_DEV:-/dev/null}
+    environment:
+      PIPEWIRE_RUNTIME_DIR: /run/owl-host-user
+      OWL_DSP_PORT: "8362"
+      # D2: Home Assistant over MQTT (discovery). mqtt://user:pass@host:1883 from .env (install.sh --mqtt URL), or leave
+      # it empty and write /var/lib/owl-node/mqtt.json {host, port, username, password}; empty = bridge off
+      OWL_MQTT_URL: ${OWL_MQTT_URL:-}
+
+  registry:
+    profiles: ["hub"]
+    image: ${OWL_REGISTRY_IMAGE:-rhastie/nmos-cpp@sha256:68e61e17dffab70303cfc10fcf4f5f8f219ae84eb189961e120e86a126959413}   # :latest of 2026-10-13, amd64+arm64
+    restart: ${OWL_RESTART:-no}
+    ports:
+      - "${OWL_REGISTRY_BIND:-0.0.0.0}:8010:8010"   # IS-04 registration + query (+ nmos-js at /admin)
+      - "${OWL_REGISTRY_BIND:-0.0.0.0}:8011:8011"   # query websockets
+    volumes:
+      - ${OWL_ETC:-/etc/owl-node}/registry.json:/home/registry.json:ro
+      - ./registry-container-config:/home/container-config:ro
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+
+  # N3: browser previews of the video senders (SRT publish in, WebRTC/WHEP out). Host network: WebRTC ICE on UDP 8189.
+  mediamtx:
+    profiles: ["hub"]
+    image: ${OWL_MEDIAMTX_IMAGE:-bluenviron/mediamtx@sha256:59e43552f3be43695b70c19424dc2a42fcec18075f88d91561a24ac5d70a586c}   # v1.21.3
+    restart: ${OWL_RESTART:-no}
+    network_mode: host
+    volumes:
+      - ${OWL_ETC:-/etc/owl-node}/mediamtx.yml:/mediamtx.yml:ro
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}

@@ -1,0 +1,62 @@
+# Gain: a filter-chain of one builtin mixer per channel (its "Gain 1" control is the gain). Live control: gain and
+# mute change without a restart (pw-cli set-param on the filter's node).
+type: gain
+label: Gain
+group: Dynamics
+description: Gain and mute, with live control.
+inputs:
+  - {id: in, label: in, channels: $p.channels}
+outputs:
+  - {id: out, label: out, channels: $p.channels}
+params:
+  gain_db: {label: Gain (dB), type: number, default: 0, min: -60, max: 20, step: 0.5, live: true}
+  mute: {label: Mute, type: bool, default: false, live: true}
+  channels: {label: Channels, type: int, default: 2, min: 1, max: 2}
+engine: pipewire
+restart_on: [channels]
+nodes:
+  in: {node: "owl-${id}-in", dir: in}
+  out: {node: "owl-${id}-out", dir: out}
+# live controls: filter-chain control name -> value expression, re-evaluated when a live param changes
+controls:
+  - {node: in, each: ch.in, control: "g#:Gain 1", value: "${sel:p.mute:0:${lin:p.gain_db}}"}
+conf: |
+  { name = libpipewire-module-filter-chain
+      args = {
+          node.description = "${label}"
+          media.name = "${label}"
+          filter.graph = {
+              nodes = [
+                  @each(ch.in){ { type = builtin name = g# label = mixer control = { "Gain 1" = ${sel:p.mute:0:${lin:p.gain_db}} } } }
+              ]
+              inputs = [ @each(ch.in){ "g#:In 1" } ]
+              outputs = [ @each(ch.in){ "g#:Out" } ]
+          }
+          capture.props = {
+              node.name = "owl-${id}-in"
+              node.description = "${label}: in"
+              media.class = Audio/Sink
+              audio.channels = ${ch.in}
+              audio.position = ${pos.in}
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+          playback.props = {
+              node.name = "owl-${id}-out"
+              node.description = "${label}: out"
+              media.class = Audio/Source
+              audio.channels = ${ch.out}
+              audio.position = ${pos.out}
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+      }
+  }
+test:
+  stimulus: {freq_hz: 1000, level_db: -30}
+  cases:
+    - {name: "unity passes", params: {gain_db: 0}, expect: {rms_db: -33, tol: 1}}
+    - {name: "-10 dB", params: {gain_db: -10}, expect: {rms_db: -43, tol: 1}}
+    - {name: "mute", params: {gain_db: 0, mute: true}, expect: {silent: true}}
