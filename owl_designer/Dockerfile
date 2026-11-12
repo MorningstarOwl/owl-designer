@@ -1,6 +1,7 @@
 # Owl Designer add-on (remote engine): the designer and Routing pages plus the thin NMOS controller behind them, all
 # Python standard library. The audio engine (owl-node's dsp role, the registry, MediaMTX) runs on another machine.
-FROM python:3.12-alpine
+ARG BUILD_FROM
+FROM ${BUILD_FROM}
 COPY owlnode /app/owlnode
 COPY run.py /run.py
 WORKDIR /app
