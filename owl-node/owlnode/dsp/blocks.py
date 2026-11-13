@@ -21,7 +21,7 @@ Two ways to write a processing block (D2):
 Ubuntu's PipeWire ships filter-graph plugins `builtin` and `ladspa` only (no LV2 loader), so LV2-only plugins (x42,
 calf) are out until the image carries a PipeWire built with lilv; LSP is in the image as its LADSPA build.
 """
-import glob, json, math, os, re, sys
+import glob, json, os, re, sys
 
 import yaml
 

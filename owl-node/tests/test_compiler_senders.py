@@ -205,7 +205,7 @@ class ChannelSlots(unittest.TestCase):
 
     def test_old_bare_sender_ids_in_state_are_understood(self):
         inv = FakeInv(hub_tx=2)
-        old = {f"hub|owl-news-out": inv.hub_senders[1]["id"]}           # what 0.7.3 stored
+        old = {"hub|owl-news-out": inv.hub_senders[1]["id"]}           # what 0.7.3 stored
         d = compile_design(design(("news|out", "pw:bedroom:spk|in")), inv, TYPES, prev_tx_alloc=old)
         self.assertEqual(set(slot_links(d.links)), {("aes67-tx-hub-2", (0, 1))})
 

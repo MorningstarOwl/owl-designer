@@ -117,7 +117,7 @@ class Listener(threading.Thread):
     def __init__(self, iface_ip, directory=None, log=print):
         super().__init__(daemon=True, name="sap")
         self.iface_ip, self.dir, self.log = iface_ip, directory or Directory(), log
-        self.error, self.packets, self._stop = None, 0, threading.Event()
+        self.error, self.packets, self._halt = None, 0, threading.Event()
 
     def _socket(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -133,7 +133,7 @@ class Listener(threading.Thread):
         return s
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 s = self._socket()
                 self.error = None
@@ -141,10 +141,10 @@ class Listener(threading.Thread):
                 if self.error != str(e):
                     self.log(f"SAP discovery: cannot listen on {SAP_GROUP}:{SAP_PORT} ({e}); retrying")
                 self.error = str(e)
-                self._stop.wait(10)
+                self._halt.wait(10)
                 continue
             try:
-                while not self._stop.is_set():
+                while not self._halt.is_set():
                     try:
                         data, _ = s.recvfrom(65536)
                     except socket.timeout:
@@ -158,7 +158,7 @@ class Listener(threading.Thread):
                 s.close()
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
     def status(self):
         return {"listening": self.is_alive() and not self.error, "error": self.error, "packets": self.packets,

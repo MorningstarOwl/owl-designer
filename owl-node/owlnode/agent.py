@@ -724,7 +724,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(405, "method not allowed")
         if not p:
             return self._send(200, ["self/", "sources/", "flows/", "devices/", "senders/", "receivers/"])
-        n = a.n
         coll = {}
         for typ, data in a.resources()[1:]:
             coll.setdefault(typ + "s", []).append(data)

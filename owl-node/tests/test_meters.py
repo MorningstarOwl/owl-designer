@@ -4,7 +4,7 @@ WirePlumber (skipped without one): a test tone linked into a tap's channels read
 import os, shutil, subprocess, sys, tempfile, time, unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from owlnode.dsp import meters as M, pw  # noqa: E402
+from owlnode.dsp import meters as M  # noqa: E402
 from owlnode.dsp.deploy import GraphOps  # noqa: E402
 
 # a stand-in for pw-record --raw: 8 channels, channel c at a constant amplitude AMP[c]

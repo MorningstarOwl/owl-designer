@@ -1,0 +1,9 @@
+# Lint only what is a bug or dead code (undefined names, unused imports/variables, syntax): no style rules, so a check
+# never asks for a reformat. CI: `ruff check` in owl-node/ (and the add-on's run.py).
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+extend-include = ["../owl_designer/run.py"]
+
+[tool.ruff.lint]
+select = ["F", "E9"]

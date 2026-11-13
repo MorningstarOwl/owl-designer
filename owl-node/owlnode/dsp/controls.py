@@ -13,7 +13,7 @@ ptp.offset_ns, registry.nodes (read-only).
 
 Everything that changes a value goes through Controls.set(): the designer (HTTP/WebSocket), MQTT, presets. The Bus
 fans each change out to every subscriber (WebSocket sessions, the MQTT bridge)."""
-import copy, queue, threading, time
+import queue, threading, time
 
 from . import blocks as B
 from .deploy import DeployError
@@ -416,16 +416,16 @@ class Fade(threading.Thread):
     def __init__(self, controls, c, start, end, secs, source):
         super().__init__(daemon=True)
         self.ctl, self.c, self.start_v, self.end_v, self.secs, self.source = controls, c, start, end, max(0.05, secs), source
-        self._stop = threading.Event()
+        self._halt = threading.Event()
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
     def run(self):
         t0 = time.time()
         n = max(1, int(self.secs / FADE_STEP_S))
         for i in range(1, n + 1):
-            if self._stop.is_set():
+            if self._halt.is_set():
                 return
             v = self.start_v + (self.end_v - self.start_v) * i / n
             if self.c["type"] == "int":

@@ -24,7 +24,6 @@ Share format (built by the compiler, see compiler.Desired.shares; `digest` ident
 import hashlib, json, os, threading, time, urllib.error, urllib.request
 
 from .. import config
-from ..audio import Proc
 from ..config import atomic_write, read_json
 from . import pw
 
@@ -90,11 +89,11 @@ class SatClient(threading.Thread):
         self.status, self.graph, self.graph_time = None, None, 0
         self.ok, self.error, self.last_ok, self.seen = False, None, 0, False
         self.version = None
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self.lock = threading.Lock()
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 code, st = http("GET", f"{self.url}/api/dsp/status", timeout=1.5)
                 if code == 200 and isinstance(st, dict) and st.get("mode") == "satellite":
@@ -110,7 +109,7 @@ class SatClient(threading.Thread):
                     self._fail(f"HTTP {code}" if code != 200 else "not a satellite dsp role")
             except Exception as e:
                 self._fail(f"{type(e).__name__}: {str(e)[:80]}")
-            self._stop.wait(0.5 if self.ok else 5.0)
+            self._halt.wait(0.5 if self.ok else 5.0)
 
     def _fail(self, why):
         with self.lock:
@@ -119,7 +118,7 @@ class SatClient(threading.Thread):
             self.ok, self.error = False, why
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
     def put_share(self, share, timeout=30):
         try:

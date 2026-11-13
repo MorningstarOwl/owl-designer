@@ -1,6 +1,6 @@
 """The deployer's live-control path: not blocked by the deployer lock (a deploy or reconcile can hold it for seconds),
 copy-on-write of the design, one design-file write per burst, and no overwrite of a design a deploy just replaced."""
-import os, sys, tempfile, threading, time, unittest
+import os, sys, threading, time, unittest
 from types import SimpleNamespace
 from unittest import mock
 

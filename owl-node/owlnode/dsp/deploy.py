@@ -92,13 +92,13 @@ class StreamWatcher(threading.Thread):
         self.want = {}                   # node name -> target node name
         self.on_event = on_event
         self.p, self.hits, self.started = None, 0, None
-        self._stop = threading.Event()
+        self._halt = threading.Event()
 
     def set(self, moves):
         self.want = {m["node"]: m["target"] for m in moves or []}
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 self.p = subprocess.Popen(["pw-mon", "-N", "-p", "-a"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                           text=True, start_new_session=True)
@@ -112,7 +112,7 @@ class StreamWatcher(threading.Thread):
                     block = []
             except Exception as e:
                 log(f"stream watcher: {type(e).__name__}: {e}")
-            self._stop.wait(2)
+            self._halt.wait(2)
 
     def _block(self, lines):
         if not lines or not lines[0].startswith("added:") or not any("type: PipeWire:Interface:Node" in l for l in lines):
@@ -136,7 +136,7 @@ class StreamWatcher(threading.Thread):
         return self.p is not None and self.p.poll() is None
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         if self.running():
             self.p.terminate()
 

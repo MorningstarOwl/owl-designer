@@ -5,7 +5,7 @@
                                satellite; the hub's video senders too, its audio ones being transport)
 Block ids are stable across refreshes: pw:<host>:<node.name> and nmos:<node name>; port ids: in/out/monitor for
 PipeWire nodes, tx:<sender uuid> / rx:<receiver uuid> for NMOS."""
-import re, time
+import time
 
 from . import pw
 from .satellite import SatClient

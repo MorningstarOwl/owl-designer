@@ -55,6 +55,9 @@
 #                          nodes come back; the nodes are paired with this hub (see the README: Replacing the hub)
 #   --registry none        a node: drop the registry of an earlier install; the hub pairs it from the designer instead
 #   --image TAG            owl-node image already loaded on this host (default owl-node:0.11.0)
+#                          When it is not on this host, the released image is pulled from ghcr.io/morningstarowl/owl-node
+#                          (amd64 and arm64; OWL_NODE_REGISTRY to use another), else it is built here from this checkout
+#   --build / --no-build   always build the image here (local changes) / never build (fail if it is not loaded)
 #   --mqtt URL             hub only (D2): Home Assistant over MQTT, mqtt://user:pass@host:1883 -> OWL_MQTT_URL in .env
 #                          (the dsp role publishes HA discovery for every control). Or write
 #                          /var/lib/owl-node/mqtt.json {host, port, username, password} instead; neither = bridge off
@@ -78,7 +81,7 @@ while [ $# -gt 0 ]; do
     --vtx) VTX+=("$2"); shift 2;; --vrx) VRX+=("$2"); shift 2;; --video-dev) VDEV+=("$2"); shift 2;;
     --replace-n1) REPLACE_N1=1; shift;; --enable) ENABLE=1; shift;; --no-enable) ENABLE=0; shift;; --no-start) START=0; shift;;
     --dry-run) DRY=1; shift;; --remove) REMOVE=1; shift;;
-    --node) MODE=node; shift;; --hub) MODE=hub; shift;; --yes|-y) YES=1; shift;; --no-build) BUILD=no; shift;;
+    --node) MODE=node; shift;; --hub) MODE=hub; shift;; --yes|-y) YES=1; shift;; --no-build) BUILD=no; shift;; --build) BUILD=always; shift;;
     -h|--help) awk 'NR>1 && !/^#/ {exit} NR>1' "$0"; exit 0;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
@@ -237,7 +240,18 @@ if [ "$PTP" = keep ] && [ "$PHC_IF" != none ] && ! systemctl cat owl-ptp4l.servi
 command -v docker >/dev/null || { echo "Docker is not installed. Install Docker Engine with the compose plugin (https://docs.docker.com/engine/install/), add yourself to the docker group, log in again, re-run." >&2; exit 1; }
 docker compose version >/dev/null 2>&1 || $DOCKER compose version >/dev/null 2>&1 || { echo "the Docker compose plugin is missing (apt install docker-compose-plugin)" >&2; exit 1; }
 NEED_BUILD=0
-if ! $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
+# a released version is published for amd64 and arm64 (the repository's CI): pull it instead of building it here
+PREBUILT="${OWL_NODE_REGISTRY:-ghcr.io/morningstarowl/owl-node}:${IMAGE##*:}"
+if [ "$BUILD" = always ]; then NEED_BUILD=1
+elif ! $DOCKER image inspect "$IMAGE" >/dev/null 2>&1 && [ "$BUILD" != no ] && [ "${IMAGE%%:*}" = owl-node ]; then
+  if [ "$DRY" = 1 ]; then say "would pull the prebuilt image $PREBUILT (else build it here)"
+  else
+    say "pulling the prebuilt image $PREBUILT"
+    if $DOCKER pull -q "$PREBUILT" >/dev/null 2>&1 && $DOCKER tag "$PREBUILT" "$IMAGE"; then say "using $PREBUILT as $IMAGE"
+    else say "no prebuilt $PREBUILT (an unreleased checkout, or no network): building it here instead"; fi
+  fi
+fi
+if [ "$NEED_BUILD" = 0 ] && [ "$DRY" = 0 -o "${IMAGE%%:*}" != owl-node ] && ! $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
   if [ "$BUILD" = no ]; then echo "image $IMAGE is not loaded (build.sh on a build machine, or drop --no-build)" >&2; exit 1; fi
   [ -f "$HERE/Dockerfile" ] || { echo "image $IMAGE is not loaded and there is no Dockerfile next to install.sh to build it" >&2; exit 1; }
   if ask "The owl-node image $IMAGE is not on this machine. Build it here now (minutes on a PC, 20-40 min on a Pi)?" y; then NEED_BUILD=1

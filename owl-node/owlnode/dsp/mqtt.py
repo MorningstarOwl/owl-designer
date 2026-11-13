@@ -58,7 +58,7 @@ class Bridge(threading.Thread):
         self.published = set((read_json(PUBLISHED, {}) or {}).get("objects") or [])
         self.entities = 0
         self.port = controller_port
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self._last_meter = {}
         self._last_sys = {}
         self._discovery_version = -1
@@ -98,7 +98,7 @@ class Bridge(threading.Thread):
         self.client = cl
         q = self.ctl.bus.subscribe()
         threading.Thread(target=self._events, args=(q,), daemon=True).start()
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 cl.connect(self.conf["host"], self.conf["port"], keepalive=30)
                 cl.loop_forever(retry_first_connection=True)
@@ -106,7 +106,7 @@ class Bridge(threading.Thread):
                 self.error = f"{type(e).__name__}: {e}"
                 self.connected = False
                 log(f"connect to {self.conf['host']}:{self.conf['port']} failed: {self.error}; retry in 10 s")
-                self._stop.wait(10)
+                self._halt.wait(10)
 
     def _on_connect(self, cl, userdata, flags, rc, props=None):
         if getattr(rc, "is_failure", False) or (isinstance(rc, int) and rc != 0):
@@ -330,7 +330,7 @@ class Bridge(threading.Thread):
     def _events(self, q):
         """Bus events -> state topics; meters at 1 Hz; system every 10 s; discovery when the design changes."""
         last_m = last_s = 0
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 ev = q.get(timeout=0.5)
             except Exception:
@@ -360,7 +360,7 @@ class Bridge(threading.Thread):
                 log(f"publish: {type(e).__name__}: {e}")
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         if self.client and self.connected:
             try:
                 self.client.publish(f"{self.base}/availability", "offline", qos=1, retain=True)

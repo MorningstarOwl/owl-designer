@@ -1,0 +1,136 @@
+# The owl-node engine: lint, unit tests and live tests against a real PipeWire + WirePlumber, AMWA NMOS conformance
+# of the agent (IS-04-01, IS-05-01, IS-05-02), and the multi-arch image (native amd64 + arm64 runners, no QEMU).
+#   pull request   tests + conformance + an amd64 image build (proves the Dockerfile; nothing is pushed)
+#   push to main   + both images, published as ghcr.io/morningstarowl/owl-node:main and :sha-<commit>
+#   tag vX.Y.Z     + published as :X.Y.Z and :latest (the tag must equal owlnode VERSION); install.sh pulls :X.Y.Z
+name: owl-node
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: ["owl-node/**", "owl_designer/**", ".github/workflows/owl-node.yml", ".github/scripts/**"]
+  pull_request:
+    paths: ["owl-node/**", "owl_designer/**", ".github/workflows/owl-node.yml", ".github/scripts/**"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: owl-node-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  IMAGE: ghcr.io/morningstarowl/owl-node
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: packages (PipeWire + WirePlumber for the live tests, the Python modules the image has)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends pipewire pipewire-bin wireplumber dbus-x11 \
+            python3-numpy python3-yaml python3-zeroconf
+      - name: one version everywhere
+        run: python3 .github/scripts/check-versions.py
+      - name: lint (ruff, bugs and dead code only)
+        working-directory: owl-node
+        run: pipx run ruff check .
+      - name: shell syntax
+        run: bash -n owl-node/install.sh owl-node/build.sh owl-node/entrypoint.sh owl-node/tests/*.sh
+      - name: tests (unit, and live against a private PipeWire + WirePlumber)
+        working-directory: owl-node
+        run: tests/with-pipewire.sh /usr/bin/python3 -m unittest discover -s tests -v
+
+  nmos:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: packages
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends python3-yaml python3-zeroconf
+      - name: AMWA NMOS conformance of the agent (amwa/nmos-testing)
+        working-directory: owl-node
+        run: tests/nmos-conformance.sh
+
+  image:
+    needs: [test, nmos]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, platform: linux/amd64, runner: ubuntu-24.04}
+          - {arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILD: ${{ github.event_name != 'pull_request' || matrix.arch == 'amd64' }}
+      PUSH: ${{ github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.BUILD == 'true'
+      - uses: docker/setup-buildx-action@v3
+        if: env.BUILD == 'true'
+      - uses: docker/login-action@v3
+        if: env.BUILD == 'true' && env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build (and push by digest)
+        id: build
+        if: env.BUILD == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./owl-node
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=owl-node-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=owl-node-${{ matrix.arch }}
+          outputs: ${{ env.PUSH == 'true' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) || 'type=cacheonly' }}
+      - name: keep the digest for the manifest
+        if: env.BUILD == 'true' && env.PUSH == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: mkdir -p /tmp/digests && touch "/tmp/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        if: env.BUILD == 'true' && env.PUSH == 'true'
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: /tmp/digests
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: tags
+        id: tags
+        run: |
+          v=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' owl-node/owlnode/__init__.py)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            t="${GITHUB_REF#refs/tags/v}"
+            [ "$t" = "$v" ] || { echo "::error::tag v$t, but owlnode VERSION is $v"; exit 1; }
+            echo "args=-t $IMAGE:$v -t $IMAGE:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=-t $IMAGE:main -t $IMAGE:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create ${{ steps.tags.outputs.args }} $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$(echo '${{ steps.tags.outputs.args }}' | awk '{print $2}')"

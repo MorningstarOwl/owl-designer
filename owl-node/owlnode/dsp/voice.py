@@ -1,7 +1,8 @@
-"""D3: push-to-talk voice through the AEC, as a Wyoming satellite Home Assistant's Assist connects to.
+"""Voice through the AEC, as a Wyoming satellite Home Assistant's Assist connects to: push-to-talk, and an optional wake
+word.
 
-Household rule: PTT only. No wake word, no always-on stream. The microphone (the AEC block's clean source) is opened
-only inside a PTT window (`pw-record`, 16 kHz mono) and closed the moment the utterance ends (HA's VAD says
+Push-to-talk (the default) keeps the microphone closed except while someone talks. The microphone (the AEC block's clean
+source) is opened only inside a PTT window (`pw-record`, 16 kHz mono) and closed the moment the utterance ends (HA's VAD says
 `voice-stopped`), the hold control is released, or `max_listen_s` passes; nothing else ever reads the mic through this
 module, and the state is visible (voice.mic_live: HA binary sensor, Panel, designer). The reply (Piper TTS audio HA
 streams back) is played into the ducker's sidechain sink (`pw-play`), so it ducks the music like an announcement.
@@ -12,17 +13,17 @@ to us, sends run-satellite, then describe in a loop; we answer info (a `satellit
 run-pipeline {start_stage: asr, end_stage: tts} + audio-start + audio-chunk ... + audio-stop; HA sends transcribe,
 voice-started/voice-stopped (its VAD), transcript {text}, synthesize {text}, then audio-start/chunk/stop with the TTS
 WAV (22.05 kHz, 16-bit mono) and expects `played` when we are done; ping/pong keep the link alive; error ends a run.
-HA picks the Assist pipeline per satellite device (the device's "Assistant" select: "Living Room" here).
+HA picks the Assist pipeline per satellite device (the device's "Assistant" select).
 
 Named controls (controls.py, kind "voice"): voice.ptt (trigger), voice.ptt_hold (bool: held while on), read-only
 voice.state (idle | listening | processing | responding), voice.mic_live, voice.last_text, voice.last_reply, voice.ha.
 
-Wake-word mode (voice.wake_word). 2026-11-11: the owner relaxed the household rule from PTT-only to a wake word chosen
-in Home Assistant. While on, the clean mic streams to HA continuously with run-pipeline {start_stage: wake} and HA's
+Wake-word mode (voice.wake_word, off unless switched on): a wake word chosen in Home Assistant. While on, the clean
+mic streams to HA continuously with run-pipeline {start_stage: wake} and HA's
 own wake word stage (the pipeline's openWakeWord entity; the word is the pipeline's "Wake word" setting in HA) detects;
 the rest of the run is as PTT. The switch is PERSISTED (/var/lib/owl-node/dsp-voice.json): a satellite that was
 listening comes up listening after a restart or a reboot and after HA reconnects. The time limit is optional:
-OWL_VOICE_WAKE_MAX_MIN (default 0 = unbounded; the earlier test mode used 30). MIC LIVE is shown the whole time, PTT
+OWL_VOICE_WAKE_MAX_MIN (default 0 = unbounded). MIC LIVE is shown the whole time, PTT
 stays available when the mode is off, on/off is logged.
 
 Audible cue. A wake-word detection plays two short ascending blips (90 ms + 110 ms, ~660 Hz then a raised fifth) into
@@ -40,20 +41,20 @@ CHUNK = 1024 * MIC_CH * MIC_WIDTH          # 64 ms of 16 kHz mono
 MAX_LISTEN_S = 12.0
 RUN_TIMEOUT_S = 45.0
 SEND_TIMEOUT_S = 10             # a peer that stops reading gets dropped after this, not held forever
-WAKE_MAX_MIN = 0.0            # minutes; 0 = no limit (the owner's choice 2026-11-11); OWL_VOICE_WAKE_MAX_MIN overrides
+WAKE_MAX_MIN = 0.0            # minutes; 0 = no limit; OWL_VOICE_WAKE_MAX_MIN overrides
 # Last-resort re-arm interval, NOT a heartbeat. HA runs the wake stage with restart_on_end=True and
 # re-arms itself; if we ALSO send run-pipeline we end up with two concurrent wake stages and HA logs
 # 'Pipeline finished' + two 'Receiving audio from satellite'. openWakeWord then has its audio split
 # between them and detects nothing at all, while the satellite still reports state=wake/mic_live.
-# That was measured on 2026-11-11: a 60 s re-arm produced exactly this. Keep this long enough that it
+# Measured: a 60 s re-arm produced exactly this. Keep this long enough that it
 # only rescues a genuinely dead pipeline.
 REARM_IDLE_S = float(os.environ.get("OWL_VOICE_REARM_IDLE_S") or 3600)
 # After a NORMAL reply HA restarts the wake stage itself (restart_on_end=True). Sending run-pipeline as well
 # leaves TWO concurrent wake stages that split the 16 kHz frames: openWakeWord then stops firing entirely
-# (measured 2026-11-11: first detection OK, every later one silent). Announcements/cancellations are the only
+# (measured: first detection OK, every later one silent). Announcements/cancellations are the only
 # case where HA has no run of its own. Set OWL_VOICE_REARM_AFTER_REPLY=1 to force the old behaviour.
 REARM_AFTER_REPLY = (os.environ.get("OWL_VOICE_REARM_AFTER_REPLY") or "").lower() in ("1", "true", "yes")
-# Audible cue on wake-word detection (the owner asked for one 2026-11-11: otherwise the satellite is silent from the
+# Audible cue on wake-word detection (otherwise the satellite is silent from the
 # wake word until the reply). Two short ascending blips played into the ducker's sidechain, exactly like a reply, so
 # they duck the music and come out of the same speakers. OWL_VOICE_CUE=0 turns it off, OWL_VOICE_CUE_VOLUME / _HZ tune
 # it. PTT is left silent: only the wake word chimes.
@@ -148,7 +149,7 @@ class Voice(threading.Thread):
         self._out = None                   # HA's socket file (write side)
         self._out_conn = None              # ... and the socket itself, for the send timeout and forced close
         self._rec, self._play = None, None
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self._listen_until = 0
         self._zc = None
         self.srv = None
@@ -289,7 +290,7 @@ class Voice(threading.Thread):
         return {"ok": True, "wake": True, "ends_in_s": self.wake_max_min * 60 if self.wake_max_min > 0 else None}
 
     def _remember(self, on):
-        """The switch survives restarts and reboots (owner's decision): a listening satellite comes back listening."""
+        """The switch survives restarts and reboots: a listening satellite comes back listening."""
         try:
             self.wake_wanted = bool(on)
             atomic_write(self.state_file, {"wake": bool(on), "changed": time.time()})
@@ -462,7 +463,7 @@ class Voice(threading.Thread):
         log(f"Wyoming satellite {self.name!r} on :{self.port} (PTT only; mic {self.mic_node() or 'none yet'}, reply -> {self.reply_node() or 'none yet'})")
         self._advertise()
         threading.Thread(target=self._watchdog, daemon=True).start()
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 conn, addr = self.srv.accept()
             except socket.timeout:
@@ -518,7 +519,7 @@ class Voice(threading.Thread):
         # HA going away -- that used to disarm the wake word every 30 s and the pipeline never ran.
         is_ctrl = False
         try:
-            while not self._stop.is_set():
+            while not self._halt.is_set():
                 ev = read_event(rf)
                 if ev is None:
                     break
@@ -534,7 +535,7 @@ class Voice(threading.Thread):
                 if mine:
                     self._out, self._out_conn = None, None
             if mine:
-                # HA can open its next control link while this one is still being torn down: found 2026-11-11, the
+                # HA can open its next control link while this one is still being torn down: the
                 # old link's reset and the new link's run-satellite landed in the same second, and this cleanup
                 # (set_wake -> _stop_listening waits up to 2 s for pw-record) then marked the NEW link
                 # disconnected, so the 1 s resume saw ha_connected=False and voice stayed silently dead. Clean up
@@ -614,7 +615,7 @@ class Voice(threading.Thread):
             self.run_started = time.time()
             self._set(state="listening", last_text="", last_reply="", last_error="")
             log(f"wake word detected ({data.get('name')!r}), listening for the command")
-            self._chime()                     # the audible cue the owner asked for: a blip, then talk
+            self._chime()                     # the audible cue: a blip, then talk
         elif typ == "transcript":
             self.timings["transcript"] = time.time()
             self._set(last_text=data.get("text") or "", state="processing")
@@ -686,8 +687,8 @@ class Voice(threading.Thread):
         target = self.reply_node()
         rate, width, ch = int(fmt.get("rate") or 22050), int(fmt.get("width") or 2), int(fmt.get("channels") or 1)
         f = {1: "s8", 2: "s16", 4: "s32"}.get(width, "s16")
-        # --volume 1.0: WirePlumber restores a stored per-application volume onto pw-play streams (2026-11-11: 0.006,
-        # every reply inaudible); an explicit volume is applied after the restore
+        # --volume 1.0: WirePlumber restores a stored per-application volume onto pw-play streams (once 0.006: every
+        # reply inaudible); an explicit volume is applied after the restore
         cmd = ["pw-play", "--raw", "--rate", str(rate), "--channels", str(ch), "--format", f, "--volume", "1.0",
                "-P", '{ node.name = "owl-voice-reply" node.description = "owl voice reply" media.role = Notification }']
         if target:
@@ -741,7 +742,7 @@ class Voice(threading.Thread):
 
     def _watchdog(self):
         """A run that gets no reply ends after RUN_TIMEOUT_S; a listening window never outlives max_listen_s."""
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             time.sleep(1.0)
             with self.lock:
                 st, t0, rec = self.state, self.run_started, self._rec
@@ -786,7 +787,7 @@ class Voice(threading.Thread):
                 self._resume_if_wanted("watchdog: link up, wake wanted")
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         self._stop_listening("stopping")
         self._abort_play()
         try:
