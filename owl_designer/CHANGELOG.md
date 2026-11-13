@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.2
+- Home Assistant: a voice reply (or what was heard) longer than 255 characters no longer turns the Reply / Heard
+  sensor "unknown": the state is shortened with an ellipsis and the whole text is the sensor's `text` attribute.
+
 ## 0.11.1
 - Voice satellite fixes (engine only; the add-on itself is unchanged): a Home Assistant that stops reading costs
   dropped audio instead of a deaf satellite (per-link writer, real shutdown of dead links); no periodic wake re-arm

@@ -21,6 +21,14 @@ from .deploy import DeployError
 
 CONF = os.path.join(config.STATE_DIR, "mqtt.json")
 PUBLISHED = os.path.join(config.STATE_DIR, "dsp-mqtt.json")
+HA_STATE_MAX = 255                 # Home Assistant rejects a longer sensor state (the entity then reads "unknown")
+VOICE_TEXTS = ("last_text", "last_reply")   # free text: the state is shortened, the whole text is an attribute
+
+
+def ha_state_text(text, limit=HA_STATE_MAX):
+    """A state HA accepts: at most `limit` characters, an ellipsis where it was cut (long assistant replies)."""
+    text = "" if text is None else str(text)
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "\u2026"
 
 
 def log(*a):
@@ -198,7 +206,10 @@ class Bridge(threading.Thread):
                 elif c["field"] == "mic_live":
                     out.append((o, "binary_sensor", dict(vb, state_topic=st_t, payload_on="ON", payload_off="OFF", icon="mdi:microphone")))
                 else:
-                    out.append((o, "sensor", dict(vb, state_topic=st_t, icon={"state": "mdi:account-voice", "ha": "mdi:link-variant"}.get(c["field"], "mdi:message-text"))))
+                    sb = dict(vb, state_topic=st_t, icon={"state": "mdi:account-voice", "ha": "mdi:link-variant"}.get(c["field"], "mdi:message-text"))
+                    if c["field"] in VOICE_TEXTS:           # the whole text (HA states stop at 255 characters)
+                        sb["json_attributes_topic"] = f"{self.base}/control/{c['key']}/attributes"
+                    out.append((o, "sensor", sb))
                 continue
             o = oid(c["key"])
             base = {"name": f"{c['block_label']} {c['label']}", "unique_id": f"{self.node_id}_{o}", "device": dev, "availability": avail,
@@ -299,7 +310,11 @@ class Bridge(threading.Thread):
 
     def publish_voice(self, st):
         for f in ("state", "last_text", "last_reply", "ha"):
-            self._pub(f"{self.base}/control/voice.{f}/state", str(st.get(f) or ("" if f != "state" else "idle")), retain=True)
+            v = str(st.get(f) or ("" if f != "state" else "idle"))
+            self._pub(f"{self.base}/control/voice.{f}/state", ha_state_text(v), retain=True)
+            if f in VOICE_TEXTS:
+                self._pub(f"{self.base}/control/voice.{f}/attributes",
+                          json.dumps({"text": v, "length": len(v), "truncated": len(v) > HA_STATE_MAX}), retain=True)
         self._pub(f"{self.base}/control/voice.mic_live/state", "ON" if st.get("mic_live") else "OFF", retain=True)
         self._pub(f"{self.base}/control/voice.ptt_hold/state", "ON" if st.get("hold") else "OFF", retain=True)
         self._pub(f"{self.base}/control/voice.wake_word/state", "ON" if st.get("wake") else "OFF", retain=True)
