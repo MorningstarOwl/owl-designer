@@ -308,7 +308,8 @@ class Deployer:
 
     def _compile(self, design, strict=True):
         inv = self.inv.refresh(0)
-        return compile_design(design, inv, self.types, self.state.get("alloc"), strict=strict)
+        return compile_design(design, inv, self.types, self.state.get("alloc"), strict=strict,
+                              prev_tx_alloc=self.state.get("tx_alloc"))
 
     def _full_conf(self, conf):
         return conf
@@ -692,7 +693,7 @@ class Deployer:
                     diff["moves"]["clear"].append(f"{node} (was -> {tgt}; back to its own output)")
             changes = sum(len(v) for sec in diff.values() for k, v in sec.items() if k != "keep")
             return {"ok": True, "errors": [], "warnings": new.warnings, "diff": diff, "changes": changes,
-                    "wires": new.wire_impl, "alloc": new.alloc, "pending": new.pending,
+                    "wires": new.wire_impl, "alloc": new.alloc, "tx_alloc": new.tx_alloc, "pending": new.pending,
                     "impact": self._impact(design, new)}
 
     def _impact(self, design, new):
@@ -781,7 +782,8 @@ class Deployer:
                 self.watcher.set(new.moves)
                 self._device_setup(new, g)
                 changes += mv_changes
-                self.state = {"links": owned, "patches": dict(new.patches), "alloc": dict(new.alloc), "procs": sorted(new.procs),
+                self.state = {"links": owned, "patches": dict(new.patches), "alloc": dict(new.alloc),
+                              "tx_alloc": dict(new.tx_alloc), "procs": sorted(new.procs),
                               "taps": sorted(taps), "adopted": [], "deployed_at": time.time(), "name": design.get("name"),
                               "moves": mv_rec, "aliases": self.state.get("aliases") or {}, "shares": shares,
                               "raw_patches": dict(getattr(self, "_raw_applied", {}) or {}),

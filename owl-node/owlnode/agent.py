@@ -57,14 +57,17 @@ class Agent:
         self.n = node
         saved = read_json(config.STATE, {}) or {}
         self.eps = {}
+        # one lock for every endpoint of this node: activation -> on_activate -> persist() reads all endpoints, so
+        # per-endpoint locks deadlocked two concurrent activations (see connection.Endpoint)
+        self.ep_lock = threading.RLock()
         for s in node.senders:
-            self.eps[s["id"]] = Endpoint("sender", s, node, (saved.get("senders") or {}).get(s["key"]))
+            self.eps[s["id"]] = Endpoint("sender", s, node, (saved.get("senders") or {}).get(s["key"]), self.ep_lock)
         for r in node.receivers:
-            self.eps[r["id"]] = Endpoint("receiver", r, node, (saved.get("receivers") or {}).get(r["key"]))
+            self.eps[r["id"]] = Endpoint("receiver", r, node, (saved.get("receivers") or {}).get(r["key"]), self.ep_lock)
         for s in node.vsenders:
-            self.eps[s["id"]] = Endpoint("sender", s, node, (saved.get("video_senders") or {}).get(s["key"]))
+            self.eps[s["id"]] = Endpoint("sender", s, node, (saved.get("video_senders") or {}).get(s["key"]), self.ep_lock)
         for r in node.vreceivers:
-            self.eps[r["id"]] = Endpoint("receiver", r, node, (saved.get("video_receivers") or {}).get(r["key"]))
+            self.eps[r["id"]] = Endpoint("receiver", r, node, (saved.get("video_receivers") or {}).get(r["key"]), self.ep_lock)
         self.static_version = new_version()
         self.node_version = new_version()
         self.lock = threading.RLock()
@@ -292,6 +295,10 @@ class Agent:
         self.mark("sender" if kind == "sender" else "receiver", ep.id)
 
     def persist(self):
+        with self.ep_lock:     # a consistent snapshot, written in activation order
+            self._persist()
+
+    def _persist(self):
         st = {"senders": {}, "receivers": {}, "video_senders": {}, "video_receivers": {}, "written": time.time()}
         for ep in self.eps.values():
             a = ep.view_active()

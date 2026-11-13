@@ -17,7 +17,8 @@
   POST /api/whep/<path>  WHEP signalling for a sender's browser preview, relayed to MediaMTX (same origin as the page;
                          the media itself goes browser <-> MediaMTX directly over WebRTC, UDP 8189)
   previews               which MediaMTX paths are live (the video senders' browser previews, N3), from MediaMTX's
-                         API on the hub (OWL_MEDIAMTX_API, default http://127.0.0.1:9997)
+                         API on the hub (OWL_MEDIAMTX_API, default http://127.0.0.1:9997); the add-on asks the hub's
+                         dsp engine (/api/dsp/previews), since that API only listens on the hub's loopback
 
 The registry stays the source of truth; this process keeps no state. Works with any IS-04/IS-05 node, not only
 owl-nodes (Sony's nmos-cpp node is the reference it is tested against).
@@ -91,7 +92,14 @@ class Controller:
         return out
 
     def previews(self):
-        """{path: {ready, readers, bytes}} of MediaMTX (None when it is not running)."""
+        """{path: {ready, readers, bytes}} of MediaMTX (None when it is not running). MediaMTX's API listens on the
+        hub's loopback only, so the Home Assistant add-on (another machine) asks the hub's dsp engine for it."""
+        if ADDON:
+            try:
+                code, body = http("GET", f"{DSP_API}/api/dsp/previews", timeout=2)
+                return body.get("previews") if code == 200 and isinstance(body, dict) else None
+            except Exception:
+                return None
         try:
             code, body = http("GET", f"{MEDIAMTX_API}/v3/paths/list?itemsPerPage=500", timeout=1)
             if code != 200:

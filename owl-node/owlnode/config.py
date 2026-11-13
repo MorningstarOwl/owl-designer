@@ -101,12 +101,33 @@ def phc_index(ifname):
 
 
 def atomic_write(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
-    with os.fdopen(fd, "w") as f:
-        f.write(data if isinstance(data, str) else json.dumps(data, indent=1, sort_keys=True))
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
+    """Write-then-rename that survives a power cut: the data is fsync'd before the rename and the directory after it.
+    Without the fsyncs a cut (a Pi on an SD card) could leave an empty state.json / dsp-design.json, which read_json
+    then silently treats as "nothing saved"."""
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data, indent=1, sort_keys=True))
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass                # some filesystems refuse a directory fsync; the file itself is already on disk
 
 
 def read_json(path, default=None):

@@ -298,14 +298,19 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    last_mtime, last_dump, nodes = None, 0, {}
+    last_sig, last_read, last_dump, nodes, st = False, 0, 0, {}, {}
     while not stopping:
         base.check()
+        # the agent replaces state.json (new inode) on every activation: re-read when its identity changes, and every
+        # 5 s anyway (file timestamps can be coarser than two quick activations)
         try:
-            mt = os.stat(config.STATE).st_mtime
+            fs = os.stat(config.STATE)
+            sig = (fs.st_ino, fs.st_mtime_ns, fs.st_ctime_ns, fs.st_size)
         except OSError:
-            mt = None
-        st = read_json(config.STATE, {}) or {}
+            sig = None
+        if sig != last_sig or time.time() - last_read > 5:
+            last_sig, last_read = sig, time.time()
+            st = read_json(config.STATE, {}) or {}
         want = {}
         for s in n.senders:
             a = (st.get("senders") or {}).get(s["key"]) or {"master_enable": True, "transport_params": [{}]}
@@ -319,8 +324,6 @@ def main():
             tp = a["transport_params"][0]
             if a.get("master_enable") and tp.get("rtp_enabled") and tp.get("multicast_ip"):
                 want[f"rx-{r['key']}"] = rx_conf(n, r, a)
-        if mt != last_mtime:
-            last_mtime = mt
         for name in list(procs):
             if name not in want or procs[name].conf != want[name]:
                 procs.pop(name).stop()

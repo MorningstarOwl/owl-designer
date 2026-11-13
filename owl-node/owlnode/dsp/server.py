@@ -22,6 +22,7 @@ D2, named controls:
   GET  /api/dsp/presets             POST /api/dsp/presets {name, keys|values, fade_s, id?}   DELETE /api/dsp/presets/<id>
   POST /api/dsp/presets/recall      {preset, fade_s?}
   GET  /api/dsp/mqtt                the HA bridge's state (broker, entities, errors; never the password)
+  GET  /api/dsp/previews            which MediaMTX preview paths are live (for the HA add-on's designer)
 D3, satellites (a node without the hub role runs this server in satellite mode: the PipeWire executor of its share,
 see satellite.py; the hub's dsp finds it on :8362 through the registry):
   GET  /api/dsp/graph               this host's PipeWire graph for the hub's inventory
@@ -213,6 +214,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.mqtt.status() if self.mqtt else {"enabled": False})
             if p == "/api/dsp/nodes":
                 return self._send(200, self._nodes())
+            if p == "/api/dsp/previews":
+                # MediaMTX's API is on the hub's loopback: the remote designer (HA add-on) reads preview state here
+                return self._send(200, {"previews": self.dep.ctl.previews()})
             if p == "/api/dsp/voice":
                 return self._send(200, self.ctl.voice.status() if self.ctl.voice else {"enabled": False})
         except Exception as e:

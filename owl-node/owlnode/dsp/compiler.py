@@ -5,12 +5,17 @@
                                                    the deployer pairs the channels when both nodes exist
   patches    {receiver id: sender id}              IS-05 patches (satellite -> satellite, and the hub's transport)
   alloc      {sender id: hub receiver id}          which hub AES67 receiver carries which satellite sender
+  tx_alloc   {"<host>|<source>": sender id}        which of a host's AES67 senders carries which local source
   taps       {name: {node, monitor, ports, channels, block}}   meter taps on the hub (Meter blocks)
   controls   [(node, control, value)]              live filter-chain controls at their design values
   shares     {host: share}                         D3: the same four things for every satellite with a dsp role
                                                    (blocks placed there with "host": "<satellite>"), pushed to it
 
 Cross-host rules (a block or device port lives on one host; the hub and every dsp satellite have PipeWire graphs):
+  "a host's AES67 sender"            = one sender per distinct source: a source that crosses to several places rides one
+                                       sender (multicast fans it out), different sources get different senders from the
+                                       host's pool (install.sh --tx), kept across deploys. Only when the pool (or the
+                                       far end's receivers) runs out do sources share a sender, which mixes them (warned)
   satellite output -> hub input      = a link into that satellite's AES67 sender (its share) + an IS-05 patch of a hub
                                        receiver (reused when it already carries that sender, else a free one) + a link
                                        from the receiver's node on the hub
@@ -48,7 +53,7 @@ class Desired:
         self.wire_rx, self.wire_patch = {}, {}   # wire id -> hub receiver it rides on / receiver it patches
         self.pending = {}            # wire id -> why it is not compiled yet (a device that is absent; non-strict only)
         self.moves = []              # [{node, target, wire}]: app streams re-targeted into a block (wire "move": true)
-        self.hub_sender_used = None
+        self.tx_alloc = {}           # "<host>|<source key>" -> sender id (stable across deploys; see pick_sender)
         self.voice = None            # the Voice assistant block (engine voice): {block, label, mic, reply, mic_wire, reply_wire}
         self.voice_wires = {}        # wire id -> the hub node it names (the assistant's listen source / reply target)
         self.rtsp_video = {}         # RTSP blocks with video: block id -> {url, path, latency_ms, codec, label} (MediaMTX)
@@ -58,7 +63,7 @@ class Desired:
         return self.shares.setdefault(host, new_share(host, design_name))
 
     def summary(self):
-        return {"procs": sorted(self.procs), "links": self.links, "patches": self.patches, "alloc": self.alloc,
+        return {"procs": sorted(self.procs), "links": self.links, "patches": self.patches, "alloc": self.alloc, "tx_alloc": self.tx_alloc,
                 "taps": self.taps, "warnings": self.warnings, "wires": self.wire_impl, "moves": self.moves,
                 "shares": {h: {"blocks": sorted(s["blocks"]), "links": len(s["links"]), "taps": sorted(s["taps"])} for h, s in self.shares.items()}}
 
@@ -71,14 +76,23 @@ def parse_ep(ref):
     return b, p
 
 
-def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True):
+def source_key(src):
+    """A local source as the sender allocation sees it: the node, monitor or not, and the channel subset."""
+    ports = src.get("ports")
+    return f"{src['node']}{'#mon' if src.get('monitor') else ''}" + ("" if ports is None else "[" + ",".join(map(str, ports)) + "]")
+
+
+def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True, prev_tx_alloc=None):
     """strict: a device that is absent is an error (a user's Deploy). Non-strict (restore after a reboot, reconcile): its
-    wires are left pending and everything else compiles; the deployer recompiles as devices appear."""
+    wires are left pending and everything else compiles; the deployer recompiles as devices appear.
+    prev_alloc / prev_tx_alloc: the last deploy's hub receiver and sender allocations, kept where still possible so a
+    re-deploy does not re-patch streams that did not change."""
     d = Desired()
     absent = []
     hub = hub or inv.cfg.name
     dname = design.get("name")
     prev_alloc = dict(prev_alloc or {})
+    prev_tx_alloc = dict(prev_tx_alloc or {})
     sat_hosts = set(getattr(inv, "sats", {}) or {})
     blocks = {}
     # ---- processing blocks
@@ -270,14 +284,75 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True):
         return rid
 
     rx_sources = {}
+    # AES67 sender nodes a wire of the design feeds directly (a satellite's sender shown as a device block): the
+    # allocation leaves those alone, or a compiled wire would be mixed into a stream the user wired by hand
+    explicit_tx = set()
+    for w in design.get("wires") or []:
+        b_, _ = parse_ep(w.get("to"))
+        if b_ and b_.startswith("pw:") and b_.count(":") >= 2:
+            explicit_tx.add(b_.split(":", 2)[2])
+    tx_by_src = {}               # host -> {source key: sender}
+    tx_used = {}                 # host -> {sender id: [source keys]}
 
-    def sat_sender(host, wid):
-        """The satellite's AES67 sender (its PipeWire sink node + sender id) that carries this host's outputs."""
-        txs = (transport.get(host) or {}).get("senders") or []
-        if not txs:
+    def sender_pool(host):
+        """The host's AES67 senders (with their PipeWire node as pw_node), in a stable order."""
+        if host == hub:
+            txs = [dict(t, pw_node=(t.get("tags") or {}).get("urn:x-owl:pipewire-node", [None])[0]) for t in inv.hub_senders]
+        else:
+            txs = list((transport.get(host) or {}).get("senders") or [])
+        txs = [t for t in txs if t.get("pw_node")]
+        return sorted(txs, key=lambda t: (t.get("label") or "", t["id"]))
+
+    def rx_free(dst_host):
+        """Whether dst_host still has an AES67 receiver for one more sender (None: no receiver needed, e.g. a wire
+        straight into an NMOS receiver)."""
+        if dst_host is None:
+            return True
+        if dst_host == hub:
+            return any(r not in used_rx for r in hub_rx_pool)
+        return any(r["id"] not in rx_sources for r in (transport.get(dst_host) or {}).get("receivers") or [])
+
+    def rx_has(dst_host, sender_id):
+        if dst_host is None:
+            return False
+        if dst_host == hub:
+            return sender_id in d.alloc
+        return any(rx_sources.get(r["id"]) == sender_id for r in (transport.get(dst_host) or {}).get("receivers") or [])
+
+    def pick_sender(host, src, wid, dst_host=None):
+        """The AES67 sender of `host` that carries `src` (a local source) off the machine: the one already carrying it,
+        else last deploy's, else a free one. Shares (mixes) only when there is no free sender, or `dst_host` has no
+        receiver left for another stream; then it prefers a sender dst_host already receives."""
+        pool = [t for t in sender_pool(host) if t["pw_node"] not in explicit_tx]
+        if not pool:
             d.errors.append(f"wire {wid}: {host} has no AES67 sender to carry this (install.sh --tx there)")
             return None
-        return txs[0]
+        key = source_key(src)
+        mine, used = tx_by_src.setdefault(host, {}), tx_used.setdefault(host, {})
+        if key in mine:
+            return mine[key]
+        # free senders: this source's own from the last deploy first, then ones nobody had, and last the ones the last
+        # deploy gave another source (that source may still be in the design, further down the wires)
+        held = {sid for k, sid in prev_tx_alloc.items() if k.startswith(host + "|") and k != f"{host}|{key}"}
+        mine_before = prev_tx_alloc.get(f"{host}|{key}")
+        free = sorted((t for t in pool if t["id"] not in used),
+                      key=lambda t: (t["id"] != mine_before, t["id"] in held))
+        if free and rx_free(dst_host):
+            tx = free[0]
+        else:
+            shared = [t for t in pool if t["id"] in used]
+            if not shared:          # nothing to share yet: a free sender, even if the far end must re-target a receiver
+                tx = free[0]
+            else:
+                tx = next((t for t in shared if rx_has(dst_host, t["id"])), shared[0])
+                why = "every AES67 sender of " + host + " is in use (install.sh --tx adds one)" if not free else \
+                      f"{dst_host} has no free AES67 receiver (install.sh --rx there adds one)"
+                d.warnings.append(f"wire {wid}: {key} shares AES67 sender {tx.get('label')} with "
+                                  f"{', '.join(used[tx['id']])}: {why}; whoever receives it hears the sum")
+        mine[key] = tx
+        used.setdefault(tx["id"], []).append(key)
+        d.tx_alloc[f"{host}|{key}"] = tx["id"]
+        return tx
 
     def sat_receiver(host, sender_id, wid):
         """A receiver on `host` for sender_id: one already carrying it (in this design or live), else a free one."""
@@ -318,9 +393,9 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True):
             d.wire_hosts.setdefault(wid, []).append(host)
         return f"PipeWire link {src['node']} -> {dst['node']}" + ("" if host == hub else f" ({host})")
 
-    def into_sat_sender(host, src, wid):
-        """src (on satellite `host`) -> that satellite's AES67 sender; returns the sender id."""
-        tx = sat_sender(host, wid)
+    def into_sat_sender(host, src, wid, dst_host=None):
+        """src (on satellite `host`) -> one of that satellite's AES67 senders; returns the sender id."""
+        tx = pick_sender(host, src, wid, dst_host)
         if not tx:
             return None, None
         impl = local_link(host, src, {"kind": "pw", "node": tx["pw_node"], "ports": None}, wid)
@@ -348,11 +423,10 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True):
         impl.append(local_link(host, {"kind": "pw", "node": rx["pw_node"], "monitor": False, "ports": None}, dst, wid))
         return impl
 
-    def hub_tx():
-        if not inv.hub_senders:
-            return None, None
-        tx = inv.hub_senders[0]
-        return tx, (tx.get("tags") or {}).get("urn:x-owl:pipewire-node", [None])[0]
+    def hub_tx(src, wid, dst_host=None):
+        """The hub AES67 sender for src (see pick_sender) and its PipeWire node, or (None, None) with an error."""
+        tx = pick_sender(hub, src, wid, dst_host)
+        return (tx, tx["pw_node"]) if tx else (None, None)
 
     def voice_wire(wid, src, dst):
         """A wire into the assistant's listen input or out of its reply output: no link of ours; it names the node the
@@ -430,7 +504,7 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True):
                         d.moves.append({"node": src["node"], "target": dst["node"], "wire": wid})
                         impl.append(f"move the stream: target.object = {dst['node']} (WirePlumber takes {src['node']} off its current output; it falls back when the block is gone)")
                 elif sh != hub and dh == hub:                                    # satellite -> hub
-                    sid, i1 = into_sat_sender(sh, src, wid)
+                    sid, i1 = into_sat_sender(sh, src, wid, hub)
                     if not sid:
                         continue
                     i2 = from_hub_receiver(sid, dst, wid, src.get("device") or src["node"], sh)
@@ -438,17 +512,16 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True):
                         continue
                     impl += [i1] + i2
                 elif sh == hub and dh != hub:                                    # hub -> satellite
-                    tx, txn = hub_tx()
+                    tx, txn = hub_tx(src, wid, dh)
                     if not tx:
-                        raise CompileError([f"wire {wid}: the hub has no AES67 sender to carry this (install.sh --tx)"])
-                    impl.append(local_link(hub, src, {"kind": "pw", "node": txn, "ports": None}, wid) + " (hub AES67 sender)")
-                    d.hub_sender_used = tx["id"]
+                        continue
+                    impl.append(local_link(hub, src, {"kind": "pw", "node": txn, "ports": None}, wid) + f" (hub AES67 sender {tx.get('label')})")
                     i2 = from_sat_receiver(dh, tx["id"], dst, wid, tx.get("label"), hub)
                     if i2 is None:
                         continue
                     impl += i2
                 else:                                                            # satellite A -> satellite B
-                    sid, i1 = into_sat_sender(sh, src, wid)
+                    sid, i1 = into_sat_sender(sh, src, wid, dh)
                     if not sid:
                         continue
                     i2 = from_sat_receiver(dh, sid, dst, wid, src.get("device") or src["node"], sh)
@@ -474,12 +547,11 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True):
                 if dst["media"] != "audio":
                     raise CompileError([f"wire {wid}: an audio output cannot feed a video receiver"])
                 if sh == hub:
-                    tx, txn = hub_tx()
+                    tx, txn = hub_tx(src, wid)
                     if not tx:
-                        raise CompileError([f"wire {wid}: the hub has no AES67 sender to carry this (install.sh --tx)"])
-                    impl.append(local_link(hub, src, {"kind": "pw", "node": txn, "ports": None}, wid) + " (hub AES67 sender)")
+                        continue
+                    impl.append(local_link(hub, src, {"kind": "pw", "node": txn, "ports": None}, wid) + f" (hub AES67 sender {tx.get('label')})")
                     sid, slabel = tx["id"], tx.get("label")
-                    d.hub_sender_used = tx["id"]
                 elif sh == dst["host"]:
                     raise CompileError([f"wire {wid}: {dst['label']} is {sh}'s own receiver (a source there); wire into its PipeWire ports instead"])
                 else:
@@ -510,14 +582,19 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True):
             d.errors += e.errors
             continue
         d.wire_impl[wid] = impl
-    # one hub sender carrying several sources mixes them: say so
-    n_into_tx = sum(1 for l in d.links if d.hub_sender_used and l["dst"]["node"] and l["dst"]["node"].startswith("aes67-tx-"))
-    if n_into_tx > 1:
-        d.warnings.append(f"{n_into_tx} outputs feed the hub's one AES67 sender: every satellite patched to it hears the sum")
+    # sources sharing a sender mix (pick_sender warned per wire); a sender node also wired by hand is counted here
+    def mixed(links, where):
+        feeds = {}
+        for l in links:
+            n_ = l["dst"]["node"]
+            if n_ and n_.startswith("aes67-tx-"):
+                feeds.setdefault(n_, set()).add((l["src"]["node"], bool(l["src"].get("monitor")), str(l["src"].get("ports"))))
+        for n_, srcs in sorted(feeds.items()):
+            if len(srcs) > 1:
+                d.warnings.append(f"{len(srcs)} sources feed AES67 sender {n_}{where}: whoever receives it hears the sum")
+    mixed(d.links, " on the hub")
     for host, sh_ in d.shares.items():
-        n = sum(1 for l in sh_["links"] if l["dst"]["node"].startswith("aes67-tx-"))
-        if n > 1:
-            d.warnings.append(f"{n} outputs on {host} feed its one AES67 sender: whoever receives it hears the sum")
+        mixed(sh_["links"], f" on {host}")
     if d.voice and not d.voice["mic"]:
         d.warnings.append(f"the voice assistant ({d.voice['label']}) has nothing wired into 'listen': it cannot hear anything")
     if d.voice and not d.voice["reply"]:

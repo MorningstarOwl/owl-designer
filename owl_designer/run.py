@@ -1,7 +1,8 @@
 """Owl Designer add-on entry point: the add-on's options -> the controller's environment, then the controller.
 
 engine_url: the owl-node hub install's dsp API (port 8362 when none is given); the registry (8010) and MediaMTX
-(9997 API, 8889 WebRTC) are on the same machine unless registry_url says otherwise. The page is served on 8361, which
+(8889 WebRTC) are on the same machine unless registry_url says otherwise. MediaMTX's API (9997) listens on the hub's
+loopback only, so which previews are live comes from the engine (/api/dsp/previews), not from MediaMTX directly. The page is served on 8361, which
 is both Home Assistant's Ingress port and the optional LAN port."""
 import json, os, sys, urllib.request
 from urllib.parse import urlsplit
@@ -34,7 +35,6 @@ env = dict(os.environ,
            OWL_CONTROLLER_PORT="8361",
            OWL_DSP_API=engine or "http://engine-not-configured.invalid:8362",
            OWL_REGISTRY=registry or "http://registry-not-configured.invalid:8010",
-           OWL_MEDIAMTX_API=f"http://{host}:9997" if host else "http://127.0.0.1:9",
            OWL_MEDIAMTX_WEBRTC=f"http://{host}:8889" if host else "http://127.0.0.1:9")
 if not engine:
     log("engine_url is not set: the designer will open and say so. Set it in the add-on's Configuration tab "

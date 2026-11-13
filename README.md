@@ -29,7 +29,7 @@ press **Deploy**, and the hub turns them into PipeWire links on each machine and
 ## Features
 
 - **One canvas for every machine.** Add a machine by typing its IP; its inputs and outputs appear. Wires between
-  machines become AES67 streams (sample-accurate with PTP) and NMOS patches — you never pick a transport.
+  machines become AES67 streams (every machine on one PTP clock) and NMOS patches — you never pick a transport.
 - **Processing blocks**, live where it makes sense: parametric and DJ EQ, compressor, limiter, ducker, gain, delay,
   mixer, router, test tone, meters. They run on the hub or on any node. A block type is one YAML file.
 - **Echo cancellation for voice.** The WebRTC AEC3 block removes what the speakers and the TV play from the microphone,
@@ -96,8 +96,10 @@ flowchart LR
 - **Linux with PipeWire** on every machine (a desktop install has it; in use on Ubuntu 26.04 and on Raspberry Pi OS /
   Debian 12) and **Docker Engine with the compose plugin**.
 - **A wired network.** AES67 and PTP do not work over Wi-Fi. A network card with a **PTP hardware clock** (most Intel
-  i210/i225/i226 and the Raspberry Pi 5's built-in port) keeps every machine sample-accurate; without one a machine
-  still shows its devices but its network audio drifts.
+  i210/i225/i226 and the Raspberry Pi 5's built-in port) keeps every machine on the same clock; without one a machine
+  still shows its devices but its network audio drifts. Receivers play out adaptively by default: clean, but not
+  sample-aligned between rooms (one direction slips a 1 ms packet every ~11.5 s). Timestamp-locked playout
+  (`ts_direct: true` in `node.yaml`) is experimental: it is not yet reliable across restarts.
 - For the voice assistant: Home Assistant with an Assist pipeline, the **Wyoming** integration and a wake word engine
   (openWakeWord); for HA entities: an **MQTT broker** (the Mosquitto add-on).
 
@@ -123,6 +125,13 @@ owl-node/install.sh
 
 Same detection, plus one AES67 sender and one receiver (building takes 20–40 minutes on a Pi). Then, in the hub's
 designer, type the machine's IP in **Nodes** and press **Add**: the hub pairs it and its inputs and outputs appear.
+
+Each different source that leaves a machine needs a sender of its own there: music to the kitchen and the news to the
+bedroom, both from the hub, use two hub senders (re-run the hub's `install.sh` with its full list of streams, e.g.
+`--tx "Living Room" --tx "Living Room 2" --rx "Living Room RX 1"`: any `--tx`/`--rx`/`--vtx`/`--vrx` replaces all of
+them; likewise two `--rx` on a machine that receives two streams). With too few, Deploy warns and the sources share
+a sender, which mixes them. A node with a PTP hardware clock also stands by as the network's clock: if the hub is off,
+one node takes over so the others stay in step (`--ptp backup`, the default; `--ptp follower` opts out).
 
 <p><img src="docs/images/nodes.png" alt="The Nodes box: two nodes added by IP, answering and paired" width="300"></p>
 
@@ -260,7 +269,7 @@ with `install.sh --hub`.
 
 Used every day in one house — a hub, a Raspberry Pi 5 node, a PC node and Home Assistant — and still young. Planned:
 access control for the designer and the APIs (today they are open on your LAN; the HA sidebar is behind HA's login),
-prebuilt engine images, a local-engine mode for powerful Home Assistant hosts, and a zero-config MQTT link from the
+sample-aligned (timestamp-locked) playout between rooms, prebuilt engine images, a local-engine mode for powerful Home Assistant hosts, and a zero-config MQTT link from the
 add-on. Issues and pull requests are welcome.
 
 ## License

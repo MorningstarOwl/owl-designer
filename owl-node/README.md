@@ -246,8 +246,9 @@ of `docker-compose.yml`, an `.env` that points `OWL_ETC`/`OWL_STATE`/`OWL_RUN` i
 video-dec up -d` / `down` in that folder. A second user-space node on the same host needs `-p <project>` and its own
 `http_port` (the compose file names its project `owl-node`).
 
-`--ptp keep` (the default) uses the host's existing `owl-ptp4l.service` (installed by N1); `--ptp grandmaster|follower`
-installs it the same way N1 does. `--replace-n1` stops N1's hand-run `owl-aes67` user unit (both would create a PTP
+`--ptp keep` (the default) uses the host's existing `owl-ptp4l.service` (installed by N1); `--ptp grandmaster|backup|follower`
+installs it the same way N1 does (`backup`, a fresh node's default, takes over as grandmaster while the hub is down;
+see `aes67/README.md`). `--replace-n1` stops N1's hand-run `owl-aes67` user unit (both would create a PTP
 driver and announce the same sessions); it does not remove N1's files. Without `--enable` nothing comes back after a
 reboot (containers have `restart: no`, units are not enabled). With it, `owl-node.service` runs `docker compose up -d`
 at boot once the user's PipeWire socket exists; the box and pinode run this way since 2026-11-08 (reboot-tested).

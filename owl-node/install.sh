@@ -10,7 +10,7 @@
 #   hub:    ./install.sh --hub      (roles agent,audio,hub; the designer opens on http://<this IP>:8361)
 #   Detected when not given: --media-if (the wired interface of the default route; a bridge like br0 is fine),
 #   --phc-if (that interface or the bridge member with a PTP hardware clock; none = system clock, see below),
-#   --ptp (keep an existing owl-ptp4l.service, else grandmaster on a hub / follower on a node; none without a PHC),
+#   --ptp (keep an existing owl-ptp4l.service, else grandmaster on a hub / backup on a node; none without a PHC),
 #   one sender "<label>" and one receiver "<label> RX 1", the image (built here from this checkout when it is not
 #   loaded: minutes on a PC, 20-40 min on a Pi). Interactive runs ask whether to start at boot (--enable / --no-enable,
 #   --yes answers every question with its default).
@@ -38,10 +38,12 @@
 #                          N4: codecs=jxs makes it a JPEG XS RTP receiver (port=<default 5010+2n>, echo=ip:port)
 #   --video-dev PATH       extra device for the video containers (repeatable): a capture stick /dev/videoN; the Pi 5's
 #                          HEVC decoder (rpi-hevc-dec + /dev/media*) is found automatically
-#   --ptp keep|grandmaster|follower|none   keep (default) = use the host's existing owl-ptp4l.service (N1's);
-#                          grandmaster/follower = install it like N1 does (L2 transport, hardware timestamps)
+#   --ptp keep|grandmaster|backup|follower|none   keep (default) = use the host's existing owl-ptp4l.service (N1's);
+#                          grandmaster/backup/follower = install it like N1 does (L2 transport, hardware timestamps).
+#                          backup (a fresh node's default) follows the hub but takes over as grandmaster when the hub
+#                          is gone, so the nodes stay aligned; follower never leads (aes67/README.md)
 #   --registry none        a node: drop the registry of an earlier install; the hub pairs it from the designer instead
-#   --image TAG            owl-node image already loaded on this host (default owl-node:0.7.2)
+#   --image TAG            owl-node image already loaded on this host (default owl-node:0.7.3)
 #   --mqtt URL             hub only (D2): Home Assistant over MQTT, mqtt://user:pass@host:1883 -> OWL_MQTT_URL in .env
 #                          (the dsp role publishes HA discovery for every control). Or write
 #                          /var/lib/owl-node/mqtt.json {host, port, username, password} instead; neither = bridge off
@@ -53,7 +55,7 @@
 # Never touches the host's PipeWire/WirePlumber daemons or their config.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.7.2 MQTT_URL=""
+NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.7.3 MQTT_URL=""
 TX=() RX=() VTX=() VRX=() VDEV=() DRY=0 REMOVE=0 ENABLE="" START=1 REPLACE_N1=0 YES=0 MODE="" BUILD=auto
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -198,12 +200,12 @@ if [ -z "$PTP" ]; then
   if [ "$PHC_IF" = none ]; then PTP=none
   elif systemctl cat owl-ptp4l.service >/dev/null 2>&1; then PTP=keep
   elif [ $HUB = 1 ]; then PTP=grandmaster
-  else PTP=follower; fi
+  else PTP=backup; fi
 fi
-case "$PTP" in keep|grandmaster|follower|none) ;; *) echo "--ptp must be keep, grandmaster, follower or none" >&2; exit 2;; esac
+case "$PTP" in keep|grandmaster|backup|follower|none) ;; *) echo "--ptp must be keep, grandmaster, backup, follower or none" >&2; exit 2;; esac
 if [ "$PTP" = none ] && [ "$PHC_IF" != none ]; then PHC_IF=none; PHC_DEV=/dev/null; fi
 if [ "$PTP" = keep ] && [ "$PHC_IF" != none ] && ! systemctl cat owl-ptp4l.service >/dev/null 2>&1; then
-  echo "no owl-ptp4l.service on this host: pass --ptp grandmaster|follower" >&2; exit 1; fi
+  echo "no owl-ptp4l.service on this host: pass --ptp grandmaster|backup|follower" >&2; exit 1; fi
 command -v docker >/dev/null || { echo "Docker is not installed. Install Docker Engine with the compose plugin (https://docs.docker.com/engine/install/), add yourself to the docker group, log in again, re-run." >&2; exit 1; }
 docker compose version >/dev/null 2>&1 || $DOCKER compose version >/dev/null 2>&1 || { echo "the Docker compose plugin is missing (apt install docker-compose-plugin)" >&2; exit 1; }
 NEED_BUILD=0
@@ -334,7 +336,7 @@ run sudo systemd-tmpfiles --create "$TMPF"
 
 # ---------------------------------------------------------------- PTP
 if [ "$PHC_IF" != none ]; then
-  if [ "$PTP" = grandmaster ] || [ "$PTP" = follower ]; then
+  if [ "$PTP" = grandmaster ] || [ "$PTP" = backup ] || [ "$PTP" = follower ]; then
     command -v /usr/sbin/ptp4l >/dev/null || run sudo apt-get install -y linuxptp
     CFG=/etc/linuxptp/owl-aes67-$PTP.cfg
     put 0644 "$CFG" < "$HERE/../aes67/ptp4l-$PTP.cfg"

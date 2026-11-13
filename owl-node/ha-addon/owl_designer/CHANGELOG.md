@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.3
+- Routing page: video previews show whether they are live again (the add-on now asks the hub's engine, owl-node 0.7.3
+  or later, instead of MediaMTX's API, which only listens on the hub itself).
+- Engine (owl-node 0.7.3): different sources wired to different rooms get their own AES67 senders instead of being
+  mixed into one; nodes stand by as the network clock when the hub is off; IS-05 activations can no longer deadlock;
+  saved state survives power cuts.
+
 ## 0.7.2
 - Documentation tab rewritten, with a picture and first steps.
 - Designer: Panels pages fit phone screens (a row of page tabs made them wider than the screen); auto-placed blocks no
