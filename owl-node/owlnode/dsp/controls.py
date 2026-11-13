@@ -18,7 +18,7 @@ import copy, queue, threading, time
 from . import blocks as B
 from .deploy import DeployError
 
-FADE_STEP_S = 0.04
+FADE_STEP_S = 0.01          # 10 ms steps: a step is a line to the long-lived pw-cli (pw.PwCtl), so smooth is cheap
 
 
 class Bus:
@@ -83,7 +83,9 @@ class Controls:
     def refresh(self, force=False):
         with self.lock:
             d = self.dep.design or {}
-            sig = (id(d), len(d.get("blocks", [])), tuple(sorted(f"{b['id']}:{b.get('label')}:{b.get('type')}" for b in d.get("blocks", []))),
+            # the shape of the controls (values are read live, _live): a live change replaces the design object, which
+            # must not rebuild the listing and bump the version at every fader step
+            sig = (len(d.get("blocks", [])), tuple(sorted(f"{b['id']}:{b.get('label')}:{b.get('type')}" for b in d.get("blocks", []))),
                    len(d.get("presets") or []), tuple(p.get("name") for p in d.get("presets") or []))
             if not force and self._cache is not None and sig == self._design_sig:
                 return self._cache
@@ -387,7 +389,8 @@ class Controls:
 
 
 class Fade(threading.Thread):
-    """Linear ramp of one live numeric control over fade_s (40 ms steps); the last step persists the design."""
+    """Linear ramp of one live numeric control over fade_s (FADE_STEP_S steps, in the control's own unit: dB for a
+    gain, so the ramp sounds even); the last step persists the design."""
 
     def __init__(self, controls, c, start, end, secs, source):
         super().__init__(daemon=True)
@@ -410,7 +413,7 @@ class Fade(threading.Thread):
                 self.ctl.dep.set_param(self.c["block"], self.c["param"], v, persist=(i == n), source=self.source, quiet=(i < n))
             except DeployError:
                 return
-            if i % 5 == 0 and i < n:
+            if i % max(1, round(0.2 / FADE_STEP_S)) == 0 and i < n:          # the UI and HA: 5 updates a second
                 self.ctl.bus.publish({"type": "control", "key": self.c["key"], "name": self.c["name"], "value": v, "source": self.source, "fading": True})
             time.sleep(max(0, t0 + i * self.secs / n - time.time()))
         with self.ctl.lock:

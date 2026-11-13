@@ -168,6 +168,7 @@ class ShareDeployer:
         self.ops = GraphOps(taps)
         self.cfg, self.taps = cfg, taps
         self.lock = threading.RLock()
+        self.persist_share = pw.Debounced(self._write_share, 1.0)      # live controls: the file once a second
         self.share = read_json(SHARE, None) or empty_share(cfg.name)
         self.share.setdefault("digest", share_digest(self.share))
         self.applied_at, self.error, self.events, self.repairs = None, None, [], 0
@@ -231,15 +232,14 @@ class ShareDeployer:
     def clear(self):
         return self.apply(empty_share(self.cfg.name))
 
-    def control(self, sets, procs):
+    def _write_share(self):
         with self.lock:
-            g = pw.dump()
-            done = 0
-            for node, ctl, val in sets or []:
-                n = g.node(node)
-                if n:
-                    ok, _ = pw.set_control(n["id"], ctl, val)
-                    done += ok
+            atomic_write(SHARE, self.share)
+
+    def control(self, sets, procs):
+        # live: straight to PipeWire (cached node ids, the long-lived pw-cli), not behind the reconcile's lock
+        done = self.ops.send_controls([tuple(x) for x in sets or []])
+        with self.lock:
             # the running process record and the saved share follow the live values (no restart; a crash restart or
             # a reboot comes back with them)
             for bid, conf in (procs or {}).items():
@@ -250,8 +250,8 @@ class ShareDeployer:
                 cs = self.share.setdefault("controls", [])
                 cs[:] = [c for c in cs if not (c[0] == node and c[1] == ctl)] + [[node, ctl, val]]
             self.share["digest"] = share_digest(self.share)
-            atomic_write(SHARE, self.share)
-            return {"ok": True, "controls_set": done, "digest": self.share["digest"]}
+        self.persist_share()
+        return {"ok": True, "controls_set": done, "digest": self.share["digest"]}
 
     def reconcile(self):
         with self.lock:
@@ -261,7 +261,7 @@ class ShareDeployer:
                 if not was and p.running():
                     self.event(f"block process {p.name} restarted")
             try:
-                g = pw.dump()
+                g = self.ops.remember(pw.dump())
                 self.last_graph_error = None
             except Exception as e:
                 self.last_graph_error = str(e)
@@ -309,6 +309,8 @@ class ShareDeployer:
                     "pw_error": self.last_graph_error}
 
     def stop(self):
+        self.persist_share.flush()
+        self.ops.pwctl.stop()
         with self.lock:
             for p in self.procs.values():
                 p.stop()
