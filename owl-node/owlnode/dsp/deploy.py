@@ -247,8 +247,14 @@ class GraphOps:
         return n
 
     def tap_links(self, taps):
-        return [{"src": {"node": t["node"], "monitor": t["monitor"], "ports": t.get("ports")},
-                 "dst": {"node": f"owl-meter-{name}", "ports": None}, "wire": f"meter:{name}"} for name, t in taps.items()]
+        """Links from every tapped node into its tap's channels of a meter bank (meters.Taps; call after want())."""
+        out = []
+        for name, t in taps.items():
+            tg = self.taps.target(name) if self.taps is not None else None
+            if tg:
+                out.append({"src": {"node": t["node"], "monitor": t["monitor"], "ports": t.get("ports")},
+                            "dst": {"node": tg[0], "ports": tg[1]}, "wire": f"meter:{name}"})
+        return out
 
     def tap_channels(self, g, taps):
         out = {}
@@ -767,8 +773,8 @@ class Deployer:
                 if rid not in new.patches and self._sub(rid):
                     diff["patches"]["clear"].append(f"{lab(rid)} (now <- {lab(self._sub(rid))})")
             taps = self._auto_taps(new)
-            diff["taps"]["start"] = [n for n in taps if n not in self.taps.taps]
-            diff["taps"]["stop"] = [n for n in self.taps.taps if n not in taps]
+            diff["taps"]["start"] = [n for n in taps if n not in self.taps.alloc]
+            diff["taps"]["stop"] = [n for n in self.taps.alloc if n not in taps]
             diff["moves"] = {"set": [], "clear": [], "keep": []}
             old_moves = {m["node"]: m["target"] for m in self.state.get("moves") or []}
             for m in new.moves:
@@ -860,7 +866,7 @@ class Deployer:
                     raise DeployError(f"hub receiver nodes did not appear after patching: {', '.join(missing)}")
                 taps = self._auto_taps(new)
                 self.taps.want(self.ops.tap_channels(g, taps))
-                g, _ = self.ops.wait_nodes([f"owl-meter-{n}" for n in taps], timeout=4)
+                g, _ = self.ops.wait_nodes(self.taps.nodes(), timeout=4)
                 owned = []
                 missing, created, pending = self.ops.ensure_links(g, new.links + self.ops.tap_links(taps), owned)
                 if missing:
@@ -1235,8 +1241,9 @@ class Deployer:
                         continue
                     w = wires.setdefault(wid, {"state": "ok", "detail": []})
                     st_ = tstats.get(name) or {}
-                    mn = g.node(f"owl-meter-{name}")
-                    linked = mn and any(l["in_node"] == f"owl-meter-{name}" for l in g.links)
+                    tg = self.taps.target(name)
+                    mn = tg and g.node(tg[0])
+                    linked = mn and any(l["in_node"] == tg[0] and l["out_node"] == t["node"] for l in g.links)
                     if not st_.get("running") or not mn:
                         w["state"], w["detail"] = "pending", ["meter tap starting"]
                     elif not linked:

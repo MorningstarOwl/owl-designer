@@ -208,7 +208,7 @@ class ShareDeployer:
             if missing and not restore:
                 raise RuntimeError(f"block nodes did not appear: {', '.join(missing)}")
             self.taps.want(self._taps_for(share, g))
-            g, _ = self.ops.wait_nodes([f"owl-meter-{n}" for n in (share.get("taps") or {})], timeout=4)
+            g, _ = self.ops.wait_nodes(self.taps.nodes(), timeout=4)
             owned = []
             links = list(share.get("links") or []) + self.ops.tap_links(share.get("taps") or {})
             miss, created, pending = self.ops.ensure_links(g, links, owned)
