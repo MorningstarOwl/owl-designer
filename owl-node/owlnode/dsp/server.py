@@ -23,6 +23,7 @@ D2, named controls:
   POST /api/dsp/presets/recall      {preset, fade_s?}
   GET  /api/dsp/mqtt                the HA bridge's state (broker, entities, errors; never the password)
   GET  /api/dsp/previews            which MediaMTX preview paths are live (for the HA add-on's designer)
+  GET  /api/dsp/sap                 AES67 streams announced over SAP (Dante, ...), with their SDPs (OWL_SAP=off: none)
 D3, satellites (a node without the hub role runs this server in satellite mode: the PipeWire executor of its share,
 see satellite.py; the hub's dsp finds it on :8362 through the registry):
   GET  /api/dsp/graph               this host's PipeWire graph for the hub's inventory
@@ -47,6 +48,7 @@ from .voice import Voice
 from .ws import Session
 from .nodes import NodeBook, NodeError
 from . import probe as P
+from . import sap as SAP
 
 
 def log(*a):
@@ -150,6 +152,7 @@ class Handler(BaseHTTPRequestHandler):
     types = None
     ctl = None
     mqtt = None
+    sap = None
     ws_clients = 0
     server_version = "owl-node-dsp/" + VERSION
     protocol_version = "HTTP/1.1"
@@ -196,6 +199,7 @@ class Handler(BaseHTTPRequestHandler):
                 st["mqtt"] = self.mqtt.status() if self.mqtt else {"enabled": False}
                 st["voice"] = self.ctl.voice.status() if self.ctl.voice else None
                 st["probes"] = P.active()
+                st["sap"] = self.sap.status() if self.sap else {"enabled": False}
                 st["ws_clients"] = Handler.ws_clients
                 st["controls_version"] = self.ctl.version
                 return self._send(200, st)
@@ -214,6 +218,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.mqtt.status() if self.mqtt else {"enabled": False})
             if p == "/api/dsp/nodes":
                 return self._send(200, self._nodes())
+            if p == "/api/dsp/sap":
+                if not self.sap:
+                    return self._send(200, {"enabled": False, "streams": []})
+                return self._send(200, dict(self.sap.status(), enabled=True, streams=self.sap.dir.list()))
             if p == "/api/dsp/previews":
                 # MediaMTX's API is on the hub's loopback: the remote designer (HA add-on) reads preview state here
                 return self._send(200, {"previews": self.dep.ctl.previews()})
@@ -386,6 +394,10 @@ def main():
     ctl = Controller(reg)
     inv = Inventory(cfg, ctl)
     inv.book = NodeBook()
+    sap = None
+    if os.environ.get("OWL_SAP", "on") not in ("off", "0", "no"):
+        sap = SAP.Listener(cfg.ip, log=log)            # third-party AES67 streams (Dante, ...) announced over SAP
+        inv.sap = sap.dir
     taps = Taps()
     dep = Deployer(cfg, inv, types, taps, ctl)
     controls = Controls(dep, types, inv, cfg)
@@ -412,6 +424,9 @@ def main():
     mqtt.start()
     if voice:
         voice.start()
+    if sap:
+        sap.start()
+    Handler.sap = sap
 
     def loop():
         while not stopping:

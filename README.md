@@ -23,7 +23,8 @@ press **Deploy**, and the hub turns them into PipeWire links on each machine and
 
 [Features](#features) · [How it fits together](#how-it-fits-together) · [Requirements](#requirements) ·
 [Install](#install) · [Home Assistant](#connect-home-assistant) · [Your first design](#your-first-design) ·
-[Voice assistant](#echo-cancellation-and-the-voice-assistant) · [Cameras](#rtsp-cameras) · [Blocks](#blocks) ·
+[Voice assistant](#echo-cancellation-and-the-voice-assistant) · [Cameras](#rtsp-cameras) ·
+[Dante and AES67 gear](#dante-and-other-aes67-gear) · [Blocks](#blocks) ·
 [Updating](#updating) · [Ports](#network-ports) · [Troubleshooting](#troubleshooting) · [Status](#status-and-roadmap)
 
 ## Features
@@ -43,6 +44,9 @@ press **Deploy**, and the hub turns them into PipeWire links on each machine and
 - **🎧 Listening probe.** Drag the probe onto any port, block or wire and hear that point on the computer you are using.
 - **Safe deploys.** Every change is shown before it is applied, replacing a whole design is called out, and a failed
   deploy rolls back by itself.
+- **Dante and AES67 gear.** Streams that Dante devices (in AES67 mode) and other AES67 equipment announce on the
+  network appear as sources on the canvas, each channel pair wireable on its own; the hub can serve them the house
+  clock over UDP.
 - **Video (experimental):** H.264/HEVC over SRT and JPEG XS over RTP between nodes, with browser previews.
 
 <table>
@@ -200,6 +204,27 @@ UniFi Protect: enable RTSP on the camera and copy its `rtsps://…:7441/…` or 
 - The link is treated as a secret: masked in the designer, never logged, never an HA entity. Self-signed `rtsps`
   certificates are pinned on Deploy.
 
+## Dante and other AES67 gear
+
+The hub listens for SAP announcements (how AES67 devices advertise their streams): every playable stream it hears that
+is not an owl-node shows up on the canvas as an **AES67 stream** source (L16/L24, 44.1/48/96 kHz). Wire it into any
+input on any machine: Deploy patches an AES67 receiver there with the stream's own description. A stream with more
+than two channels (a Dante flow, a stagebox) also offers **channels 1-2, 3-4, …** as separate outputs, so you can send
+one pair to the kitchen and another to the deck. If the device re-announces with new settings, the design follows
+within a few seconds; a stream that stops being announced stays wired (greyed) until it returns.
+
+For Dante:
+
+- In Dante Controller, turn on **AES67 mode** for the device and create a **multicast flow** of the channels you want
+  (Dante only announces multicast AES67 flows).
+- Dante gear follows PTP over **UDP**, while owl-nodes use Ethernet-level PTP. Give the hub both:
+  `owl-node/install.sh --hub --ptp-udp` (a second, server-only PTP instance on the same clock; the hub's PTP hardware
+  clock must be on its media interface, not behind a bridge). Then the Dante device and the owl-nodes share one clock.
+- The other direction already works: owl-node senders are announced over SAP, so they appear in Dante Controller as
+  AES67 flows you can subscribe Dante receivers to.
+
+`OWL_SAP=off` in the hub's environment turns discovery off; `GET :8362/api/dsp/sap` lists what it hears.
+
 ## Blocks
 
 | Group | Block | |
@@ -233,7 +258,8 @@ configuration with its ports, parameters and live controls. Adding a LADSPA plug
 | 8010–8011/tcp | NMOS registry (hub) | 8360/tcp | NMOS node API (every machine) |
 | 10700/tcp | voice satellite (hub) | 5004/udp, 239.69.x.x | AES67 audio (multicast) |
 | 8889/tcp, 8189/udp | browser previews (WebRTC) | 8890/udp | SRT (video, camera relay) |
-| PTP | layer 2 (Ethernet), not IP | 1883/tcp | MQTT (to your broker) |
+| PTP | layer 2 (Ethernet); with `--ptp-udp` also 319–320/udp | 1883/tcp | MQTT (to your broker) |
+| 9875/udp, 239.255.255.255 | SAP stream announcements | | |
 
 ## Troubleshooting
 

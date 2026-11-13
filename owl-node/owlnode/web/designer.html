@@ -441,6 +441,7 @@ function autoPlace(block, index, counts, hub) {
   // hub sources & apps left, processing middle, hub sinks right, satellites far right
   let col;
   if (block.kind === "proc") col = 1;
+  else if (block.source === "sap") col = 0;            // an AES67 stream announced on the network: a source
   else if (block.source === "nmos" || (hub && block.host && block.host !== hub)) col = 3;
   else if (block.inputs.length && !block.outputs.some((p) => p.id === "out")) col = 2;
   else col = 0;
@@ -574,7 +575,9 @@ function App() {
     const have = new Set(out.map((b) => b.id));
     for (const w of design.wires || []) for (const ref of [w.from, w.to]) {
       const bid = ref.split("|")[0];
-      if (!have.has(bid) && !bid.match(/^[a-z][a-z0-9-]*$/)) { have.add(bid); out.push({ id: bid, kind: "device", source: bid.startsWith("nmos:") ? "nmos" : "pipewire", host: bid.split(":")[1] || "?", label: bid.split(":").pop(), sub: "not present", class: "gone", inputs: [], outputs: [], live: false }); }
+      if (!have.has(bid) && !bid.match(/^[a-z][a-z0-9-]*$/)) { have.add(bid); out.push(bid.startsWith("sap:")
+        ? { id: bid, kind: "device", source: "sap", host: "aes67", label: "AES67 stream", sub: "not announced now (its device is off, or stopped announcing)", class: "gone", inputs: [], outputs: [], live: false }
+        : { id: bid, kind: "device", source: bid.startsWith("nmos:") ? "nmos" : "pipewire", host: bid.split(":")[1] || "?", label: bid.split(":").pop(), sub: "not present", class: "gone", inputs: [], outputs: [], live: false }); }
     }
     return out;
   }, [inv, design, types, showHidden]);

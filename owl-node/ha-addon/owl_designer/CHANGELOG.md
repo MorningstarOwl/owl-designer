@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0
+- Designer: AES67 streams that Dante devices (AES67 mode) and other AES67 gear announce on the network appear as
+  sources, with each channel pair of a multichannel flow as its own output (needs the hub on owl-node 0.8.0).
+- Engine (owl-node 0.8.0): one sender carries several sources side by side on separate channels (Dante-style flows);
+  a hub's sender has 8 channels, so four stereo streams leave the hub over one stream; `install.sh --ptp-udp` serves the
+  house clock to Dante gear.
+
 ## 0.7.3
 - Routing page: video previews show whether they are live again (the add-on now asks the hub's engine, owl-node 0.7.3
   or later, instead of MediaMTX's API, which only listens on the hub itself).

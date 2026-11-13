@@ -4,7 +4,8 @@ Review of the repository at owl-designer 0.7.2 (2026-11-13): the NMOS agent, IS-
 DSP compiler/deployer, the APIs, the Wyoming voice satellite, video, the installer, CI and the Home Assistant add-on.
 Findings come from reading the code; nothing was built or run (the repository has no tests to run).
 
-Status: **section 1 (security) is deferred**; **section 2 (bugs) is fixed in 0.7.3** (see the notes under each item).
+Status: **section 1 (security) is deferred**; **section 2 (bugs) is fixed in 0.7.3**; **section 3 items 1-2 are done in
+0.8.0** (see the notes under each item).
 
 ## 1. Security (deferred)
 
@@ -59,10 +60,20 @@ Status: **section 1 (security) is deferred**; **section 2 (bugs) is fixed in 0.7
 
 1. Per-wire flow allocation and channel-level routing (sender pool and/or multichannel flows + IS-08 channel mapping)
    instead of fixed `--tx`/`--rx` sets.
+   *Done (0.8.0):* multichannel flows. A sender of up to 8 channels carries several sources side by side; the compiler
+   gives each distinct source a channel slot (stable across deploys, packing into senders the destination already
+   receives) and the receiving side links only those channels. A hub's default sender has 8 channels. IS-08 to expose
+   the mapping to other NMOS controllers is still open (item 5).
 2. SAP discovery of third-party AES67 / Dante (AES67 mode) / Ravenna streams as designer sources; UDPv4 PTP as the
    default wherever the host is not on a bridge.
+   *Done (0.8.0):* the hub's engine listens for SAP (`owlnode/dsp/sap.py`); playable streams that are not owl-nodes are
+   source blocks (channel pairs of multichannel flows wireable on their own); wiring one patches a receiver with the
+   announced SDP; a re-announcement with a new SDP is followed. `install.sh --hub --ptp-udp` installs the server-only
+   UDPv4 PTP instance for Dante gear (opt-in rather than default: it needs the PHC on the media interface, and the L2
+   nodes are unaffected). Not yet tried against a real Dante device.
 3. ST 2022-7 dual-network redundancy (only the first SDP leg is parsed today).
 4. Per-flow latency and aligned multi-room playout (depends on bug 4).
+   Next: a per-receiver latency setting from the designer.
 5. NMOS IS-07 (events for panels/buttons), IS-08, IS-11, IS-12; an IPMX roadmap for video.
 6. Video, NVX-style: HDMI audio de-embed/embed, multiview, a scalable video routing model.
 7. The hub is a single point of failure (registry, engine, PTP grandmaster): a standby hub, or documented degraded

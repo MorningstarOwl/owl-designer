@@ -45,8 +45,12 @@
 #                          grandmaster/backup/follower = install it like N1 does (L2 transport, hardware timestamps).
 #                          backup (a fresh node's default) follows the hub but takes over as grandmaster when the hub
 #                          is gone, so the nodes stay aligned; follower never leads (aes67/README.md)
+#   --ptp-udp / --no-ptp-udp   hub: also serve PTP over UDPv4 (a second ptp4l, server-only, same NIC and clock:
+#                          ptp/ptp4l-gm-udpv4.cfg), so Dante devices in AES67 mode and other AES67 gear, which expect
+#                          UDPv4, follow the house clock. Needs the PHC on the media interface itself (not a bridge
+#                          port). Kept on a re-run once installed; --no-ptp-udp removes it
 #   --registry none        a node: drop the registry of an earlier install; the hub pairs it from the designer instead
-#   --image TAG            owl-node image already loaded on this host (default owl-node:0.7.3)
+#   --image TAG            owl-node image already loaded on this host (default owl-node:0.8.0)
 #   --mqtt URL             hub only (D2): Home Assistant over MQTT, mqtt://user:pass@host:1883 -> OWL_MQTT_URL in .env
 #                          (the dsp role publishes HA discovery for every control). Or write
 #                          /var/lib/owl-node/mqtt.json {host, port, username, password} instead; neither = bridge off
@@ -58,19 +62,20 @@
 # Never touches the host's PipeWire/WirePlumber daemons or their config.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.7.3 MQTT_URL=""
-TX=() RX=() VTX=() VRX=() VDEV=() DRY=0 REMOVE=0 ENABLE="" START=1 REPLACE_N1=0 YES=0 MODE="" BUILD=auto
+NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.8.0 MQTT_URL=""
+TX=() RX=() VTX=() VRX=() VDEV=() DRY=0 REMOVE=0 ENABLE="" START=1 REPLACE_N1=0 YES=0 MODE="" BUILD=auto PTP_UDP=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME="$2"; shift 2;; --label) LABEL="$2"; shift 2;; --area) AREA="$2"; shift 2;;
     --roles) ROLES="$2"; shift 2;; --media-if) MEDIA_IF="$2"; shift 2;; --phc-if) PHC_IF="$2"; shift 2;;
+    --ptp-udp) PTP_UDP=1; shift;; --no-ptp-udp) PTP_UDP=0; shift;;
     --registry) REGISTRY="$2"; shift 2;; --ptp) PTP="$2"; shift 2;; --image) IMAGE="$2"; shift 2;; --mqtt) MQTT_URL="$2"; shift 2;;
     --tx) TX+=("$2"); shift 2;; --rx) RX+=("$2"); shift 2;;
     --vtx) VTX+=("$2"); shift 2;; --vrx) VRX+=("$2"); shift 2;; --video-dev) VDEV+=("$2"); shift 2;;
     --replace-n1) REPLACE_N1=1; shift;; --enable) ENABLE=1; shift;; --no-enable) ENABLE=0; shift;; --no-start) START=0; shift;;
     --dry-run) DRY=1; shift;; --remove) REMOVE=1; shift;;
     --node) MODE=node; shift;; --hub) MODE=hub; shift;; --yes|-y) YES=1; shift;; --no-build) BUILD=no; shift;;
-    -h|--help) sed -n 2,50p "$0"; exit 0;;
+    -h|--help) awk 'NR>1 && !/^#/ {exit} NR>1' "$0"; exit 0;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -109,6 +114,7 @@ ETC=/etc/owl-node OPT=/opt/owl-node STATE=/var/lib/owl-node RUNDIR=/run/owl-node
 TMPF=/etc/tmpfiles.d/owl-node.conf PTPSTAT_UNIT=/etc/systemd/system/owl-node-ptpstat.service
 BOOT_UNIT=/etc/systemd/system/owl-node.service
 PTP_UNIT=/etc/systemd/system/owl-ptp4l.service UDEV=/etc/udev/rules.d/60-owl-node-ptp.rules
+PTP_UDP_UNIT=/etc/systemd/system/owl-ptp4l-udpv4.service PTP_UDP_CFG=/etc/linuxptp/owl-aes67-gm-udpv4.cfg
 U=$(id -un) UIDN=$(id -u) GIDN=$(id -g)
 DOCKER="docker"; docker info >/dev/null 2>&1 || DOCKER="sudo docker"     # docker group members need no sudo
 if [ ${#VTX[@]} -gt 0 ] && [[ ",$ROLES," != *",video-enc,"* ]]; then ROLES="$ROLES,video-enc"; fi
@@ -125,7 +131,8 @@ if [ "$REMOVE" = 1 ]; then
   fi
   run sudo systemctl disable owl-node.service 2>/dev/null || true
   run sudo systemctl disable --now owl-node-ptpstat.service 2>/dev/null || true
-  for f in "$BOOT_UNIT" "$PTPSTAT_UNIT" "$TMPF" "$UDEV" /usr/local/lib/owl-node/owl-node-ptpstat.py; do [ -e "$f" ] && run sudo rm -f "$f"; done
+  run sudo systemctl disable --now owl-ptp4l-udpv4.service 2>/dev/null || true
+  for f in "$BOOT_UNIT" "$PTPSTAT_UNIT" "$TMPF" "$UDEV" "$PTP_UDP_UNIT" "$PTP_UDP_CFG" /usr/local/lib/owl-node/owl-node-ptpstat.py; do [ -e "$f" ] && run sudo rm -f "$f"; done
   [ -d "$OPT" ] && run sudo rm -rf "$OPT"
   [ -d "$ETC" ] && run sudo rm -rf "$ETC"
   [ -d "$RUNDIR" ] && run sudo rm -rf "$RUNDIR"
@@ -207,6 +214,12 @@ if [ -z "$PTP" ]; then
 fi
 case "$PTP" in keep|grandmaster|backup|follower|none) ;; *) echo "--ptp must be keep, grandmaster, backup, follower or none" >&2; exit 2;; esac
 if [ "$PTP" = none ] && [ "$PHC_IF" != none ]; then PHC_IF=none; PHC_DEV=/dev/null; fi
+if [ -z "$PTP_UDP" ]; then [ -e "$PTP_UDP_UNIT" ] && PTP_UDP=1 || PTP_UDP=0; fi        # keep what is installed
+if [ "$PTP_UDP" = 1 ]; then
+  [ $HUB = 1 ] || { echo "--ptp-udp is for the hub (the house's grandmaster)" >&2; exit 2; }
+  [ "$PHC_IF" != none ] || { echo "--ptp-udp needs a PTP hardware clock" >&2; exit 2; }
+  [ "$PHC_IF" = "$MEDIA_IF" ] || { echo "--ptp-udp: the PHC ($PHC_IF) is not the media interface ($MEDIA_IF): a UDP socket on a bridge port never receives (see ptp/ptp4l-gm-udpv4.cfg)" >&2; exit 2; }
+fi
 if [ "$PTP" = keep ] && [ "$PHC_IF" != none ] && ! systemctl cat owl-ptp4l.service >/dev/null 2>&1; then
   echo "no owl-ptp4l.service on this host: pass --ptp grandmaster|backup|follower" >&2; exit 1; fi
 command -v docker >/dev/null || { echo "Docker is not installed. Install Docker Engine with the compose plugin (https://docs.docker.com/engine/install/), add yourself to the docker group, log in again, re-run." >&2; exit 1; }
@@ -371,6 +384,34 @@ DevicePolicy=closed
 WantedBy=multi-user.target
 EOF
   fi
+  if [ "$PTP_UDP" = 1 ]; then
+    command -v /usr/sbin/ptp4l >/dev/null || run sudo apt-get install -y linuxptp
+    put 0644 "$PTP_UDP_CFG" < "$HERE/ptp/ptp4l-gm-udpv4.cfg"
+    put 0644 "$PTP_UDP_UNIT" <<EOF
+[Unit]
+Description=owl-node PTP over UDPv4 on $PHC_IF (server-only, for Dante / AES67 gear)
+After=network-online.target owl-ptp4l.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ptp4l -f $PTP_UDP_CFG -i $PHC_IF
+Restart=always
+RestartSec=5
+# its management sockets live in /run/timemaster (the only extra-instance path Ubuntu's ptp4l AppArmor profile allows)
+RuntimeDirectory=timemaster
+RuntimeDirectoryPreserve=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_TIME
+DeviceAllow=char-ptp rw
+DevicePolicy=closed
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  elif [ -e "$PTP_UDP_UNIT" ]; then
+    run sudo systemctl disable --now owl-ptp4l-udpv4.service 2>/dev/null || true
+    run sudo rm -f "$PTP_UDP_UNIT" "$PTP_UDP_CFG"
+  fi
   put 0644 "$UDEV" <<'EOF'
 # owl-node: the audio container (running as the desktop user) reads the NIC's PTP hardware clock. Read-only for others.
 SUBSYSTEM=="ptp", MODE="0664"
@@ -415,6 +456,7 @@ EOF
 run sudo systemctl daemon-reload
 if [ "$ENABLE" = 1 ]; then
   [ "$PHC_IF" != none ] && run sudo systemctl enable owl-ptp4l.service owl-node-ptpstat.service
+  [ "$PTP_UDP" = 1 ] && run sudo systemctl enable owl-ptp4l-udpv4.service
   run sudo systemctl enable owl-node.service
 else
   run sudo systemctl disable owl-node.service 2>/dev/null || true
@@ -430,11 +472,12 @@ fi
 if [ "$START" = 1 ]; then
   if [ "$PHC_IF" != none ]; then
     [ "$PTP" = keep ] || run sudo systemctl restart owl-ptp4l.service
+    [ "$PTP_UDP" = 1 ] && run sudo systemctl restart owl-ptp4l-udpv4.service
     run sudo systemctl restart owl-node-ptpstat.service
   fi
   compose up -d --remove-orphans
 fi
-echo "$([ $DRY = 1 ] && echo "[dry-run] would install" || echo installed) owl-node $NAME: roles=$ROLES media=$MEDIA_IF ($IP) phc=$PHC_IF ptp=$PTP" \
+echo "$([ $DRY = 1 ] && echo "[dry-run] would install" || echo installed) owl-node $NAME: roles=$ROLES media=$MEDIA_IF ($IP) phc=$PHC_IF ptp=$PTP$([ "$PTP_UDP" = 1 ] && echo "+udpv4")" \
      "registry=${REGISTRY:-paired-by-hub} $([ "$KEEP_STREAMS" = 1 ] && echo "streams=kept from the existing node.yaml" || echo "senders=${#TX[@]} receivers=${#RX[@]} video senders=${#VTX[@]} video receivers=${#VRX[@]}")" \
      "at-boot=$([ $ENABLE = 1 ] && echo yes || echo no)"
 if [ $HUB = 1 ]; then

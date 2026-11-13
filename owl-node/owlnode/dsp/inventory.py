@@ -118,6 +118,35 @@ def nmos_blocks(g, hub_node_id, hub_name):
     return out
 
 
+def sap_blocks(streams, owl_sessions=(), owl_ips=()):
+    """Announced AES67 streams (sap.Directory.list()) that are not owl-nodes -> network device blocks. A stream of more
+    than two channels (a Dante flow) also offers each channel pair as an output, so one pair can be wired on its own."""
+    out = []
+    for st in streams:
+        if st["name"] in owl_sessions or st["origin"] in owl_ips:
+            continue                                   # an owl-node's own sender: it is in the designer through NMOS
+        ch = st.get("channels") or 0
+        outputs = []
+        if not st.get("error"):
+            info = {"stream": st["id"], "sdp": st["sdp"], "name": st["name"], "channels": ch}
+            outputs.append({"id": "out", "label": "all channels" if ch > 2 else "out", "media": "audio", "channels": ch,
+                            "sap": dict(info, ports=None)})
+            if ch > 2:
+                for i in range(0, ch - 1, 2):
+                    outputs.append({"id": f"ch{i + 1}-{i + 2}", "label": f"channels {i + 1}-{i + 2}", "media": "audio",
+                                    "channels": 2, "sap": dict(info, ports=[i, i + 1])})
+                if ch % 2:
+                    outputs.append({"id": f"ch{ch}", "label": f"channel {ch}", "media": "audio", "channels": 1,
+                                    "sap": dict(info, ports=[ch - 1])})
+        f = st.get("format") or {}
+        sub = (f"AES67 stream (SAP) · {st['origin']} · {st.get('group')}:{st.get('port')} · "
+               f"{f.get('encoding')}/{f.get('rate')}/{ch}" if not st.get("error") else f"AES67 stream (SAP), not playable: {st['error']}")
+        out.append({"id": f"sap:{st['id']}", "kind": "device", "source": "sap", "host": "aes67", "label": st["name"],
+                    "sub": sub, "class": "source", "inputs": [], "outputs": outputs, "live": not st.get("error"),
+                    "origin": st["origin"]})
+    return out
+
+
 class Inventory:
     """Refreshed on demand (cached ~1.5 s). hub_receivers/hub_senders: the hub's audio transport for the compiler."""
 
@@ -131,6 +160,7 @@ class Inventory:
         self.sats = {}                  # host -> SatClient (D3: every non-hub owl-node is probed for a dsp role)
         self.book = None                # E1: NodeBook (nodes added by address in the designer), set by the server
         self.node_transport = {}        # host -> {senders: [...], receivers: [...]} (audio, with PipeWire node tags)
+        self.sap = None                 # sap.Directory of announced third-party AES67 streams, set by the server
 
     def refresh(self, max_age=1.5):
         if time.time() - self.time < max_age and self.graph is not None:
@@ -166,6 +196,11 @@ class Inventory:
             if c.graph is not None:
                 self.blocks += pw_blocks(c.graph, host, satellite=True, live=c.ok)
             self.blocks += self._transport_placeholders(host, c.graph)
+        if self.sap is not None:
+            owl_sessions = {t for s_ in self.senders.values() for t in (s_.get("tags") or {}).get("urn:x-owl:sap-session", [])}
+            owl_ips = {((n.get("api") or {}).get("endpoints") or [{}])[0].get("host")
+                       for n in self.nmos.get("nodes", []) if (self.nmos.get("status") or {}).get(n["id"])} | {self.cfg.ip}
+            self.blocks += sap_blocks(self.sap.list(), owl_sessions, owl_ips)
         self.time = time.time()
         return self
 

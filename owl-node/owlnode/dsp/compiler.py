@@ -264,6 +264,11 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True, p
             return {"kind": "pw", "node": port["pw"]["node"], "monitor": bool(port["pw"].get("monitor")), "ports": None,
                     "media": "audio", "channels": port["channels"], "device": blk["label"], "app": blk.get("class") == "app-out",
                     "host": blk["host"]}
+        if "sap" in port:                      # a third-party AES67 stream announced over SAP (sap.py)
+            sp = port["sap"]
+            return {"kind": "sap_tx", "sender": f"sap:{sp['stream']}", "sdp": sp["sdp"], "ports": sp.get("ports"),
+                    "media": "audio", "channels": port["channels"], "label": f"{blk['label']}" + (
+                        f" ({port['label']})" if sp.get("ports") is not None else ""), "host": None}
         if "nmos" in port:
             if role == "from":
                 return {"kind": "nmos_tx", "sender": port["nmos"]["sender"], "media": port["media"], "host": blk["host"],
@@ -277,6 +282,14 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True, p
 
     hub_rx_pool = {r["id"]: r for r in inv.hub_receivers}
     used_rx = set()
+    sap_sdp = {}                 # "sap:<stream>" -> {sdp, label}: receivers patched with an announced SDP, no NMOS sender
+
+    def set_patch(rid, sender_id, wid):
+        """A receiver's source: an NMOS sender (d.patches) or an announced stream (d.raw_patches, our own SDP)."""
+        if sender_id in sap_sdp:
+            d.raw_patches[rid] = dict(sap_sdp[sender_id], wire=wid)
+        else:
+            d.patches[rid] = sender_id
     transport = getattr(inv, "node_transport", {}) or {}
 
     def alloc_receiver(sender_id, wire_id):
@@ -291,10 +304,11 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True, p
             sub = r.get("subscription") or {}
             if sub.get("active") and sub.get("sender_id") == sender_id:
                 cands.append(r["id"])                                              # already carries it: adopt
-        for r in hub_rx_pool.values():
+        held = {rid for sid, rid in prev_alloc.items() if sid != sender_id}   # the last deploy's, for other senders
+        for r in sorted(hub_rx_pool.values(), key=lambda r: r["id"] in held):
             sub = r.get("subscription") or {}
             if r["id"] not in used_rx and not sub.get("active"):
-                cands.append(r["id"])                                              # free
+                cands.append(r["id"])                                              # free (others' previous last)
         busy = []
         for r in hub_rx_pool.values():
             sub = r.get("subscription") or {}
@@ -311,7 +325,7 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True, p
         rid = cands[0]
         d.alloc[sender_id] = rid
         used_rx.add(rid)
-        d.patches[rid] = sender_id
+        set_patch(rid, sender_id, wire_id)
         return rid
 
     rx_sources = {}
@@ -493,7 +507,7 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True, p
         if not rx:
             return None
         rx_sources[rx["id"]] = sender_id
-        d.patches[rx["id"]] = sender_id
+        set_patch(rx["id"], sender_id, wid)
         d.wire_patch[wid] = rx["id"]
         impl = [f"IS-05 patch {rx.get('label')} ({host}) <- {src_label} ({src_host})"]
         impl.append(local_link(host, {"kind": "pw", "node": rx["pw_node"], "monitor": False, "ports": ports}, dst, wid))
@@ -555,6 +569,31 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True, p
                 d.wire_patch[wid] = dst["receiver"]
                 impl.append(f"MediaMTX pulls {src['label']} (path {v['path']}); IS-05 patch {dst['label']} ({dst['host']}) "
                             f"<- SRT read:{v['path']} on the hub (MPEG-TS)")
+                d.wire_impl[wid] = impl
+                continue
+            if src["kind"] == "sap_tx":
+                sap_sdp[src["sender"]] = {"sdp": src["sdp"], "label": src["label"], "stream": src["sender"][4:]}
+                if dst["kind"] in ("pw", "meter"):
+                    dh_ = dst.get("host")
+                    if dh_ == hub:
+                        i2 = from_hub_receiver(src["sender"], dst, wid, src["label"], "AES67/SAP", src.get("ports"))
+                    else:
+                        i2 = from_sat_receiver(dh_, src["sender"], dst, wid, src["label"], "AES67/SAP", src.get("ports"))
+                    if i2 is None:
+                        continue
+                    impl += i2
+                elif dst["kind"] == "nmos_rx" and dst["media"] == "audio":
+                    if rx_sources.get(dst["receiver"], src["sender"]) != src["sender"]:
+                        raise CompileError([f"wire {wid}: receiver {dst['label']} already has another source"])
+                    if src.get("ports") is not None:
+                        d.warnings.append(f"wire {wid}: {dst['label']} gets the whole stream {src['label']}, not only "
+                                          f"those channels (an NMOS receiver plays a stream as it is)")
+                    rx_sources[dst["receiver"]] = src["sender"]
+                    set_patch(dst["receiver"], src["sender"], wid)
+                    d.wire_patch[wid] = dst["receiver"]
+                    impl.append(f"IS-05 patch {dst['label']} ({dst['host']}) <- {src['label']} (AES67/SAP, announced SDP)")
+                else:
+                    raise CompileError([f"wire {wid}: an AES67 stream goes into an audio input or an AES67 receiver"])
                 d.wire_impl[wid] = impl
                 continue
             if dst["kind"] == "voice" or src["kind"] == "voice":

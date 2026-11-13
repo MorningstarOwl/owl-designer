@@ -573,11 +573,23 @@ class Deployer:
         return bool(s.get("active")) and not s.get("sender_id")
 
     def _apply_raw_patches(self, desired, wait_s=8):
-        """Receivers wired from an RTSP block's video: patched with our own transport file when it changed or the
-        receiver is not playing it; receivers a previous design patched this way and this one does not are released."""
+        """Receivers patched with a transport file of our own (no NMOS sender behind it): wired from an RTSP block's
+        video (MediaMTX's relay), or from an AES67 stream announced over SAP (its own SDP, sap.py). Patched when the
+        file changed or the receiver is not playing it; receivers a previous design patched this way and this one does
+        not are released."""
         changes, applied = [], {}
         before = dict(self.state.get("raw_patches") or {})
         for rid, rp in (getattr(desired, "raw_patches", None) or {}).items():
+            if rp.get("sdp"):                                  # an announced AES67 stream
+                dig = __import__("hashlib").sha1(rp["sdp"].encode()).hexdigest()[:10]
+                applied[rid] = dig
+                if before.get(rid) == dig and self._raw_ok(rid):
+                    continue
+                code, resp = self.ctl.patch_sdp(rid, rp["sdp"], [{"rtp_enabled": True}])
+                if code not in (200, 202):
+                    raise DeployError(f"IS-05 patch of receiver {rid} <- {rp['label']} (AES67/SAP): HTTP {code} {str(resp)[:200]}")
+                changes.append(f"patched {rid[:8]} <- {rp['label']} (AES67/SAP)")
+                continue
             codec = self._rtsp_codec(rp, wait_s=wait_s)
             if codec is None:
                 codec = "h264"
@@ -608,8 +620,9 @@ class Deployer:
                 if code not in (200, 202):
                     raise DeployError(f"IS-05 patch of receiver {rid} <- {sid}: HTTP {code} {str(resp)[:200]}")
                 changes.append(f"patched {rid[:8]} <- {sid[:8]}")
+        raw = getattr(desired, "raw_patches", None) or {}
         for rid in set(owned_before) | set(adopted):
-            if rid not in desired.patches and rid in self.inv.receivers and self._sub(rid) is not None:
+            if rid not in desired.patches and rid not in raw and rid in self.inv.receivers and self._sub(rid) is not None:
                 code, resp = self.ctl.patch(rid, None)
                 changes.append(f"disconnected {rid[:8]} -> {code}")
         return changes
@@ -765,7 +778,8 @@ class Deployer:
                 self._sync_mediamtx(new, refresh_pins=(reason == "deploy"))
                 changes += self._apply_raw_patches(new)
                 rx_nodes = [(self.inv.receivers[r].get("tags") or {}).get("urn:x-owl:pipewire-node", [None])[0]
-                            for r in new.patches if r in self.inv.receivers and r in {x["id"] for x in self.inv.hub_receivers}]
+                            for r in list(new.patches) + list(new.raw_patches)
+                            if r in self.inv.receivers and r in {x["id"] for x in self.inv.hub_receivers}]
                 g, missing = self.ops.wait_nodes([n for n in rx_nodes if n])
                 if missing:
                     raise DeployError(f"hub receiver nodes did not appear after patching: {', '.join(missing)}")
@@ -857,11 +871,24 @@ class Deployer:
                 except Exception as e:
                     self.event(f"recompile with pending wires failed: {e}")
             self._reconcile_shares()
+            sap = getattr(self.inv, "sap", None)
+            if sap is not None and time.time() >= getattr(self, "sap_next", 0):
+                self.sap_next = time.time() + 5
+                moved = [rp["label"] for rp in (self.desired.raw_patches or {}).values()
+                         if rp.get("sdp") and (sap.get(rp.get("stream")) or {}).get("sdp") not in (None, rp["sdp"])]
+                if moved:                          # re-announced with another SDP (a Dante reconfiguration, ...)
+                    self.event(f"AES67 stream(s) re-announced with a new SDP: {', '.join(moved)}: re-applying")
+                    try:
+                        self.inv.refresh(0)
+                        self.apply(self.design, rollback=False, reason="AES67 stream re-announced", strict=False)
+                    except Exception as e:
+                        self.event(f"re-apply after a re-announcement failed: {e}")
             if (getattr(self.desired, "rtsp_video", None) or getattr(self.desired, "raw_patches", None)) \
                     and time.time() >= getattr(self, "mtx_next", 0):
                 self.mtx_next = time.time() + 15               # RTSP relay: paths and receivers heal themselves
                 try:
-                    self._sync_mediamtx(self.desired)
+                    if self.desired.rtsp_video:
+                        self._sync_mediamtx(self.desired)
                     if self.desired.raw_patches:
                         self.inv.refresh(0)
                         if any(not self._raw_ok(r) for r in self.desired.raw_patches):
@@ -869,9 +896,9 @@ class Deployer:
                             self.state["raw_patches"] = dict(self._raw_applied)
                             atomic_write(STATE, self.state)
                             if ch:
-                                self.event("re-patched camera receiver(s): " + "; ".join(ch))
+                                self.event("re-patched receiver(s) (camera / AES67 stream): " + "; ".join(ch))
                 except Exception as e:
-                    self.event(f"RTSP relay check: {type(e).__name__}: {e}")
+                    self.event(f"own-SDP patches (camera / AES67 stream): {type(e).__name__}: {e}")
             try:
                 g = pw.dump()
                 self.last_graph_error = None
@@ -1064,7 +1091,8 @@ class Deployer:
                         w["detail"].append("the receiver is not registered (its node is down?)")
                     elif not self._raw_ok(rid):
                         w["state"] = "missing"
-                        w["detail"].append("the receiver is not playing the camera (re-patched within 15 s)")
+                        w["detail"].append("the receiver is not playing " + ("the stream" if rp.get("sdp") else "the camera")
+                                           + " (re-patched within 15 s)")
                 for wid, node in (getattr(self.desired, "voice_wires", None) or {}).items():   # the assistant's listen/reply
                     w = wires.setdefault(wid, {"state": "ok", "detail": []})
                     if not g.node(node):
