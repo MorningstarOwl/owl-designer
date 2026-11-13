@@ -2,7 +2,8 @@
 # of the agent (IS-04-01, IS-05-01, IS-05-02), and the multi-arch image (native amd64 + arm64 runners, no QEMU).
 #   pull request   tests + conformance + an amd64 image build (proves the Dockerfile; nothing is pushed)
 #   push to main   + both images, published as ghcr.io/morningstarowl/owl-node:main and :sha-<commit>
-#   tag vX.Y.Z     + published as :X.Y.Z and :latest (the tag must equal owlnode VERSION); install.sh pulls :X.Y.Z
+#   tag vX.Y.Z     + published as :X.Y.Z and :latest (the tag must equal owlnode VERSION); install.sh pulls :X.Y.Z;
+#                    then the GitHub release "owl-designer X.Y.Z", its notes the version's section of owl-node/CHANGELOG.md
 name: owl-node
 on:
   push:
@@ -103,7 +104,7 @@ jobs:
     needs: image
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      contents: write          # the GitHub release of a tag
       packages: write
     steps:
       - uses: actions/checkout@v4
@@ -134,3 +135,13 @@ jobs:
         run: |
           docker buildx imagetools create ${{ steps.tags.outputs.args }} $(printf "$IMAGE@sha256:%s " *)
           docker buildx imagetools inspect "$(echo '${{ steps.tags.outputs.args }}' | awk '{print $2}')"
+      - name: GitHub release (tags only, once the images are published)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v="${GITHUB_REF#refs/tags/v}"
+          awk -v v="$v" '$0 == "## " v {f=1; next} /^## / && f {exit} f' owl-node/CHANGELOG.md > /tmp/notes.md
+          [ -s /tmp/notes.md ] || { echo "::error::owl-node/CHANGELOG.md has no '## $v' section"; exit 1; }
+          if gh release view "v$v" >/dev/null 2>&1; then echo "release v$v exists"
+          else gh release create "v$v" --verify-tag --title "owl-designer $v" --notes-file /tmp/notes.md; fi

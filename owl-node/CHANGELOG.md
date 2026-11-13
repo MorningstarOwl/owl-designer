@@ -4,6 +4,12 @@ The engine (the `owl-node` image, `install.sh`, the designer pages). The Home As
 [owl_designer/CHANGELOG.md](../owl_designer/CHANGELOG.md). Versions are shared: one `X.Y.Z` for both.
 
 ## 0.11.0
+- CI for the engine: lint, unit + live PipeWire tests, AMWA NMOS conformance (IS-04-01, IS-05-01, IS-05-02), and
+  multi-arch images published to `ghcr.io/morningstarowl/owl-node`; `install.sh` pulls the released image instead of
+  building it (`--build` to build anyway).
+- The Home Assistant add-on is built from the controller's source (no duplicated folder, no committed archive); the
+  designer page is split into `designer.html`, `designer.css` and `designer.js`.
+- Thread subclasses no longer shadow `threading.Thread._stop` (they crashed on Python <= 3.12 when joined).
 - Test signal injector: pink/white noise or a sine into any input, on any machine, at a set level and for a set time.
 - Sound library on the hub (WAV/FLAC/Ogg/MP3) and a Sound player block with Play/Stop controls (Panels, HA buttons).
 - `pw-dump` output with a trailing change document is read correctly.
@@ -28,10 +34,3 @@ The engine (the `owl-node` image, `install.sh`, the designer pages). The Home As
 
 ## 0.7.2 and earlier
 See the git history and the add-on changelog.
-
-## Unreleased
-- CI for the engine: lint, unit + live PipeWire tests, AMWA NMOS conformance, multi-arch images on GHCR.
-- `install.sh` pulls the released image instead of building it (`--build` to build anyway).
-- Thread subclasses no longer shadow `threading.Thread._stop` (they crashed on Python <= 3.12 when joined).
-- The add-on is built from the controller's source (no duplicated folder, no committed archive).
-- The designer page is split into `designer.html`, `designer.css` and `designer.js`.
