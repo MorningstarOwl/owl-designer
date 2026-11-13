@@ -3,6 +3,12 @@
 The engine (the `owl-node` image, `install.sh`, the designer pages). The Home Assistant add-on has its own:
 [owl_designer/CHANGELOG.md](../owl_designer/CHANGELOG.md). Versions are shared: one `X.Y.Z` for both.
 
+## 0.11.1
+- Voice satellite fixes (engine only; the add-on itself is unchanged): a Home Assistant that stops reading costs
+  dropped audio instead of a deaf satellite (per-link writer, real shutdown of dead links); no periodic wake re-arm
+  (it stacked Home Assistant wake runs); the wake word is detected on the speaker itself (openWakeWord in the image),
+  only the command goes to Home Assistant.
+
 ## 0.11.0
 - CI for the engine: lint, unit + live PipeWire tests, AMWA NMOS conformance (IS-04-01, IS-05-01, IS-05-02), and
   multi-arch images published to `ghcr.io/morningstarowl/owl-node`; `install.sh` pulls the released image instead of

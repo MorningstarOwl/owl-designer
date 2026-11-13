@@ -192,6 +192,9 @@ class Bridge(threading.Thread):
                 elif c["field"] in ("ptt_hold", "wake_word"):
                     out.append((o, "switch", dict(vb, state_topic=st_t, command_topic=cmd_t, payload_on="ON", payload_off="OFF", state_on="ON", state_off="OFF",
                                                   icon="mdi:microphone" if c["field"] == "ptt_hold" else "mdi:ear-hearing")))
+                elif c["type"] == "select":
+                    out.append((o, "select", dict(vb, state_topic=st_t, command_topic=cmd_t, options=[str(x) for x in c.get("options") or []],
+                                                  icon="mdi:account-voice")))
                 elif c["field"] == "mic_live":
                     out.append((o, "binary_sensor", dict(vb, state_topic=st_t, payload_on="ON", payload_off="OFF", icon="mdi:microphone")))
                 else:
@@ -300,6 +303,8 @@ class Bridge(threading.Thread):
         self._pub(f"{self.base}/control/voice.mic_live/state", "ON" if st.get("mic_live") else "OFF", retain=True)
         self._pub(f"{self.base}/control/voice.ptt_hold/state", "ON" if st.get("hold") else "OFF", retain=True)
         self._pub(f"{self.base}/control/voice.wake_word/state", "ON" if st.get("wake") else "OFF", retain=True)
+        if st.get("wake_model"):
+            self._pub(f"{self.base}/control/voice.wake_model/state", str(st["wake_model"]), retain=True)
 
     def publish_meters(self, values):
         # changed by >= 0.5 dB, or not sent for 45 s: the sensors carry expire_after 120 s, so a silent meter must keep

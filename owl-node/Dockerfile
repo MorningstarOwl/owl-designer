@@ -70,6 +70,25 @@ RUN apt-get update \
       gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-x mesa-va-drivers \
       python3-gi python3-gst-1.0 gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
  && rm -rf /var/lib/apt/lists/*
+# D3.2 on-device wake word (voice.py): pyopen-wakeword 1.1.0 (Apache-2.0, github.com/rhasspy/pyopen-wakeword), the
+# engine of HA's openWakeWord add-on: a py3-none wheel per arch that bundles the TFLite C library and the standard
+# models (okay_nabu, hey_jarvis, hey_mycroft, alexa, hey_rhasspy), so it works on the image's Python 3.14 as is.
+# Fetched from PyPI and checked by sha256 (the image has no pip); numpy is python3-numpy above.
+ARG TARGETARCH
+RUN python3 - <<'EOF'
+import hashlib, io, os, platform, urllib.request, zipfile
+arch = os.environ.get("TARGETARCH") or {"x86_64": "amd64", "aarch64": "arm64"}[platform.machine()]
+base = "https://files.pythonhosted.org/packages/"
+url, sha = {
+    "amd64": (base + "f0/d7/228edc51d9b35b9d46cf685509e79144262ffd8756a49243a27da3302059/pyopen_wakeword-1.1.0-py3-none-manylinux_2_35_x86_64.whl",
+              "754347a59de2b3d378a0cbc404a8b41164036e74fa1c185f88056974e4bfb6b4"),
+    "arm64": (base + "8c/74/746a3b3f81e2c1c69fc736c9e630f983797e413f7f58c1eac59d66d6687d/pyopen_wakeword-1.1.0-py3-none-manylinux_2_35_aarch64.whl",
+              "32a865123ebcc270ce6408b675456c3aecd8a6f0ddfe6311680616c9c01f990a"),
+}[arch]
+data = urllib.request.urlopen(url, timeout=120).read()
+assert hashlib.sha256(data).hexdigest() == sha, "pyopen-wakeword wheel checksum mismatch"
+zipfile.ZipFile(io.BytesIO(data)).extractall("/opt/owl-node/py")
+EOF
 COPY --from=gstbuild /src/libgstowlpoolfix.so /src/libgstowlrtpstat.so /opt/owl-node/gst/
 COPY --from=gstbuild /src/owl_ducker.so /opt/owl-node/ladspa/
 COPY --from=jxsbuild /opt/owl-node/lib/libSvtJpegxs.so.0 /opt/owl-node/lib/
@@ -78,7 +97,7 @@ COPY --from=jxsbuild /src/libgstsvtjpegxs.so /src/libgstrsrtp.so /opt/owl-node/g
 COPY owlnode /opt/owl-node/owlnode
 COPY dsp /opt/owl-node/dsp
 COPY entrypoint.sh /usr/local/bin/owl-node
-ENV PYTHONPATH=/opt/owl-node PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 GST_PLUGIN_PATH=/opt/owl-node/gst \
+ENV PYTHONPATH=/opt/owl-node:/opt/owl-node/py PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 GST_PLUGIN_PATH=/opt/owl-node/gst \
     LADSPA_PATH=/usr/lib/ladspa:/opt/owl-node/ladspa
 LABEL org.opencontainers.image.title="owl-node" \
       org.opencontainers.image.description="AES67 audio, H.264/HEVC-over-SRT and JPEG XS RTP video endpoint with an AMWA NMOS IS-04/IS-05 agent; hub: NMOS controller, DSP designer and compiler" \

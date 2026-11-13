@@ -158,13 +158,16 @@ class Controls:
                 for key, label, typ, live, help_ in (
                         ("voice.ptt", "Push to talk", "trigger", True, "Opens the AEC's clean mic to Assist until the utterance ends"),
                         ("voice.ptt_hold", "Talk (hold)", "bool", True, "Mic open while on; off closes it"),
-                        ("voice.wake_word", "Wake word", "bool", True, "Listens for the pipeline's wake word (chosen in HA: Settings > Voice assistants > the pipeline); persists across restarts; MIC LIVE while on"),
+                        ("voice.wake_word", "Wake word", "bool", True, "Listens for the wake word on this device (voice.wake_model); only the command after it goes to HA; persists across restarts; MIC LIVE while on"),
+                        ("voice.wake_model", "Wake word model", "select", True, "The word the device listens for: openWakeWord's built-in models plus custom <name>.tflite in /var/lib/owl-node/wake-models"),
                         ("voice.state", "Voice state", "text", False, "idle, listening, processing, responding"),
                         ("voice.mic_live", "Mic live", "bool", False, "True only inside a PTT window"),
                         ("voice.last_text", "Heard", "text", False, ""), ("voice.last_reply", "Reply", "text", False, ""),
                         ("voice.ha", "Assist link", "text", False, "Home Assistant's Wyoming connection")):
                     vc[key] = {"key": key, "name": key, "label": label, "type": typ, "kind": "voice", "live": live, "block": "voice",
                                "block_label": "Voice", "field": key.split(".", 1)[1], "help": help_, "readonly": not live}
+                from .voice import available_wake_models
+                vc["voice.wake_model"]["options"] = available_wake_models()
             aliases = dict((self.dep.state.get("aliases") or {}))
             self._cache = {"by_key": by_key, "by_name": by_name, "meters": meters, "presets": pc, "voice": vc, "aliases": aliases}
             return self._cache
@@ -274,6 +277,8 @@ class Controls:
                     return dict(self.voice.ptt_hold(B.truthy(value), source=source), key=c["key"], name=c["name"])
                 if c["field"] == "wake_word":
                     return dict(self.voice.set_wake(B.truthy(value), source=source), key=c["key"], name=c["name"])
+                if c["field"] == "wake_model":
+                    return dict(self.voice.set_wake_model(value, source=source), key=c["key"], name=c["name"])
             except RuntimeError as e:
                 raise DeployError(str(e))
             raise DeployError(f"{c['name']} is read-only")

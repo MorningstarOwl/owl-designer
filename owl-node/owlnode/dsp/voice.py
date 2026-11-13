@@ -26,12 +26,22 @@ listening comes up listening after a restart or a reboot and after HA reconnects
 OWL_VOICE_WAKE_MAX_MIN (default 0 = unbounded). MIC LIVE is shown the whole time, PTT
 stays available when the mode is off, on/off is logged.
 
+On-device wake word (the processing stays on the speaker itself; installing on the HA
+machine stays an option, not the lab's use case). With OWL_VOICE_WAKE_ENGINE=local (the default) the wake word is
+detected HERE: the clean mic feeds pyopen-wakeword (openWakeWord's models on the TFLite C library, the engine of HA's
+openWakeWord add-on) and nothing leaves the box until it fires. Then the satellite sends HA `detection` + run-pipeline
+{start_stage: asr} and streams only the command; HA does STT, the conversation and TTS as for PTT. HA runs no wake stage
+for us at all, so the stacked-wake-run failure (fe0403b) cannot happen. The word is the voice.wake_model control (a
+select in HA via MQTT): the built-in models plus any custom <name>.tflite in /var/lib/owl-node/wake-models; persisted
+with the switch. If the engine cannot load, the satellite falls back to HA's wake stage (OWL_VOICE_WAKE_ENGINE=ha
+forces that), where the word is the pipeline's "Wake word" setting in HA.
+
 Audible cue. A wake-word detection plays two short ascending blips (90 ms + 110 ms, ~660 Hz then a raised fifth) into
 the ducker's sidechain, i.e. the same sink as a reply, so it ducks the music and comes out of the speakers the reply
 comes out of; it is 0.2 s and fires the moment HA sends `detection`, before the user has to speak. OWL_VOICE_CUE=0
 silences it, OWL_VOICE_CUE_VOLUME (0.45) and OWL_VOICE_CUE_HZ (660) tune it. PTT is deliberately silent.
 """
-import json, os, socket, struct, subprocess, threading, time
+import collections, json, os, socket, struct, subprocess, threading, time
 
 from .. import config
 from ..config import atomic_write, read_json
@@ -40,15 +50,28 @@ MIC_RATE, MIC_CH, MIC_WIDTH = 16000, 1, 2
 CHUNK = 1024 * MIC_CH * MIC_WIDTH          # 64 ms of 16 kHz mono
 MAX_LISTEN_S = 12.0
 RUN_TIMEOUT_S = 45.0
-SEND_TIMEOUT_S = 10             # a peer that stops reading gets dropped after this, not held forever
+# Sending to HA (an incident: HA busy with add-on installs stopped reading for >10 s; the old synchronous
+# sendall under SO_SNDTIMEO raised BlockingIOError (= EAGAIN, the send timeout expiring), and the link was "killed"
+# without really closing it, so HA kept a half-dead link it was happy with and never reconnected). Now every
+# connection has its own writer thread (_Link): nobody else ever waits on HA, audio chunks are dropped while HA is not
+# reading, control frames queue, and only a peer that reads NOTHING for SEND_STALL_S loses the link -- by a real
+# shutdown(), which HA sees and answers with a reconnect 3 s later.
+SEND_TICK_S = 1                 # SO_SNDTIMEO: how often a blocked writer wakes up to check the stall clock
+SEND_STALL_S = float(os.environ.get("OWL_VOICE_SEND_STALL_S") or 30)   # no progress at all for this long = dead peer
+AUDIO_BACKLOG = 8               # audio-chunk frames (64 ms each) queued behind a slow HA before new ones are dropped
+CTRL_BACKLOG = 256              # control frames queued behind a stalled HA before the link is given up
+ORPHAN_WARN_S = 60.0            # wake wanted, HA alive (probes), but no control link for this long: say so loudly
 WAKE_MAX_MIN = 0.0            # minutes; 0 = no limit; OWL_VOICE_WAKE_MAX_MIN overrides
 # Last-resort re-arm interval, NOT a heartbeat. HA runs the wake stage with restart_on_end=True and
 # re-arms itself; if we ALSO send run-pipeline we end up with two concurrent wake stages and HA logs
 # 'Pipeline finished' + two 'Receiving audio from satellite'. openWakeWord then has its audio split
 # between them and detects nothing at all, while the satellite still reports state=wake/mic_live.
-# Measured: a 60 s re-arm produced exactly this. Keep this long enough that it
-# only rescues a genuinely dead pipeline.
-REARM_IDLE_S = float(os.environ.get("OWL_VOICE_REARM_IDLE_S") or 3600)
+# Measured: a 60 s re-arm produced exactly this, and later the hourly re-arm did it
+# too -- HA 2026.11.1 does not end the previous wake run, every run's audio stream reads the same queue, and
+# after a few hours of an idle room 3 runs split the mic three ways and nothing was detected for 7 h. So the
+# periodic re-arm is OFF (0); re-arms happen only where HA has no run of its own (pipeline error, after an
+# announcement). OWL_VOICE_REARM_IDLE_S=<s> turns it back on (not recommended).
+REARM_IDLE_S = float(os.environ.get("OWL_VOICE_REARM_IDLE_S") or 0)
 # After a NORMAL reply HA restarts the wake stage itself (restart_on_end=True). Sending run-pipeline as well
 # leaves TWO concurrent wake stages that split the 16 kHz frames: openWakeWord then stops firing entirely
 # (measured: first detection OK, every later one silent). Announcements/cancellations are the only
@@ -62,6 +85,11 @@ CUE_ON = (os.environ.get("OWL_VOICE_CUE") or "1").lower() not in ("0", "false", 
 CUE_VOLUME = float(os.environ.get("OWL_VOICE_CUE_VOLUME") or 0.45)
 CUE_HZ = float(os.environ.get("OWL_VOICE_CUE_HZ") or 660.0)
 CUE_RATE = 48000
+WAKE_ENGINE = (os.environ.get("OWL_VOICE_WAKE_ENGINE") or "local").lower()   # local (on this box) | ha (HA's wake stage)
+WAKE_THRESHOLD = float(os.environ.get("OWL_VOICE_WAKE_THRESHOLD") or 0.5)      # openWakeWord's default, as HA's add-on
+WAKE_REFRACTORY_S = 2.0
+DEFAULT_WAKE_MODEL = os.environ.get("OWL_VOICE_WAKE_MODEL") or "hey_mycroft"
+BUILTIN_WAKE_MODELS = ("okay_nabu", "hey_jarvis", "hey_mycroft", "alexa", "hey_rhasspy")
 STATE_FILE = None             # /var/lib/owl-node/dsp-voice.json (set at import from config)
 VERSION = "1"
 
@@ -124,6 +152,166 @@ def read_event(f):
     return hdr.get("type"), data, payload
 
 
+def wake_models_dir():
+    return os.path.join(config.STATE_DIR, "wake-models")
+
+
+def available_wake_models():
+    """Built-in openWakeWord models, then custom <name>.tflite files in /var/lib/owl-node/wake-models."""
+    out = list(BUILTIN_WAKE_MODELS)
+    try:
+        for f in sorted(os.listdir(wake_models_dir())):
+            if f.endswith(".tflite") and f[:-7] not in out:
+                out.append(f[:-7])
+    except OSError:
+        pass
+    return out
+
+
+class LocalWake:
+    """On-device openWakeWord for one model: 16 kHz s16 mono in, True when the word is heard. Same scoring as HA's
+    openWakeWord add-on (wyoming-openwakeword 2.x): a probability over WAKE_THRESHOLD fires once, then WAKE_REFRACTORY_S
+    of silence. Used from the mic pump thread only."""
+
+    def __init__(self, model_id, threshold=WAKE_THRESHOLD):
+        from pyopen_wakeword import Model, OpenWakeWord, OpenWakeWordFeatures
+        custom = os.path.join(wake_models_dir(), f"{model_id}.tflite")
+        if os.path.isfile(custom):
+            self.model = OpenWakeWord.from_model(custom)
+        elif model_id in BUILTIN_WAKE_MODELS:
+            self.model = OpenWakeWord.from_builtin(Model(model_id))
+        else:
+            raise ValueError(f"no wake word model {model_id!r} (built in: {', '.join(BUILTIN_WAKE_MODELS)}; custom: "
+                             f"{wake_models_dir()}/<name>.tflite)")
+        self.features = OpenWakeWordFeatures.from_builtin()
+        self.id, self.threshold = model_id, threshold
+        self.last, self.peak, self.score = 0.0, 0.0, 0.0
+
+    def reset(self):
+        self.features.reset()
+        self.model.reset()
+
+    def process(self, pcm):
+        hit = False
+        for feats in self.features.process_streaming(pcm):
+            for p in self.model.process_streaming(feats):
+                self.peak = max(self.peak, p)
+                if p > self.threshold and time.monotonic() - self.last >= WAKE_REFRACTORY_S:
+                    self.last, self.score, hit = time.monotonic(), p, True
+        return hit
+
+    def close(self):
+        for x in (self.model, self.features):
+            try:
+                x.close()
+            except Exception:
+                pass
+
+
+class _Link:
+    """The write side of one HA connection: a writer thread drains a queue, so a reader that stalls costs a dropped audio
+    chunk (or a wait in this thread only), never a blocked caller, a frozen status() or another connection's reply.
+
+    A frame is either written whole or the link is shut down: a half-written frame would desynchronise HA's reader.
+    close() uses shutdown(SHUT_RDWR), not close(): the reader thread's makefile() holds its own reference to the fd, so
+    socket.close() alone left the TCP connection up (seen: a "killed" link kept answering HA's pings for 10 min and
+    HA, seeing a healthy link, never re-sent run-satellite)."""
+
+    def __init__(self, conn, peer, on_dead=None):
+        self.conn, self.peer, self.on_dead = conn, peer, on_dead
+        self.is_ctrl = False               # carried run-satellite: HA's satellite link, not a describe probe
+        self.opened = time.time()
+        self.cv = threading.Condition()
+        self.q = collections.deque()       # (frame, is_audio)
+        self.audio_queued, self.dropped, self.sent = 0, 0, 0
+        self._drops_logged, self._drop_log_at = 0, 0.0
+        self.dead = None                   # the reason, once the link is down
+        try:
+            # bounds each send() only; recv stays blocking, so an idle-but-healthy HA link is never timed out
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", SEND_TICK_S, 0))
+        except OSError:
+            pass
+        threading.Thread(target=self._writer, daemon=True, name=f"voice-tx {peer}").start()
+
+    def send(self, frame, droppable=False):
+        """Queue one frame. -> False if it was an audio chunk dropped because HA is behind; raises if the link is down."""
+        with self.cv:
+            if self.dead:
+                raise ConnectionError(f"HA link {self.peer} is down ({self.dead})")
+            if droppable and self.audio_queued >= AUDIO_BACKLOG:
+                self.dropped += 1
+                if time.time() - self._drop_log_at > 30:
+                    self._drop_log_at = time.time()
+                    log(f"HA {self.peer} is not reading: dropping mic audio ({self.dropped} chunk(s) so far), link kept")
+                return False
+            if len(self.q) >= CTRL_BACKLOG + AUDIO_BACKLOG:
+                full = True
+            else:
+                full = False
+                self.q.append((frame, droppable))
+                self.audio_queued += 1 if droppable else 0
+                self.cv.notify()
+        if full:
+            self.close(f"send queue full ({len(self.q)} frames behind)")
+            raise ConnectionError(f"HA link {self.peer} is down (send queue full)")
+        return True
+
+    def _writer(self):
+        while True:
+            with self.cv:
+                while not self.q and not self.dead:
+                    self.cv.wait()
+                if self.dead:
+                    return
+                frame, audio = self.q.popleft()
+                self.audio_queued -= 1 if audio else 0
+            try:
+                self._sendall(frame)
+                self.sent += 1
+                if self.dropped != self._drops_logged and not self.audio_queued:
+                    log(f"HA {self.peer} is reading again ({self.dropped - self._drops_logged} mic chunk(s) dropped meanwhile)")
+                    self._drops_logged, self._drop_log_at = self.dropped, 0.0
+            except (OSError, ValueError) as e:
+                self.close(f"send failed ({type(e).__name__}: {e})")
+                return
+
+    def _sendall(self, frame):
+        view, blocked_since = memoryview(frame), None
+        while view:
+            if self.dead:
+                raise ConnectionError(self.dead)
+            try:
+                n = self.conn.send(view)
+            except (BlockingIOError, socket.timeout):      # SO_SNDTIMEO tick with nothing written: HA is not reading
+                now = time.time()
+                if blocked_since is None:
+                    blocked_since = now - SEND_TICK_S
+                elif now - blocked_since >= SEND_STALL_S:
+                    raise TimeoutError(f"HA read nothing for {now - blocked_since:.0f} s")
+                continue
+            view, blocked_since = view[n:], None
+
+    def close(self, why):
+        """Take the connection down for real (both directions; the reader sees EOF, HA sees the close). Idempotent."""
+        with self.cv:
+            if self.dead:
+                return False
+            self.dead = why
+            self.q.clear()
+            self.audio_queued = 0
+            self.cv.notify_all()
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        if self.on_dead:
+            try:
+                self.on_dead(self, why)
+            except Exception as e:
+                log(f"link {self.peer} on_dead: {type(e).__name__}: {e}")
+        return True
+
+
 class Voice(threading.Thread):
     def __init__(self, cfg, dep, bus, port=None):
         super().__init__(daemon=True, name="voice")
@@ -141,13 +329,19 @@ class Voice(threading.Thread):
         self.wake, self.wake_until, self.wake_detections = False, 0, 0
         self.wake_max_min = float(os.environ.get("OWL_VOICE_WAKE_MAX_MIN") or WAKE_MAX_MIN)
         self.state_file = os.path.join(config.STATE_DIR, "dsp-voice.json")
-        self.wake_wanted = bool((read_json(self.state_file, {}) or {}).get("wake"))   # persisted switch
+        saved = read_json(self.state_file, {}) or {}
+        self.wake_wanted = bool(saved.get("wake"))   # persisted switch
+        self.wake_model = saved.get("wake_model") or DEFAULT_WAKE_MODEL
+        self.wake_engine = WAKE_ENGINE if WAKE_ENGINE in ("local", "ha") else "local"
+        self._detector, self._phase, self._cmd_until = None, None, 0.0   # local engine: phase wake | command
+        self._wake_engine_note = ""
         self.wake_word = os.environ.get("OWL_VOICE_WAKE_WORD") or "Hey Mycroft"
         self._off_reason, self._off_at, self._wd_resume_at = None, 0.0, 0.0   # why wake went off (watchdog resume)
         self.lock = threading.RLock()
-        self._wlock = threading.Lock()     # serialises socket writes only; never held while computing status
-        self._out = None                   # HA's socket file (write side)
-        self._out_conn = None              # ... and the socket itself, for the send timeout and forced close
+        self._link = None                  # HA's control link (a _Link that carried run-satellite), or None
+        self._links = set()                # every open connection (control link, probes, stale links being reaped)
+        self._link_lost_at = time.time()   # when the last control link went away (orphan warning)
+        self._last_probe_at, self._orphan_warned_at = 0.0, 0.0
         self._rec, self._play = None, None
         self._halt = threading.Event()
         self._listen_until = 0
@@ -197,9 +391,15 @@ class Voice(threading.Thread):
                     "wired_by": ("override" if self.mic_override else "block" if self._block() is not None else "guess"),
                     "block": (self._block() or {}).get("block"),
                     "timings": dict(self.timings), "run_started": self.run_started, "max_listen_s": self.max_listen_s,
-                    "wake": self.wake, "wake_wanted": self.wake_wanted, "wake_word": self.wake_word, "wake_max_min": self.wake_max_min,
+                    "wake": self.wake, "wake_wanted": self.wake_wanted, "wake_word": (f"{self.wake_model.replace('_', ' ').title()} (on this device)" if self.wake_engine == "local"
+                                  and not self._wake_engine_note else self.wake_word), "wake_max_min": self.wake_max_min,
                     "wake_ends_in_s": (round(self.wake_until - time.time()) if self.wake_until != float("inf") else None) if self.wake else None,
-                    "wake_detections": self.wake_detections}
+                    "wake_detections": self.wake_detections,
+                    "wake_engine": self.wake_engine, "wake_engine_note": self._wake_engine_note,
+                    "wake_model": self.wake_model, "wake_models": available_wake_models(),
+                    "streaming_to_ha": bool(self._rec is not None and (self._phase == "command" or (self.wake and self._phase is None))),
+                    "link": ({"peer": self._link.peer, "queued": len(self._link.q), "sent": self._link.sent,
+                              "dropped_audio": self._link.dropped} if self._link is not None else None)}
 
     def _set(self, **kw):
         with self.lock:
@@ -257,6 +457,7 @@ class Voice(threading.Thread):
                 if not self.wake:
                     return {"ok": True, "wake": False}
                 self.wake = False
+                self._phase = None
                 self._off_reason, self._off_at = source, time.time()
                 self._stop_listening("wake word mode off")
                 self._abort_play()
@@ -285,7 +486,8 @@ class Voice(threading.Thread):
             self._start_wake_stream(mic)
         self._set(state="wake", mic_live=True)
         self._remember(True)
-        log(f"wake word mode ON ({source}): streaming {mic} to HA for the pipeline's wake word"
+        log(f"wake word mode ON ({source}): " + (f"listening on {mic} for {self.wake_model!r} on this device (nothing goes to HA until it is heard)"
+                                                  if self._phase is not None else f"streaming {mic} to HA for the pipeline's wake word")
             + (f" for at most {self.wake_max_min:g} min" if self.wake_max_min > 0 else " (no time limit)"))
         return {"ok": True, "wake": True, "ends_in_s": self.wake_max_min * 60 if self.wake_max_min > 0 else None}
 
@@ -293,9 +495,24 @@ class Voice(threading.Thread):
         """The switch survives restarts and reboots: a listening satellite comes back listening."""
         try:
             self.wake_wanted = bool(on)
-            atomic_write(self.state_file, {"wake": bool(on), "changed": time.time()})
+            atomic_write(self.state_file, {"wake": bool(on), "wake_model": self.wake_model, "changed": time.time()})
         except Exception as e:
             log(f"could not persist the wake switch: {e}")
+
+    def set_wake_model(self, name, source="api"):
+        """Choose the on-device wake word (voice.wake_model). Takes effect at once while listening; persisted."""
+        name = str(name or "").strip()
+        if name not in available_wake_models():
+            raise RuntimeError(f"no wake word model {name!r}; choose one of {', '.join(available_wake_models())}")
+        if self.wake_engine == "local":
+            LocalWake(name).close()                 # load it once now, so a broken custom model fails here, not silently
+        with self.lock:
+            self.wake_model = name
+        self._remember(self.wake_wanted)
+        self._set()
+        log(f"wake word model -> {name!r} ({source})" + ("" if self.wake_engine == "local" else
+                                                         " (only used by the on-device engine; HA's wake stage is active)"))
+        return {"ok": True, "wake_model": name}
 
     def _resume_if_wanted(self, why):
         """After HA connects and enables us: back to listening if the switch was on. A skipped resume is logged (it
@@ -313,8 +530,8 @@ class Voice(threading.Thread):
     def _rearm_wake(self, why):
         """HA stops its pipeline after an announcement, a started conversation or an error and then waits for the
         satellite's next run-pipeline (restart_on_end only covers a normal run end): send the wake stage again."""
-        if not self.wake or self._out is None:
-            return
+        if not self.wake or self._link is None or self._phase is not None:
+            return                                  # the on-device engine never asks HA for a wake stage
         try:
             self._send("run-pipeline", {"start_stage": "wake", "end_stage": "tts", "restart_on_end": True,
                                         "snd_format": {"rate": 22050, "width": 2, "channels": 1}})
@@ -324,11 +541,26 @@ class Voice(threading.Thread):
             log(f"re-arm failed: {type(e).__name__}: {e}")
 
     def _start_wake_stream(self, mic):
-        """run-pipeline from the wake stage (HA detects with the pipeline's wake word entity; restart_on_end keeps it
+        """On-device engine: the mic feeds the local detector, nothing goes to HA until it fires. HA engine (fallback):
+        run-pipeline from the wake stage (HA detects with the pipeline's wake word entity; restart_on_end keeps it
         listening after every run) and the continuous mic stream."""
-        self._send("run-pipeline", {"start_stage": "wake", "end_stage": "tts", "restart_on_end": True,
-                                    "snd_format": {"rate": 22050, "width": 2, "channels": 1}})
-        self._send("audio-start", {"rate": MIC_RATE, "width": MIC_WIDTH, "channels": MIC_CH, "timestamp": 0})
+        self._phase = None
+        if self.wake_engine == "local":
+            try:
+                if self._detector is None or self._detector.id != self.wake_model:
+                    if self._detector is not None:
+                        self._detector.close()
+                    self._detector = LocalWake(self.wake_model)
+                self._detector.reset()
+                self._phase, self._wake_engine_note = "wake", ""
+            except Exception as e:
+                self._detector = None
+                self._wake_engine_note = f"on-device engine unavailable ({type(e).__name__}: {e}); using HA's wake stage"
+                log(f"wake word: {self._wake_engine_note}")
+        if self._phase is None:
+            self._send("run-pipeline", {"start_stage": "wake", "end_stage": "tts", "restart_on_end": True,
+                                        "snd_format": {"rate": 22050, "width": 2, "channels": 1}})
+            self._send("audio-start", {"rate": MIC_RATE, "width": MIC_WIDTH, "channels": MIC_CH, "timestamp": 0})
         self._rec = self._record(mic)
         self._listen_until = self.wake_until
         self._last_arm = time.time()
@@ -383,16 +615,90 @@ class Voice(threading.Thread):
                         break
                 # Never send while holding self.lock: a stalled socket would freeze status()
                 # and the Web GUI along with it.
-                self._send("audio-chunk", {"rate": MIC_RATE, "width": MIC_WIDTH, "channels": MIC_CH, "timestamp": 0}, buf)
+                if self._phase is not None and self.wake:
+                    self._local_step(buf)              # on-device wake word: HA only gets the command after it
+                    continue
+                # A slow HA costs dropped chunks here (the link's writer keeps the queue short), never a wait.
+                self._send("audio-chunk", {"rate": MIC_RATE, "width": MIC_WIDTH, "channels": MIC_CH, "timestamp": 0}, buf,
+                           droppable=True)
         except Exception as e:
             log(f"mic pump: {type(e).__name__}: {e}")
+            link_lost = isinstance(e, ConnectionError)
+        else:
+            link_lost = False
         if self._rec is rec:
             if self.wake:
-                self.set_wake(False, source="time limit" if time.time() > self._listen_until else "mic ended")
+                self.set_wake(False, source="time limit" if time.time() > self._listen_until
+                              else "HA disconnected" if link_lost else "mic ended")
                 if time.time() <= self._listen_until:
                     threading.Timer(3.0, self._resume_if_wanted, ("mic ended",)).start()
             else:
                 self._stop_listening("max listen time" if time.time() > self._listen_until else "mic ended")
+
+    # ------------------------------------------------------------------ on-device wake word
+    def _local_step(self, buf):
+        """One mic chunk while the on-device engine is listening (pump thread). Phase 'wake': detect locally (not while
+        a reply or announcement plays from our own speakers). Phase 'command': stream to HA until its VAD, a transcript,
+        an error or max_listen_s ends the utterance."""
+        if self._phase == "command":
+            if time.time() > self._cmd_until:
+                self._end_command("max listen time")
+                return
+            self._send("audio-chunk", {"rate": MIC_RATE, "width": MIC_WIDTH, "channels": MIC_CH, "timestamp": 0}, buf,
+                       droppable=True)
+            return
+        det = self._detector
+        if det is None or det.id != self.wake_model:
+            try:
+                if det is not None:
+                    det.close()
+                det = self._detector = LocalWake(self.wake_model)
+            except Exception as e:
+                log(f"wake word model {self.wake_model!r}: {type(e).__name__}: {e}")
+                self._detector = None
+                self.wake_model = det.id if det is not None else DEFAULT_WAKE_MODEL
+                return
+        if self._play is not None:
+            return
+        if det.process(buf):
+            self._local_detected(det)
+
+    def _local_detected(self, det):
+        now = time.time()
+        with self.lock:
+            self.wake_detections += 1
+            self.run_started = now
+            self.timings = {"wake_on": self.timings.get("wake_on"), "detection": now}
+            self._phase, self._cmd_until = "command", now + self.max_listen_s
+        log(f"wake word {det.id!r} heard on this device (score {det.score:.2f}); streaming the command to HA")
+        try:
+            self._send("detection", {"name": det.id, "timestamp": 0})
+            self._send("run-pipeline", {"start_stage": "asr", "end_stage": "tts", "restart_on_end": False,
+                                        "snd_format": {"rate": 22050, "width": 2, "channels": 1}})
+            self._send("audio-start", {"rate": MIC_RATE, "width": MIC_WIDTH, "channels": MIC_CH, "timestamp": 0})
+        except ConnectionError as e:
+            self._phase = "wake"
+            self._set(last_error=f"wake word heard but HA is not connected ({e})")
+            log(f"wake word heard but HA is not connected: {e}")
+            return
+        self._set(state="listening", last_text="", last_reply="", last_error="")
+        self._chime()
+
+    def _end_command(self, why):
+        """The utterance is over: stop streaming to HA and go back to listening locally (state shows the run)."""
+        if self._phase != "command":
+            return
+        self._phase = "wake"
+        if self._detector is not None:
+            self._detector.reset()
+        self.timings["mic_closed"] = time.time()
+        try:
+            self._send("audio-stop", {"timestamp": 0})
+        except Exception:
+            pass
+        if self.state == "listening":
+            self._set(state="processing")
+        log(f"command sent ({why}) after {self.timings['mic_closed'] - (self.timings.get('detection') or self.timings['mic_closed']):.1f} s")
 
     def _stop_listening(self, why):
         with self.lock:
@@ -418,41 +724,26 @@ class Voice(threading.Thread):
         log(f"mic closed ({why}) after {self.timings['mic_closed'] - self.timings.get('ptt', self.timings['mic_closed']):.1f} s")
 
     # ------------------------------------------------------------------ HA link
-    def _kill_link(self, why):
-        """Drop a dead HA connection. A peer that stops reading must never wedge the process:
-        the old code wrote under self.lock with no timeout, so one half-dead socket froze
-        status(), the designer and the wake stage forever."""
-        with self.lock:
-            wf, conn = self._out, self._out_conn
-            self._out, self._out_conn = None, None
-        log(f"link killed: {why}")
-        for x in (wf, conn):
-            try:
-                if x is not None:
-                    x.close()
-            except Exception:
-                pass
-        self._set(ha_connected=False, ha_peer=None, last_error=why)
-
-    def _send(self, typ, data=None, payload=b"", link=None):
-        """Write one frame. `link` is a socket to answer on (a discovery probe that asked `describe`
-        must get its own `info` back); without it the frame goes to the control link."""
-        if link is not None:
-            conn = link          # a socket, exactly like self._out_conn
-        else:
+    def _send(self, typ, data=None, payload=b"", link=None, droppable=False):
+        """Queue one frame on `link` (a _Link: a discovery probe that asked `describe` must get its own `info` back) or,
+        without it, on the control link. Never blocks on HA; raises if there is no live link. `droppable` (audio chunks
+        only) lets a link that HA is not reading drop the frame instead of queueing it."""
+        if link is None:
             with self.lock:
-                conn = self._out_conn
-        if conn is None:
-            raise RuntimeError("Home Assistant is not connected")
-        frame = encode_event(typ, data, payload)
-        with self._wlock:
-            try:
-                conn.sendall(frame)
-            except OSError as e:
-                if link is not None:
-                    raise
-                self._kill_link(f"send failed ({type(e).__name__}: {e})")
-                raise
+                link = self._link
+        if link is None:
+            raise ConnectionError("Home Assistant is not connected")
+        return link.send(encode_event(typ, data, payload), droppable=droppable)
+
+    def _link_dead(self, link, why):
+        """A _Link went down (its writer gave up, or it was replaced/reaped). The reader thread sees EOF right after and
+        does the state cleanup in _serve; this only records why."""
+        if link.is_ctrl and why != "closed":
+            log(f"link killed ({link.peer}): {why}")
+            with self.lock:
+                mine = self._link is link
+            if mine:
+                self._set(last_error=why)
 
     def run(self):
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -506,34 +797,41 @@ class Voice(threading.Thread):
     def _serve(self, conn, addr):
         peer = f"{addr[0]}:{addr[1]}"
         conn.settimeout(None)
-        rf, wf = conn.makefile("rb"), conn.makefile("wb")
-        try:
-            # SO_SNDTIMEO bounds send() only, so a peer that stops reading raises instead of
-            # blocking forever (recv is unaffected, so an idle-but-healthy HA link stays up).
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", SEND_TIMEOUT_S, 0))
-        except OSError:
-            pass
-        # HA opens TWO kinds of connection: a persistent control link that starts with
-        # run-satellite, and the ~30 s zeroconf discovery probe that connects, asks describe and
-        # hangs up. A probe must never take over the control link, nor its close be mistaken for
-        # HA going away -- that used to disarm the wake word every 30 s and the pipeline never ran.
-        is_ctrl = False
+        rf = conn.makefile("rb")
+        link = _Link(conn, peer, on_dead=self._link_dead)
+        with self.lock:
+            self._links.add(link)
+        # HA opens TWO kinds of connection: its satellite (control) link, which starts with run-satellite, and the
+        # ~30 s describe-only probe that connects, asks describe and hangs up. A probe must never take over the control
+        # link, nor its close be mistaken for HA going away -- that used to disarm the wake word every 30 s.
+        # A control link that is no longer THE control link (replaced, or killed by its writer) is shut down and never
+        # answered again: HA only reconnects when its link dies or goes 5 s without an event (assist_satellite.py,
+        # _PING_TIMEOUT), so answering its pings on a link we have written off keeps HA connected to nothing.
         try:
             while not self._halt.is_set():
                 ev = read_event(rf)
-                if ev is None:
+                if ev is None or link.dead:
                     break
-                if ev[0] == "run-satellite" and not is_ctrl:
-                    is_ctrl = True
-                    self._take_over(conn, wf, peer)
-                self._handle(*ev, link=conn)
+                if ev[0] == "run-satellite" and not link.is_ctrl:
+                    link.is_ctrl = True
+                    self._take_over(link)
+                elif link.is_ctrl and self._link is not link:
+                    link.close("stale control link (replaced or written off); HA must reconnect")
+                    break
+                elif ev[0] == "describe" and not link.is_ctrl:
+                    self._last_probe_at = time.time()
+                self._handle(*ev, link=link)
         except (OSError, ValueError) as e:
-            log(f"link {peer}: {type(e).__name__}: {e}")
+            if not link.dead:
+                log(f"link {peer}: {type(e).__name__}: {e}")
         finally:
+            link.close("closed")
             with self.lock:
-                mine = self._out is wf
+                self._links.discard(link)
+                mine = self._link is link
                 if mine:
-                    self._out, self._out_conn = None, None
+                    self._link = None
+                    self._link_lost_at = time.time()
             if mine:
                 # HA can open its next control link while this one is still being torn down: the
                 # old link's reset and the new link's run-satellite landed in the same second, and this cleanup
@@ -542,46 +840,45 @@ class Voice(threading.Thread):
                 # and drop the flags only while no newer link has taken over; _take_over stops a wake stream the
                 # old link left running.
                 with self.lock:
-                    replaced = self._out is not None
+                    replaced = self._link is not None
                 if not replaced:
                     if self.wake:
                         self.set_wake(False, source="HA disconnected")
                     self._stop_listening("HA disconnected")
                     self._abort_play()
                 with self.lock:
-                    replaced = self._out is not None
+                    replaced = self._link is not None
                     if not replaced:
                         self._set(ha_connected=False, ha_enabled=False, ha_peer=None, state="idle", mic_live=False)
-                log(f"Home Assistant disconnected ({peer})" + (" — a newer link had already taken over" if replaced else ""))
-            elif not is_ctrl:
+                log(f"Home Assistant disconnected ({peer}" + (f": {link.dead}" if link.dead != "closed" else "") + ")"
+                    + (" — a newer link had already taken over" if replaced else ""))
+            elif link.is_ctrl:
+                log(f"previous HA link {peer} closed ({link.dead})")
+            else:
                 log(f"probe {peer} closed (describe only, link untouched)")
             try:
+                rf.close()
                 conn.close()
             except OSError:
                 pass
 
-    def _take_over(self, conn, wf, peer):
+    def _take_over(self, link):
         """Promote a connection to the control link, replacing any previous one.
 
         A wake stream still running for the previous link is stopped first (the wish is kept), so the run-satellite
         resume starts a fresh wake stage on THIS link instead of finding wake 'already on' and never arming it. The
         swap and the connected flag change together under the lock, so the previous link's cleanup cannot mark this
-        link disconnected afterwards."""
+        link disconnected afterwards. The previous link is shut down for real, so HA cannot keep using it."""
         with self.lock:
-            carried = self._out is not None and self.wake
+            carried = self._link is not None and self.wake
         if carried:
             self.set_wake(False, source="HA disconnected")
         with self.lock:
-            old, old_conn = self._out, self._out_conn
-            self._out, self._out_conn = wf, conn
-            self._set(ha_connected=True, ha_peer=peer, last_error="")
-        for x in (old, old_conn):
-            try:
-                if x is not None:
-                    x.close()
-            except Exception:
-                pass
-        log(f"Home Assistant link established ({peer})" + (" (replaced the previous link)" if old is not None else ""))
+            old, self._link = self._link, link
+            self._set(ha_connected=True, ha_peer=link.peer, last_error="")
+        if old is not None:
+            old.close(f"replaced by {link.peer}")
+        log(f"Home Assistant link established ({link.peer})" + (f" (replaced {old.peer})" if old is not None else ""))
 
     def _handle(self, typ, data, payload, link=None):
         if typ not in ("ping", "pong", "audio-chunk"):
@@ -605,11 +902,13 @@ class Voice(threading.Thread):
             self.timings["voice_started"] = time.time()
         elif typ == "voice-stopped":
             self.timings["voice_stopped"] = time.time()
-            if self.wake:
+            if self.wake and self._phase is not None:
+                self._end_command("end of utterance")
+            elif self.wake:
                 self._set(state="processing")           # the stream stays open: HA restarts at the wake stage after the run
             else:
                 self._stop_listening("end of utterance")
-        elif typ == "detection":
+        elif typ == "detection" and self._phase is None:
             self.timings = {"wake_on": self.timings.get("wake_on"), "detection": time.time()}     # one run's timings
             self.wake_detections += 1
             self.run_started = time.time()
@@ -619,7 +918,9 @@ class Voice(threading.Thread):
         elif typ == "transcript":
             self.timings["transcript"] = time.time()
             self._set(last_text=data.get("text") or "", state="processing")
-            if not self.wake:
+            if self.wake and self._phase is not None:
+                self._end_command("transcript")
+            elif not self.wake:
                 self._stop_listening("transcript")
             log(f"heard: {data.get('text')!r}")
         elif typ == "synthesize":
@@ -637,7 +938,10 @@ class Voice(threading.Thread):
             self._finish_play()
         elif typ == "error":
             self.timings["error"] = time.time()
-            if self.wake:
+            if self.wake and self._phase is not None:
+                self._end_command("pipeline error")    # back to listening on this device; nothing to re-arm in HA
+                self._set(last_error=f"{data.get('code') or 'error'}: {data.get('text') or ''}", state="wake")
+            elif self.wake:
                 # HA does not restart the pipeline after an error (restart_on_end is ignored then): start the wake stage again
                 self._set(last_error=f"{data.get('code') or 'error'}: {data.get('text') or ''}", state="wake")
                 self._rearm_wake("pipeline error")
@@ -645,7 +949,7 @@ class Voice(threading.Thread):
                 self._stop_listening("pipeline error")
                 self._set(last_error=f"{data.get('code') or 'error'}: {data.get('text') or ''}", state="idle")
             log(f"pipeline error: {data}")
-        elif typ in ("detect", "streaming-started", "streaming-stopped") or (typ or "").startswith("timer-"):
+        elif typ in ("detection", "detect", "streaming-started", "streaming-stopped") or (typ or "").startswith("timer-"):
             pass
         else:
             log(f"unhandled event {typ} {data}")
@@ -748,7 +1052,7 @@ class Voice(threading.Thread):
                 st, t0, rec = self.state, self.run_started, self._rec
             if self.wake and time.time() > self.wake_until:
                 self.set_wake(False, source="time limit")
-            elif self.wake and st == "wake" and time.time() - max(getattr(self, "_last_arm", 0), self.timings.get("detection") or 0) > REARM_IDLE_S:
+            elif REARM_IDLE_S > 0 and self.wake and st == "wake" and time.time() - max(getattr(self, "_last_arm", 0), self.timings.get("detection") or 0) > REARM_IDLE_S:
                 self._rearm_wake("periodic")           # safety net (idle re-arm): a wake stage HA dropped without telling us; a
                                                        # re-arm restarts HA's wake stage and drops audio in flight, so rarely
             elif rec is not None and not self.wake and time.time() > self._listen_until:
@@ -776,15 +1080,39 @@ class Voice(threading.Thread):
                         log(f"retarget to {want}: {type(e).__name__}: {e}")
             now = time.time()
             if (not self.wake and self.wake_wanted and self._off_reason == "no mic in the design" and rec is None
-                    and st == "idle" and self.mic_node() and self._out is not None and self.ha_connected and self.ha_enabled
+                    and st == "idle" and self.mic_node() and self._link is not None and self.ha_connected and self.ha_enabled
                     and now - self._wd_resume_at > 10):
                 self._wd_resume_at = now
                 self._resume_if_wanted("watchdog: a mic is wired again")
-            if (not self.wake and self.wake_wanted and self._off_reason == "HA disconnected" and rec is None
-                    and st == "idle" and self._out is not None and self.ha_connected and self.ha_enabled
+            if (not self.wake and self.wake_wanted and self._off_reason in ("HA disconnected", "mic ended") and rec is None
+                    and st == "idle" and self._link is not None and self.ha_connected and self.ha_enabled
                     and now - self._off_at > 5 and now - self._wd_resume_at > 10):
                 self._wd_resume_at = now
                 self._resume_if_wanted("watchdog: link up, wake wanted")
+            self._reap_and_nudge(now)
+
+    def _reap_and_nudge(self, now):
+        """Never leave HA holding a link we have written off. Any connection that carried run-satellite but is not the
+        control link is shut down (its reader also does this on its next event; this catches a silent one). HA's
+        satellite task reconnects 3 s after its link dies and retries every 10 s (assist_satellite.py on_restart /
+        on_reconnect), so this is all it takes to get run-satellite again; zeroconf re-discovery would NOT help (the
+        config flow aborts as already_configured), and describe probes cannot be turned into a satellite link.
+        If HA is clearly alive (probes keep coming) yet no control link has arrived for ORPHAN_WARN_S while the wake
+        word is wanted, every other connection from HA is closed too and it is logged loudly: then HA's satellite task
+        itself is stuck, which only an entry reload in HA fixes."""
+        with self.lock:
+            cur, links = self._link, list(self._links)
+        for l in links:
+            if l.is_ctrl and l is not cur and not l.dead:
+                l.close("stale control link (reaper); HA must reconnect")
+        if (cur is None and self.wake_wanted and now - self._link_lost_at > ORPHAN_WARN_S
+                and now - self._last_probe_at < 45 and now - self._orphan_warned_at > 300):
+            self._orphan_warned_at = now
+            for l in links:
+                if not l.dead and now - l.opened > 10:
+                    l.close("orphan sweep")
+            log(f"WARNING: wake word wanted and HA is reachable (describe probes), but HA has not opened the satellite "
+                f"link for {now - self._link_lost_at:.0f} s; its satellite task looks stuck (reload the Wyoming entry)")
 
     def stop(self):
         self._halt.set()

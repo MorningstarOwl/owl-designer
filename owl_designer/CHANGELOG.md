@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.1
+- Voice satellite fixes (engine only; the add-on itself is unchanged): a Home Assistant that stops reading costs
+  dropped audio instead of a deaf satellite (per-link writer, real shutdown of dead links); no periodic wake re-arm
+  (it stacked Home Assistant wake runs); the wake word is detected on the speaker itself (openWakeWord in the image),
+  only the command goes to Home Assistant.
+
 ## 0.11.0
 - Designer: **🔊 Inject** next to the probe: drag it onto any input, on any machine, to play pink/white noise or a sine
   at a set level for a set time. **Sounds** in the Design panel: upload doorbells, chimes and alarms; a new **Sound
