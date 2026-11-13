@@ -7,12 +7,11 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 TMP = tempfile.mkdtemp(prefix="owl-lat-")
-os.environ.setdefault("OWL_NODE_STATE", os.path.join(TMP, "state"))
-os.environ.setdefault("OWL_NODE_RUN", os.path.join(TMP, "run"))
 
 from owlnode import agent as A, audio, config  # noqa: E402
 from owlnode.dsp.compiler import CompileError, compile_design  # noqa: E402
 from test_compiler_senders import FakeInv, TYPES, design  # noqa: E402
+from _owltmp import isolate  # noqa: E402
 
 
 class CompilerLatency(unittest.TestCase):
@@ -46,6 +45,7 @@ class CompilerLatency(unittest.TestCase):
 
 class AgentLatency(unittest.TestCase):
     def setUp(self):
+        isolate(self)
         path = os.path.join(TMP, "node.yaml")
         with open(path, "w") as f:
             f.write("name: n\ninterfaces: {media: lo}\nclock: {phc_if: none}\naudio:\n  receivers: [{id: rx1}]\n")

@@ -6,12 +6,12 @@ PATCHes) each held one lock and waited for the other forever. A barrier forces e
 import os, sys, tempfile, threading, unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(__file__))
 TMP = tempfile.mkdtemp(prefix="owl-test-")
-os.environ.setdefault("OWL_NODE_STATE", os.path.join(TMP, "state"))
-os.environ.setdefault("OWL_NODE_RUN", os.path.join(TMP, "run"))
 
 from owlnode import config  # noqa: E402
 from owlnode.agent import Agent  # noqa: E402
+from _owltmp import isolate  # noqa: E402
 
 NODE_YAML = """
 name: testnode
@@ -32,6 +32,7 @@ def make_agent():
 
 class ConcurrentActivation(unittest.TestCase):
     def test_two_receivers_activate_at_once(self):
+        isolate(self)
         a = make_agent()
         rx = [ep for ep in a.eps.values() if ep.kind == "receiver"]
         self.assertEqual(len(rx), 2)
