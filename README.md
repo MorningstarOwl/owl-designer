@@ -120,9 +120,10 @@ git clone https://github.com/MorningstarOwl/owl-designer.git && cd owl-designer
 owl-node/install.sh --hub
 ```
 
-Run it as your desktop user (it asks for sudo itself). It finds the wired interface, the PTP clock and its role, builds
-the image (a few minutes on a PC), asks whether to start at boot and ends with the designer's address. Add
-`--dry-run` first to see every file it would write.
+Run it as your desktop user (it asks for sudo itself). It finds the wired interface, the PTP clock and its role, pulls
+the engine image for its version (amd64 or arm64, from `ghcr.io/morningstarowl/owl-node`; it builds it from the
+checkout instead when there is none, e.g. for an unreleased version: a few minutes on a PC, 20-40 on a Pi), asks
+whether to start at boot and ends with the designer's address. Add `--dry-run` first to see every file it would write.
 
 ### 2. Every other machine
 
@@ -131,7 +132,7 @@ git clone https://github.com/MorningstarOwl/owl-designer.git && cd owl-designer
 owl-node/install.sh
 ```
 
-Same detection, plus one AES67 sender and one receiver (building takes 20–40 minutes on a Pi). Then, in the hub's
+Same detection, plus one AES67 sender and one receiver. Then, in the hub's
 designer, type the machine's IP in **Nodes** and press **Add**: the hub pairs it and its inputs and outputs appear.
 
 Streams between machines work like Dante flows: a sender carries several sources side by side, each on its own
@@ -364,8 +365,9 @@ with `install.sh --hub`.
 
 Used every day in one house — a hub, a Raspberry Pi 5 node, a PC node and Home Assistant — and still young. Planned:
 access control for the designer and the APIs (today they are open on your LAN; the HA sidebar is behind HA's login),
-sample-aligned (timestamp-locked) playout between rooms, prebuilt engine images, a local-engine mode for powerful Home Assistant hosts, and a zero-config MQTT link from the
-add-on. Issues and pull requests are welcome.
+sample-aligned (timestamp-locked) playout between rooms, a local-engine mode for powerful Home Assistant hosts, and a zero-config MQTT link from the
+add-on. Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md); how it is built:
+[docs/architecture.md](docs/architecture.md).
 
 ## License
 

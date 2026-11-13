@@ -1,0 +1,37 @@
+# owl-node changelog
+
+The engine (the `owl-node` image, `install.sh`, the designer pages). The Home Assistant add-on has its own:
+[owl_designer/CHANGELOG.md](../owl_designer/CHANGELOG.md). Versions are shared: one `X.Y.Z` for both.
+
+## 0.11.0
+- Test signal injector: pink/white noise or a sine into any input, on any machine, at a set level and for a set time.
+- Sound library on the hub (WAV/FLAC/Ogg/MP3) and a Sound player block with Play/Stop controls (Panels, HA buttons).
+- `pw-dump` output with a trailing change document is read correctly.
+
+## 0.10.0
+- Live controls through one long-lived `pw-cli`, without the deployer lock: ~16 ms -> ~0.03 ms per change; 10 ms fades.
+- Meter banks: all meter taps in one `pw-record` of up to 64 channels.
+- Health issues (`/api/dsp/health`, an HA "Needs attention" sensor) and Prometheus metrics (`/metrics`).
+- Deploy history (the last 20) and design export/import in the designer.
+
+## 0.9.0
+- Receiver playout latency from the designer (design-wide and per wire), applied on the nodes.
+- The hub's backup kept on every node; `install.sh --hub --restore-from <node|file>` restores it on a new hub.
+
+## 0.8.0
+- Multichannel AES67 senders: several sources side by side on separate channels (a hub sender has 8 channels).
+- SAP discovery of Dante (AES67 mode) and other AES67 streams as designer sources; `install.sh --ptp-udp`.
+
+## 0.7.3
+- Fixed: IS-05 activation deadlock; sources mixed into one sender; add-on previews; state files without fsync.
+- `--ptp backup`: nodes take over as PTP grandmaster while the hub is down.
+
+## 0.7.2 and earlier
+See the git history and the add-on changelog.
+
+## Unreleased
+- CI for the engine: lint, unit + live PipeWire tests, AMWA NMOS conformance, multi-arch images on GHCR.
+- `install.sh` pulls the released image instead of building it (`--build` to build anyway).
+- Thread subclasses no longer shadow `threading.Thread._stop` (they crashed on Python <= 3.12 when joined).
+- The add-on is built from the controller's source (no duplicated folder, no committed archive).
+- The designer page is split into `designer.html`, `designer.css` and `designer.js`.

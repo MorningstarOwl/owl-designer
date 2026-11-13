@@ -1,0 +1,1290 @@
+// Owl Designer: the designer page (React 18 + React Flow 11, vendored; no build step). designer.html loads this.
+"use strict";
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+const h = React.createElement;
+const RF = window.ReactFlow;
+const Flow = RF.default || RF.ReactFlow;
+const { Handle, Position, Background, Controls, ReactFlowProvider, useReactFlow, applyNodeChanges, MarkerType } = RF;
+
+const api = async (method, path, body) => {
+  const r = await fetch(path, { method, headers: { "Content-Type": "application/json" }, body: body == null ? undefined : JSON.stringify(body), cache: "no-store" });
+  let j = null; try { j = await r.json(); } catch (e) { j = { error: `HTTP ${r.status}` }; }
+  if (!r.ok) throw new Error(j.error || (j.errors && j.errors.join("; ")) || `HTTP ${r.status}`);
+  return j;
+};
+const tapName = (node, monitor) => (node + (monitor ? "-mon" : "")).replace(/[.:]/g, "_").toLowerCase().slice(0, 40);
+const fmtDb = (v) => v == null ? "–" : (v <= -99 ? "-∞" : v.toFixed(0));
+// what a draft changes against the deployed design (layout, panels and presets are not "changes": they apply live)
+const designDiff = (a, b) => {
+  if (!a || !b) return [];
+  const out = [];
+  if ((a.name || "") !== (b.name || "")) out.push(`name "${b.name}" → "${a.name}"`);
+  if ((a.latency_ms ?? null) !== (b.latency_ms ?? null)) out.push(`network latency ${b.latency_ms ?? "default"} → ${a.latency_ms ?? "default"} ms`);
+  const ab = Object.fromEntries((a.blocks || []).map((x) => [x.id, x])), bb = Object.fromEntries((b.blocks || []).map((x) => [x.id, x]));
+  for (const id in ab) if (!bb[id]) out.push(`+ block ${ab[id].label || id}`); else if (JSON.stringify([ab[id].type, ab[id].label, ab[id].host, ab[id].params || {}]) !== JSON.stringify([bb[id].type, bb[id].label, bb[id].host, bb[id].params || {}])) out.push(`~ block ${ab[id].label || id}`);
+  for (const id in bb) if (!ab[id]) out.push(`− block ${bb[id].label || id}`);
+  const wk = (w) => `${w.from}>${w.to}${w.move ? "!" : ""}${w.latency_ms != null ? "@" + w.latency_ms : ""}`;
+  const aw = new Set((a.wires || []).map(wk)), bw = new Set((b.wires || []).map(wk));
+  const n1 = [...aw].filter((x) => !bw.has(x)).length, n2 = [...bw].filter((x) => !aw.has(x)).length;
+  if (n1) out.push(`+ ${n1} wire${n1 === 1 ? "" : "s"}`);
+  if (n2) out.push(`− ${n2} wire${n2 === 1 ? "" : "s"}`);
+  if (JSON.stringify(a.devices || {}) !== JSON.stringify(b.devices || {})) out.push("device names / hidden devices");
+  return out;
+};
+const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+const lsSet = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} };
+const ago = (t) => { if (!t) return "some time ago"; const s_ = Math.max(0, Date.now() / 1000 - t); return s_ < 90 ? "just now" : s_ < 5400 ? `${Math.round(s_ / 60)} min ago` : s_ < 129600 ? `${Math.round(s_ / 3600)} h ago` : new Date(t * 1000).toLocaleString(); };
+const newId = (prefix, taken) => { let n = 1; while (taken.has(`${prefix}${n}`)) n++; return `${prefix}${n}`; };
+
+// ------------------------------------------------------------------ the listening probe
+// The dsp role streams raw s16le stereo PCM of one point of the graph over a WebSocket (/api/dsp/probe, probe.py). The
+// page is plain http on the LAN, where AudioWorklet is not available (secure contexts only), so the PCM is played as
+// short AudioBuffers scheduled back to back with a small jitter buffer: ~120 ms behind the room, re-synced when the
+// network or the two clocks drift.
+class ProbePlayer {
+  constructor(onState) { this.onState = onState; this.ctx = null; this.ws = null; this.gain = null; this.next = 0; this.vol = 0.8; this.level = 0; this.stats = { underruns: 0, resyncs: 0 }; }
+  warm() {                                  // on pointerdown: create/resume the AudioContext inside the gesture
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      try { this.ctx = new AC({ sampleRate: 48000, latencyHint: "interactive" }); } catch (e) { this.ctx = new AC(); }
+      this.gain = this.ctx.createGain(); this.gain.gain.value = this.vol; this.gain.connect(this.ctx.destination);
+    }
+    try { this.ctx.resume(); } catch (e) {}
+  }
+  start(block, port) {
+    this.stop(true);
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      try { this.ctx = new AC({ sampleRate: 48000, latencyHint: "interactive" }); } catch (e) { this.ctx = new AC(); }
+      this.gain = this.ctx.createGain(); this.gain.gain.value = this.vol; this.gain.connect(this.ctx.destination);
+    }
+    this.ctx.resume();                      // we are inside the drop / click (a user gesture), so this is allowed
+    this.next = 0; this.level = 0;
+    const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + location.pathname.replace(/[^/]*$/, "") +
+      `api/dsp/probe?block=${encodeURIComponent(block)}&port=${encodeURIComponent(port)}`;
+    const ws = this.ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    this.onState({ block, port, state: "connecting", label: `${block} · ${port}` });
+    ws.onmessage = (ev) => {
+      if (ws !== this.ws) return;
+      if (typeof ev.data === "string") {
+        let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+        if (m.type === "probe") this.onState({ block, port, state: "playing", label: m.label, note: m.note, node: m.node, monitor: m.monitor });
+        else if (m.type === "error") this.onState({ block, port, state: "error", error: m.error });
+        return;
+      }
+      this.play(ev.data);
+    };
+    ws.onclose = () => { if (ws === this.ws) { this.ws = null; this.onState((s) => (s && s.state !== "error" ? { ...s, state: "stopped" } : s)); } };
+    ws.onerror = () => { if (ws === this.ws) this.onState((s) => ({ ...(s || {}), block, port, state: "error", error: (s && s.error) || "the probe connection failed" })); };
+  }
+  play(buf) {
+    const ctx = this.ctx; if (!ctx) return;
+    const pcm = new Int16Array(buf), n = pcm.length >> 1;
+    if (!n) return;
+    const ab = ctx.createBuffer(2, n, 48000), l = ab.getChannelData(0), r = ab.getChannelData(1);
+    let pk = 0;
+    for (let i = 0, j = 0; i < n; i++, j += 2) { const a = pcm[j] / 32768, b = pcm[j + 1] / 32768; l[i] = a; r[i] = b; const m = Math.max(Math.abs(a), Math.abs(b)); if (m > pk) pk = m; }
+    this.level = Math.max(pk, this.level * 0.85);
+    const now = ctx.currentTime, LAT = 0.12;
+    if (this.next < now + 0.01) { if (this.next) this.stats.underruns++; this.next = now + LAT; }   // underrun: re-buffer
+    else if (this.next > now + 0.6) { this.stats.resyncs++; this.next = now + LAT; }               // drifted behind: catch up
+    const src = ctx.createBufferSource(); src.buffer = ab; src.connect(this.gain); src.start(this.next);
+    this.next += ab.duration;
+  }
+  setVolume(v) { this.vol = v; if (this.gain) this.gain.gain.setTargetAtTime(v, this.ctx.currentTime, 0.02); }
+  latency() { return this.ctx && this.next ? Math.max(0, this.next - this.ctx.currentTime) : null; }
+  stop(quiet) {
+    const ws = this.ws; this.ws = null;
+    if (ws) { try { ws.send(JSON.stringify({ type: "stop" })); } catch (e) {} try { ws.close(); } catch (e) {} }
+    this.next = 0; this.level = 0;
+    if (!quiet) this.onState(null);
+  }
+}
+
+function ProbePanel({ probe, player, onStop }) {
+  const [, tick] = useState(0);
+  useEffect(() => { const t = setInterval(() => tick((x) => x + 1), 100); return () => clearInterval(t); }, []);
+  const [vol, setVol] = useState(player.vol);
+  const lvl = player.level > 0 ? Math.max(0, Math.min(100, (20 * Math.log10(player.level) + 60) / 60 * 100)) : 0;
+  const lat = player.latency();
+  return h("div", { className: "probe-panel" },
+    h("div", { className: "ph" }, h("span", null, "🎧"), h("b", { title: probe.label }, probe.state === "error" ? "Probe" : probe.label || "Probe"),
+      h("button", { className: "btn", onClick: onStop }, probe.state === "playing" || probe.state === "connecting" ? "Stop" : "Close")),
+    probe.state === "connecting" ? h("div", { className: "pn" }, "connecting…") : null,
+    probe.state === "playing" ? h("div", { className: "pn" }, probe.note || (probe.monitor ? `${probe.node} (monitor)` : probe.node)) : null,
+    probe.state === "stopped" ? h("div", { className: "pn" }, "stopped (the stream ended)") : null,
+    probe.state === "error" ? h("div", { className: "err" }, probe.error) : null,
+    probe.state === "playing" ? [
+      h("div", { key: "l", className: "pr" }, h("span", null, "level"), h("div", { className: "lv" }, h("i", { style: { width: lvl + "%" } })),
+        h("span", { style: { width: 54, textAlign: "right", fontVariantNumeric: "tabular-nums", color: "var(--muted)" } }, player.level > 0 ? `${(20 * Math.log10(player.level)).toFixed(0)} dBFS` : "silent")),
+      h("div", { key: "v", className: "pr" }, h("span", null, "volume"), h("input", { type: "range", min: 0, max: 1.5, step: 0.01, value: vol, onChange: (e) => { const v = Number(e.target.value); setVol(v); player.setVolume(v); } }),
+        h("span", { style: { width: 54, textAlign: "right", color: "var(--muted)" } }, lat != null ? `${Math.round(lat * 1000)} ms` : "")),
+      h("div", { key: "h", className: "pn", style: { marginTop: 6, marginBottom: 0 } }, "Drag 🎧 onto another port to move it. Plays on this computer only; keep it quiet near the living-room mic.")] : null);
+}
+
+// ------------------------------------------------------------------ the injector
+// A test signal played INTO an input (inject.py on the dsp role): white/pink noise or a sine at an RMS level, for a
+// limited time. Nothing plays until Start; it keeps playing if this page closes and stops by itself at the end.
+function InjectPanel({ inject: inj, setInject, raised, say }) {
+  const set = (k, v) => setInject((s) => ({ ...s, [k]: v }));
+  const lvlTimer = useRef(null);
+  useEffect(() => {                      // follow it while it plays (time left; ended by its timer or elsewhere)
+    if (inj.state !== "playing") return;
+    const t = setInterval(() => api("GET", "api/dsp/inject").then((r) => {
+      const me = (r.injections || []).find((x) => x.id === inj.id);
+      setInject((s) => s && s.id === inj.id ? (me ? { ...s, remaining_s: me.remaining_s } : { ...s, state: "ended" }) : s);
+    }, () => {}), 1000);
+    return () => clearInterval(t);
+  }, [inj.state, inj.id]);
+  const start = () => api("POST", "api/dsp/inject", { block: inj.block, port: inj.port, kind: inj.kind, level_db: Number(inj.level_db), freq_hz: Number(inj.freq_hz), duration_s: Number(inj.duration_s) })
+    .then((r) => setInject((s) => ({ ...s, state: "playing", id: r.id, remaining_s: r.remaining_s, host: r.host, error: null })),
+          (e) => setInject((s) => ({ ...s, state: "error", error: e.message })));
+  const stop = () => (inj.id ? api("DELETE", `api/dsp/inject/${encodeURIComponent(inj.id)}`).catch(() => {}) : Promise.resolve()).then(() => set("state", "ended"));
+  const level = (v) => {
+    set("level_db", v);
+    if (inj.state !== "playing") return;
+    clearTimeout(lvlTimer.current);
+    lvlTimer.current = setTimeout(() => api("POST", `api/dsp/inject/${encodeURIComponent(inj.id)}`, { level_db: Number(v) }).catch((e) => say(e.message, true)), 120);
+  };
+  const playing = inj.state === "playing";
+  return h("div", { className: "probe-panel", style: raised ? { bottom: 210 } : null },
+    h("div", { className: "ph" }, h("span", null, "🔊"), h("b", { title: inj.label }, inj.label || "Inject"),
+      playing ? h("button", { className: "btn danger", onClick: stop }, "Stop") : h("button", { className: "btn", onClick: () => setInject(null) }, "Close")),
+    h("div", { className: "pr" }, h("span", null, "signal"),
+      h("select", { value: inj.kind, disabled: playing, onChange: (e) => set("kind", e.target.value) },
+        h("option", { value: "pink" }, "pink noise"), h("option", { value: "white" }, "white noise"), h("option", { value: "sine" }, "sine")),
+      inj.kind === "sine" ? h("input", { type: "number", min: 20, max: 20000, step: 1, value: inj.freq_hz, disabled: playing, style: { width: 70 }, onChange: (e) => set("freq_hz", e.target.value) }) : null,
+      inj.kind === "sine" ? h("span", null, "Hz") : null),
+    h("div", { className: "pr" }, h("span", null, "level"),
+      h("input", { type: "range", min: -60, max: -3, step: 1, value: inj.level_db, onChange: (e) => level(e.target.value) }),
+      h("span", { style: { width: 64, textAlign: "right", fontVariantNumeric: "tabular-nums" } }, `${inj.level_db} dBFS`)),
+    h("div", { className: "pr" }, h("span", null, "for"),
+      h("select", { value: inj.duration_s, disabled: playing, onChange: (e) => set("duration_s", Number(e.target.value)) },
+        [10, 30, 60, 120, 300, 600].map((d) => h("option", { key: d, value: d }, d < 60 ? `${d} s` : `${d / 60} min`))),
+      playing ? h("span", { className: "pn", style: { margin: 0 } }, `${inj.remaining_s ?? ""} s left${inj.host ? ` · on ${inj.host}` : ""}`) : null),
+    !playing && inj.state !== "error" ? h("button", { className: "btn primary", style: { marginTop: 8, width: "100%" }, onClick: start },
+      inj.state === "ended" ? "Play again" : "Start") : null,
+    inj.state === "error" ? [h("div", { key: "e", className: "err" }, inj.error),
+      h("button", { key: "b", className: "btn", style: { marginTop: 6 }, onClick: () => set("state", "setup") }, "Back")] : null,
+    inj.state === "ended" ? h("div", { className: "pn" }, "ended") : null,
+    h("div", { className: "warnline" }, "Added to whatever plays into this input, and heard wherever it goes from there: start low."));
+}
+
+// ------------------------------------------------------------------ nodes
+function Meter({ stats, ch }) {
+  if (!stats) return null;
+  const v = stats.rms_dbfs && stats.rms_dbfs[ch] != null ? stats.rms_dbfs[ch] : (stats.rms_dbfs && stats.rms_dbfs[0]);
+  const pk = stats.peak_dbfs && stats.peak_dbfs[ch] != null ? stats.peak_dbfs[ch] : null;
+  const pct = v == null ? 0 : Math.max(0, Math.min(100, (v + 60) / 60 * 100));
+  const cls = stats.clip > 0 ? "clip" : (pk != null && pk > -3) ? "hot" : "";
+  return h("span", { className: "m", title: `rms ${fmtDb(v)} dBFS, peak ${fmtDb(pk)} dBFS${stats.clip ? ", CLIPPING" : ""}` },
+    h("span", { className: "meter" }, h("i", { className: cls, style: { width: pct + "%" } })), " ", fmtDb(v));
+}
+
+function PortRow({ p, dir, run, stat, probed }) {
+  const isIn = dir === "in";
+  const video = p.media === "video";
+  let extra = null;
+  if (run) {
+    if (stat && stat.kind === "tap") extra = h(Meter, { stats: stat.stats, ch: 0 });
+    else if (stat && stat.kind === "nmos") extra = h("span", { className: "m", title: JSON.stringify(stat.s) }, stat.text);
+  }
+  const lbl = h("span", { className: "lbl", title: `${p.label}${p.channels ? ` · ${p.channels} ch` : ""}${p.media_type ? " · " + p.media_type : ""}` }, p.label);
+  return h("div", { className: `port ${dir}${probed ? " probed" : ""}`, "data-port": p.id },
+    h(Handle, { type: isIn ? "target" : "source", position: isIn ? Position.Left : Position.Right, id: p.id,
+      className: video ? "video" : "", "data-media": p.media }),
+    isIn ? [lbl, extra] : [extra, lbl]);
+}
+
+function DeviceNode({ data, selected }) {
+  const { block: b, run, meters, hub } = data;
+  const st = b.status;
+  let badge = null;
+  if (run && b.source === "nmos") {
+    if (!st) badge = h("span", { className: "badge b-none" }, "no status");
+    else if (st.ptp && st.ptp.state === "MASTER") badge = h("span", { className: "badge b-ok" }, "PTP GM");
+    else if (st.ptp && st.ptp.state === "SLAVE") badge = h("span", { className: `badge ${Math.abs(st.ptp.offset_ns || 1e9) < 1000 ? "b-ok" : "b-warn"}` }, `PTP ${st.ptp.offset_ns} ns`);
+    else if (st.clock === "internal") badge = h("span", { className: "badge b-none" }, "sys clock");
+    else badge = h("span", { className: "badge b-bad" }, "PTP ?");
+  }
+  const ins = b.inputs.map((p) => h(PortRow, { key: p.id, p, dir: "in", run, stat: meters[p.id], probed: data.probed === p.id }));
+  const outs = b.outputs.map((p) => h(PortRow, { key: p.id, p, dir: "out", run, stat: meters[p.id], probed: data.probed === p.id }));
+  const rows = [];
+  const n = Math.max(ins.length, outs.length);
+  for (let i = 0; i < n; i++) { rows.push(ins[i] || h("div", { key: "i" + i })); rows.push(outs[i] || h("div", { key: "o" + i })); }
+  return h("div", { className: `node ${b.host === hub ? "hub" : "sat"} ${b.live === false ? "down" : ""} ${selected ? "selected" : ""}` },
+    h("div", { className: "hd" }, h("b", { title: b.label }, b.label), badge, h("span", { className: "host" }, b.host)),
+    h("div", { className: "sub" }, b.sub || b.class),
+    h("div", { className: "ports" }, rows));
+}
+
+function ProcNode({ data, selected }) {
+  const { block: b, type: t, run, meters, proc } = data;
+  const ports = portsOf(t, b.params);
+  const ins = ports.inputs.map((p) => h(PortRow, { key: p.id, p, dir: "in", run, stat: meters[p.id], probed: data.probed === p.id }));
+  const outs = ports.outputs.map((p) => h(PortRow, { key: p.id, p, dir: "out", run, stat: meters[p.id], probed: data.probed === p.id }));
+  const rows = [];
+  const n = Math.max(ins.length, outs.length);
+  for (let i = 0; i < n; i++) { rows.push(ins[i] || h("div", { key: "i" + i })); rows.push(outs[i] || h("div", { key: "o" + i })); }
+  let badge = null;
+  if (run && t.engine === "pipewire") badge = proc ? (proc.running ? h("span", { className: "badge b-ok" }, `running${proc.restarts ? ` · ${proc.restarts} restarts` : ""}`) : h("span", { className: "badge b-bad" }, "down")) : h("span", { className: "badge b-none" }, "not deployed");
+  if (run && t.engine === "device") badge = proc ? (proc.running ? h("span", { className: "badge b-ok", title: proc.node }, "plugged in") : h("span", { className: "badge b-warn" }, "not plugged in")) : h("span", { className: "badge b-none" }, "not deployed");
+  if (!run && t.engine === "device") badge = h("span", { className: "badge b-none", title: (t.match || {})["node.name"] }, "device");
+  if (t.engine === "rtsp") {
+    const p_ = b.params || {}, url = String(p_.url || "");
+    badge = !url ? h("span", { className: "badge b-warn" }, "no URL")
+      : !run ? h("span", { className: "badge b-none" }, "RTSP")
+      : p_.audio === false ? h("span", { className: "badge b-ok" }, "video relay")
+      : proc ? (proc.running ? h("span", { className: "badge b-ok" }, `pulling${proc.restarts ? ` · ${proc.restarts} restarts` : ""}`) : h("span", { className: "badge b-bad" }, "down"))
+      : h("span", { className: "badge b-none" }, "not deployed");
+  }
+  if (t.engine === "voice") {
+    const v = data.voice;
+    badge = !v ? h("span", { className: "badge b-none" }, "voice off")
+      : v.ha !== "connected" ? h("span", { className: "badge b-bad", title: "Home Assistant is not connected to the Wyoming satellite" }, "HA not connected")
+      : v.block !== b.id ? h("span", { className: "badge b-warn", title: "Deploy to make the assistant use these wires" }, "not deployed")
+      : !v.mic_node ? h("span", { className: "badge b-bad" }, "no mic wired")
+      : v.wake ? h("span", { className: "badge b-ok", title: `wake word: ${v.wake_word || "set in HA"}` }, v.state === "wake" ? "listening for wake word" : v.state)
+      : h("span", { className: "badge b-warn" }, "push-to-talk only");
+  }
+  const summary = Object.entries(t.params || {}).filter(([k, s]) => s.live || s.type === "bool").slice(0, 3).map(([k, s]) => {
+    const v = (b.params || {})[k] ?? s.default; return `${s.label || k}: ${typeof v === "boolean" ? (v ? "on" : "off") : v}`; }).join(" · ");
+  return h("div", { className: `node proc ${t.engine === "voice" ? "voice" : ""} ${selected ? "selected" : ""}` },
+    h("div", { className: "hd" }, h("b", null, b.label || t.label), badge, h("span", { className: "host" }, t.type + (b.host ? " @ " + b.host : ""))),
+    h("div", { className: "sub" }, t.engine === "rtsp" ? rtspSummary(b.params || {}) : t.engine === "voice" ? (data.voice && data.voice.block === b.id ? `hears ${data.voice.mic_node || "nothing"} · replies into ${data.voice.reply_node || "the default speaker"}` : "Home Assistant voice satellite") : (summary || t.description)),
+    h("div", { className: "ports" }, rows));
+}
+
+// an RTSP URL without its credentials or token path: what the canvas may show
+const rtspHost = (url) => { const m = /^(\w+):\/\/(?:[^@/]*@)?([^/]+)/.exec(String(url || "")); return m ? `${m[1]}://${m[2]}` : ""; };
+const rtspSummary = (p) => [rtspHost(p.url) || "no URL yet", p.audio === false ? null : "audio", p.video === false ? null : "video"].filter(Boolean).join(" · ");
+
+function portsOf(t, params) {
+  const ch = (spec) => { const c = spec.channels == null ? 2 : spec.channels; if (typeof c === "string" && c.startsWith("$p.")) return Number((params || {})[c.slice(3)] ?? t.defaults[c.slice(3)] ?? 2); return Number(c); };
+  const mk = (p) => { const media = p.media || "audio"; return { id: p.id, label: p.label || p.id, media, channels: media === "audio" ? ch(p) : null }; };
+  return { inputs: (t.inputs || []).map(mk), outputs: (t.outputs || []).map(mk) };
+}
+
+const nodeTypes = { device: DeviceNode, proc: ProcNode };
+
+// ------------------------------------------------------------------ layout
+function autoPlace(block, index, counts, hub) {
+  // hub sources & apps left, processing middle, hub sinks right, satellites far right
+  let col;
+  if (block.kind === "proc") col = 1;
+  else if (block.source === "sap") col = 0;            // an AES67 stream announced on the network: a source
+  else if (block.source === "nmos" || (hub && block.host && block.host !== hub)) col = 3;
+  else if (block.inputs.length && !block.outputs.some((p) => p.id === "out")) col = 2;
+  else col = 0;
+  const x = [40, 420, 800, 1180][col];
+  const y = 40 + (counts[col] || 0) * 150;
+  counts[col] = (counts[col] || 0) + 1;
+  return { x, y };
+}
+
+// ------------------------------------------------------------------ app
+function App() {
+  const [mode, setMode] = useState(lsGet("owl.mode") || "design");
+  const [inv, setInv] = useState(null);
+  const [palette, setPalette] = useState([]);
+  const [design, setDesign] = useState(null);          // the draft on the canvas
+  const [deployedName, setDeployedName] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [sel, setSel] = useState(null);                 // {kind: node|edge, id}
+  const [plan, setPlan] = useState(null);               // the diff modal
+  const [toast, setToast] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [sheet, setSheet] = useState(null);             // phone: "palette" | "inspector"
+  const [err, setErr] = useState(null);
+  const [deployed, setDeployed] = useState(null);       // the deployed design (what the draft is compared with)
+  const [deployedAt, setDeployedAt] = useState(null);
+  const [notice, setNotice] = useState(null);           // {kind: "stale"|"moved", draft?, at?}
+  const [flowKey, setFlowKey] = useState(0);            // bump = remount the canvas (Reset, Rollback, open a draft)
+  const [showHidden, setShowHidden] = useState(false);
+  const [focusHost, setFocusHost] = useState(null);     // a node just added: frame its devices too
+  const [probe, setProbe] = useState(null);             // {block, port, state, label, note, error}
+  const [dragProbe, setDragProbe] = useState(null);     // {x, y, target, label, tool} while 🎧 or 🔊 is being dragged
+  const [inject, setInject] = useState(null);           // {block, port, label, state: setup|playing|ended|error, id, ...}
+  const [sounds, setSounds] = useState([]);             // the sound library (sounds.py)
+  const loadSounds = () => api("GET", "api/dsp/sounds").then((r) => setSounds(r.sounds || []), () => {});
+  useEffect(() => { loadSounds(); }, []);
+  const playerRef = useRef(null);
+  if (!playerRef.current) playerRef.current = new ProbePlayer(setProbe);
+  useEffect(() => () => playerRef.current.stop(true), []);
+  const designRef = useRef(design); designRef.current = design;
+  const deployedRef = useRef(null); deployedRef.current = deployed;
+  const live = useLive(true);
+  const types = useMemo(() => Object.fromEntries(palette.map((t) => [t.type, t])), [palette]);
+  const run = mode === "run";
+
+  const say = (msg, isErr) => { setToast({ msg, err: isErr }); setTimeout(() => setToast(null), isErr ? 8000 : 4000); };
+
+  // initial load: palette, deployed design (or baseline), server draft
+  useEffect(() => {
+    (async () => {
+      try {
+        const [p, d, dr, st] = await Promise.all([api("GET", "api/dsp/palette"), api("GET", "api/dsp/design"), api("GET", "api/dsp/draft"), api("GET", "api/dsp/status")]);
+        setPalette(p.types);
+        setDeployedName(d.deployed ? d.design.name : null);
+        setDeployed(d.deployed ? d.design : null); setDeployedAt(st.deployed_at || null);
+        const draft = dr.draft && dr.draft.wires ? dr.draft : null;
+        // panels and presets live with the deployed design (and are edited there live); a draft that predates them takes them over
+        if (draft && d.deployed) { if (!draft.panels) draft.panels = d.design.panels || []; if (!draft.presets) draft.presets = d.design.presets || []; }
+        // The canvas opens what is RUNNING. A draft is resumed only when it was started from this very deploy; an older
+        // one (a test design left over from another day) is set aside with a bar that says so, never opened silently.
+        let open = d.design;
+        if (draft && d.deployed && designDiff(draft, d.design).length) {
+          if (draft.based_on && draft.based_on.deployed_at === st.deployed_at) open = draft;
+          else { lsSet("owl.setAside", JSON.stringify(draft)); setNotice({ kind: "stale", draft }); }
+        } else if (draft && !d.deployed) open = draft;
+        setDesign(open);
+        setErr(null);
+      } catch (e) { setErr("dsp API: " + e.message); }
+    })();
+  }, []);
+  // inventory 3 s; status 1 s in Run, 3 s otherwise
+  useEffect(() => {
+    let t; const f = async () => { try { setInv(await api("GET", "api/dsp/inventory")); setErr(null); } catch (e) { setErr("inventory: " + e.message); } t = setTimeout(f, 3000); };
+    f(); return () => clearTimeout(t);
+  }, []);
+  useEffect(() => {
+    let t; const f = async () => { try { const s = await api("GET", "api/dsp/status"); setStatus(s); setDeployedName(s.deployed ? s.name : null); setDeployedAt(s.deployed_at || null); } catch (e) {} t = setTimeout(f, run ? 1000 : 3000); };
+    f(); return () => clearTimeout(t);
+  }, [run]);
+  // draft -> server (debounced) + localStorage
+  const saveT = useRef(null);
+  const update = useCallback((fn) => {
+    setDesign((d) => {
+      const nd = typeof fn === "function" ? fn(d) : fn;
+      clearTimeout(saveT.current);
+      saveT.current = setTimeout(() => { api("PUT", "api/dsp/draft", { draft: { ...nd, based_on: nd.based_on || { name: deployedRef.current && deployedRef.current.name, deployed_at: deployedAtRef.current }, saved_at: Date.now() / 1000 } }).catch(() => {}); }, 800);
+      return nd;
+    });
+  }, []);
+  useEffect(() => { lsSet("owl.mode", mode); }, [mode]);
+  // the top bar wraps on narrow screens: everything below follows its real height
+  useEffect(() => {
+    const el = document.querySelector(".top"); if (!el || !window.ResizeObserver) return;
+    const ro = new ResizeObserver(() => document.documentElement.style.setProperty("--toph", el.offsetHeight + "px"));
+    ro.observe(el); return () => ro.disconnect();
+  });
+  // the running design changed (a deploy or rollback, here or in another browser): follow it when the canvas has no
+  // edits of its own, else say so
+  const deployedAtRef = useRef(null);
+  useEffect(() => {
+    const prev = deployedAtRef.current; deployedAtRef.current = deployedAt;
+    if (prev == null || deployedAt == null || prev === deployedAt) return;
+    (async () => {
+      try {
+        const d = await api("GET", "api/dsp/design");
+        const before = deployedRef.current;
+        setDeployed(d.deployed ? d.design : null);
+        if (!d.deployed || !designDiff(designRef.current, d.design).length) return;      // what the canvas shows (our own deploy)
+        if (!designDiff(designRef.current, before).length) { setDesign({ ...d.design, based_on: { name: d.design.name, deployed_at: deployedAt } }); setPositions({}); setFlowKey((k) => k + 1); }
+        else setNotice({ kind: "moved", name: d.design && d.design.name, at: deployedAt });
+      } catch (e) {}
+    })();
+  }, [deployedAt]);
+
+
+  // ---- nodes & edges from inventory + design
+  const blocks = useMemo(() => {
+    if (!inv || !design) return [];
+    const names = design.devices || {};
+    const wired = new Set(); for (const w of design.wires || []) { wired.add(w.from.split("|")[0]); wired.add(w.to.split("|")[0]); }
+    // the system's names are often ambiguous ("Ryzen HD Audio Controller Pro" twice: the speaker and the internal mic;
+    // a USB mic that also has a headphone jack): drop the " Pro" of the pro-audio profile and say in/out when two share one
+    const base = (b) => (b.label || "").replace(/ Pro$/, "").replace(/ Analog Stereo$/, "");
+    const count = {}; for (const b of inv.blocks) if (b.source === "pipewire") { const k = b.host + "|" + base(b); count[k] = (count[k] || 0) + 1; }
+    const out = [];
+    for (const b0 of inv.blocks) {
+      const o = names[b0.id] || {};
+      let label = base(b0) || b0.label;
+      if (b0.source === "pipewire" && count[b0.host + "|" + label] > 1) label += b0.class === "source" ? " (input)" : b0.class === "sink" ? " (output)" : "";
+      const b = { ...b0, kind: "device", sysLabel: b0.label, label: o.label || label, hidden: !!o.hidden };
+      if (b.hidden && !wired.has(b.id) && !showHidden) continue;
+      out.push(b);
+    }
+    for (const b of design.blocks || []) if (types[b.type]) out.push({ ...b, kind: "proc" });
+    // devices in the design that are gone from the inventory (unplugged / satellite down): keep them, greyed
+    const have = new Set(out.map((b) => b.id));
+    for (const w of design.wires || []) for (const ref of [w.from, w.to]) {
+      const bid = ref.split("|")[0];
+      if (!have.has(bid) && !bid.match(/^[a-z][a-z0-9-]*$/)) { have.add(bid); out.push(bid.startsWith("sap:")
+        ? { id: bid, kind: "device", source: "sap", host: "aes67", label: "AES67 stream", sub: "not announced now (its device is off, or stopped announcing)", class: "gone", inputs: [], outputs: [], live: false }
+        : { id: bid, kind: "device", source: bid.startsWith("nmos:") ? "nmos" : "pipewire", host: bid.split(":")[1] || "?", label: bid.split(":").pop(), sub: "not present", class: "gone", inputs: [], outputs: [], live: false }); }
+    }
+    return out;
+  }, [inv, design, types, showHidden]);
+
+  const meterFor = useMemo(() => {
+    const taps = (status && status.taps) || {};
+    return (b, p) => {
+      if (!run) return null;
+      if (b.kind === "proc") { const t = taps[`${b.id}-${p.id}`]; return t ? { kind: "tap", stats: t.stats } : null; }
+      if (p.pw) { const t = taps[tapName(p.pw.node, !!p.pw.monitor)]; return t ? { kind: "tap", stats: t.stats } : null; }
+      if (p.nmos && b.status) {
+        const s = p.nmos.receiver ? (b.status.receivers || {})[p.nmos.receiver] : (b.status.senders || {})[p.nmos.sender];
+        if (!s) return null;
+        let text = "";
+        if (p.nmos.receiver) {
+          if (!s.active) text = "idle";
+          else if (s.fps != null) text = `${s.fps ?? 0} fps${s.lost ? ` · lost ${s.lost}` : ""}${s.latency_ms != null ? ` · ${s.latency_ms} ms` : ""}`;
+          else text = `${s.pkts_per_s ?? 0} pkt/s${s.lost ? ` · lost ${s.lost}` : ""}${s.rms_dbfs && s.rms_dbfs[0] != null ? ` · ${s.rms_dbfs.map(fmtDb).join("/")} dB` : ""}`;
+        } else text = s.active === false ? "parked" : s.running ? `${s.fps ?? 0} fps · ${s.callers ?? 0} rx` : "";
+        return { kind: "nmos", s, text };
+      }
+      return null;
+    };
+  }, [status, run]);
+
+  const [positions, setPositions] = useState({});      // live drag positions (layout saved on drag end)
+  const nodes = useMemo(() => {
+    const counts = {};
+    const layout = (design && design.layout) || {};
+    // auto-placed blocks never land on a position another block already holds (a remembered layout position and a
+    // fresh auto-placement in the same column used to stack two blocks exactly on top of each other)
+    const taken = blocks.map((b) => positions[b.id] || layout[b.id]).filter(Boolean);
+    const free = (p) => { let q = { ...p }; while (taken.some((t) => Math.abs(t.x - q.x) < 160 && Math.abs(t.y - q.y) < 120)) q = { x: q.x, y: q.y + 150 }; taken.push(q); return q; };
+    return blocks.map((b, i) => {
+      const pos = positions[b.id] || layout[b.id] || free(autoPlace(b, i, counts, inv.hub));
+      if (!layout[b.id] && !positions[b.id]) layout[b.id] = pos;
+      const meters = {};
+      for (const p of (b.kind === "proc" ? portsOf(types[b.type], b.params).inputs.concat(portsOf(types[b.type], b.params).outputs) : b.inputs.concat(b.outputs))) meters[p.id] = meterFor(b, p);
+      return { id: b.id, type: b.kind === "proc" ? "proc" : "device", position: pos, deletable: b.kind === "proc", draggable: !run,
+               data: { block: b, type: types[b.type], run, meters, hub: inv && inv.hub, proc: status && status.procs && status.procs[b.id], voice: status && status.voice,
+                       probed: probe && probe.block === b.id && probe.state !== "error" && probe.state !== "stopped" ? probe.port : null },
+               className: probe && probe.block === b.id && probe.state === "playing" ? "probed" : "",
+               selected: sel && sel.kind === "node" && sel.id === b.id };
+    });
+  }, [blocks, positions, design, run, meterFor, types, status, sel, inv, probe]);
+
+  const edges = useMemo(() => {
+    if (!design) return [];
+    const ws = (status && status.wires) || {};
+    const out = (design.wires || []).map((w) => {
+      const [sb, sp] = w.from.split("|"), [tb, tp] = w.to.split("|");
+      const st = ws[w.id];
+      const sblk = blocks.find((b) => b.id === sb);
+      const media = sblk && sblk.kind === "proc" && types[sblk.type] ? ((portsOf(types[sblk.type], sblk.params).outputs.find((p) => p.id === sp) || {}).media || "audio")
+        : /^tx:/.test(sp) ? ((sblk || { outputs: [] }).outputs.find((p) => p.id === sp) || {}).media : "audio";
+      const cls = (run && st ? st.state : "") + (media === "video" ? " video" : "");
+      let label;
+      if (run && st && st.rx) label = `${st.rx.pkts_per_s ?? 0} pkt/s${st.rx.lost ? ` · lost ${st.rx.lost}` : ""}`;
+      else if (run && st && st.state !== "ok") label = st.detail[0];
+      else if (w.move) label = "moved";
+      return { id: w.id, source: sb, sourceHandle: sp, target: tb, targetHandle: tp, className: cls, label, labelStyle: { fontSize: 10, fill: "var(--muted)" }, labelBgStyle: { fill: "var(--panel)" },
+               selected: sel && sel.kind === "edge" && sel.id === w.id, markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14 } };
+    });
+    // links on the hub made by others (WirePlumber, apps), read-only
+    const hub = inv && inv.hub;
+    const have = new Set(out.map((e) => `${e.source}|${e.sourceHandle}>${e.target}|${e.targetHandle}`));
+    const byNode = {}; for (const b of blocks) if (b.node) byNode[b.node] = b;
+    for (const l of (status && status.external_links) || []) {
+      const sb = byNode[l.out_node], tb = byNode[l.in_node];
+      if (!sb || !tb) continue;
+      const sp = /^monitor/.test(l.out_port) ? "monitor" : "out";
+      const key = `${sb.id}|${sp}>${tb.id}|in`;
+      if (have.has(key)) continue; have.add(key);
+      out.push({ id: "ext:" + key, source: sb.id, sourceHandle: sp, target: tb.id, targetHandle: "in", className: "ext", deletable: false, selectable: true, label: "existing link", labelStyle: { fontSize: 10, fill: "var(--muted)" }, labelBgStyle: { fill: "var(--panel)" } });
+    }
+    return out;
+  }, [design, status, run, sel, blocks, inv, types]);
+
+  // ---- editing
+  const onNodesChange = useCallback((changes) => {
+    for (const c of changes) {
+      if (c.type === "position" && c.position) setPositions((p) => ({ ...p, [c.id]: c.position }));
+      if (c.type === "position" && c.dragging === false) {
+        setPositions((p) => { const pos = p[c.id]; if (pos) update((d) => ({ ...d, layout: { ...(d.layout || {}), [c.id]: pos } })); const np = { ...p }; delete np[c.id]; return np; });
+      }
+      if (c.type === "select") setSel(c.selected ? { kind: "node", id: c.id } : (s) => (s && s.id === c.id ? null : s));
+      if (c.type === "remove") update((d) => ({ ...d, blocks: d.blocks.filter((b) => b.id !== c.id), wires: d.wires.filter((w) => !w.from.startsWith(c.id + "|") && !w.to.startsWith(c.id + "|")) }));
+    }
+  }, [update]);
+  const onEdgesChange = useCallback((changes) => {
+    for (const c of changes) {
+      if (c.type === "select") setSel(c.selected ? { kind: "edge", id: c.id } : (s) => (s && s.id === c.id ? null : s));
+      if (c.type === "remove" && !c.id.startsWith("ext:")) update((d) => ({ ...d, wires: d.wires.filter((w) => w.id !== c.id) }));
+    }
+  }, [update]);
+  const portMedia = (bid, pid) => {
+    const b = blocks.find((x) => x.id === bid); if (!b) return null;
+    if (b.kind === "proc") { const ps = portsOf(types[b.type], b.params); const p = ps.inputs.concat(ps.outputs).find((x) => x.id === pid); return p ? p.media : "audio"; }
+    const p = b.inputs.concat(b.outputs).find((x) => x.id === pid); return p ? p.media : null; };
+  const isValidConnection = useCallback((c) => {
+    if (run || !c.sourceHandle || !c.targetHandle || c.source === c.target) return false;
+    const sm = portMedia(c.source, c.sourceHandle), tm = portMedia(c.target, c.targetHandle);
+    return !!sm && !!tm && (sm === tm || sm === "other" || tm === "other");
+  }, [blocks, run]);
+  const onConnect = useCallback((c) => {
+    if (!isValidConnection(c)) return;
+    update((d) => {
+      const from = `${c.source}|${c.sourceHandle}`, to = `${c.target}|${c.targetHandle}`;
+      if (d.wires.some((w) => w.from === from && w.to === to)) return d;
+      return { ...d, wires: [...d.wires, { id: newId("w", new Set(d.wires.map((w) => w.id))), from, to }] };
+    });
+  }, [update, isValidConnection]);
+  const addBlock = (t) => {
+    update((d) => {
+      const id = newId(t.type, new Set(d.blocks.map((b) => b.id)));
+      const layout = { ...(d.layout || {}) };
+      layout[id] = { x: 420 + (d.blocks.length % 2) * 40, y: 60 + d.blocks.length * 160 };
+      return { ...d, blocks: [...d.blocks, { id, type: t.type, label: t.label, params: { ...t.defaults } }], layout };
+    });
+    setSheet(null);
+  };
+  const setParam = (bid, k, v) => update((d) => ({ ...d, blocks: d.blocks.map((b) => (b.id === bid ? { ...b, params: { ...(b.params || {}), [k]: v } } : b)) }));
+  const setLabel = (bid, v) => update((d) => ({ ...d, blocks: d.blocks.map((b) => (b.id === bid ? { ...b, label: v } : b)) }));
+  // D3: a processing block runs on the hub (no host key) or on a satellite with a dsp role
+  const setHost = (bid, v) => update((d) => ({ ...d, blocks: d.blocks.map((b) => (b.id === bid ? (v && v !== inv.hub ? { ...b, host: v } : (({ host, ...rest }) => rest)(b)) : b)) }));
+  const liveSet = async (bid, k, v) => {
+    setParam(bid, k, v);
+    if (deployedName) { try { const r = await api("POST", "api/dsp/control", { block: bid, param: k, value: v }); if (!r.live) say(`${bid} restarted with ${k} = ${v}`); } catch (e) { say("control: " + e.message, true); } }
+  };
+
+  // ---- deploy / rollback
+  const doPlan = async () => {
+    setBusy(true);
+    try {
+      const p = await api("POST", "api/dsp/plan", { design });
+      if (!p.ok && p.errors.length && p.errors.every((e) => / no device /.test(e))) {
+        // only absent devices (an app whose stream exists while it plays, a satellite that is down): offer to deploy anyway
+        const p2 = await api("POST", "api/dsp/plan", { design, allow_missing: true });
+        if (p2.ok) { p2.allowMissing = true; p2.absent = p.errors; setPlan(p2); setBusy(false); return; }
+      }
+      setPlan(p);
+    } catch (e) { say(e.message, true); }
+    setBusy(false);
+  };
+  const doDeploy = async (allowMissing) => {
+    setBusy(true); setPlan(null);
+    try {
+      const r = await api("POST", "api/dsp/deploy", { design, allow_missing: !!allowMissing });
+      say(`Deployed in ${r.seconds} s: ${r.links_created} links made, ${r.links_removed} removed, ${r.patch_changes.length} patch changes${r.pending.length ? `, pending: ${r.pending.join(", ")}` : ""}`);
+      setDeployedName(design.name);
+      const st = await api("GET", "api/dsp/status");
+      setDeployed(design); setDeployedAt(st.deployed_at || null); setNotice(null);
+      update((d) => ({ ...d, based_on: { name: d.name, deployed_at: st.deployed_at } }));
+      setMode("run");
+    } catch (e) { say("Deploy failed (rolled back): " + e.message, true); }
+    setBusy(false);
+  };
+  const doRollback = async () => {
+    if (!confirm(`Roll back to the previous design${status && status.prev_name ? ` "${status.prev_name}"` : ""}?`)) return;
+    setBusy(true);
+    try {
+      const r = await api("POST", "api/dsp/rollback"); const d = await api("GET", "api/dsp/design"); const st = await api("GET", "api/dsp/status");
+      setDeployed(d.design); setDeployedAt(st.deployed_at || null); setNotice(null);
+      update({ ...d.design, based_on: { name: d.design.name, deployed_at: st.deployed_at } }); setPositions({}); setFlowKey((k) => k + 1);
+      say(`Rolled back in ${r.seconds} s`);
+    }
+    catch (e) { say("Rollback failed: " + e.message, true); }
+    setBusy(false);
+  };
+  const resetToDeployed = async () => {
+    const d = await api("GET", "api/dsp/design");
+    update({ ...d.design, based_on: { name: d.design.name, deployed_at: deployedAtRef.current } }); setPositions({}); setSel(null); setFlowKey((k) => k + 1);
+    if (d.deployed) setDeployed(d.design);
+    if (notice && notice.kind === "moved") setNotice(null);
+    say(d.deployed ? "Canvas reset to the deployed design" : "Canvas reset to the running state");
+  };
+  // ---- export / import / history: a design as a file, or one deployed before, opened on the canvas (Deploy… shows the diff)
+  const loadOnCanvas = (d, msg) => {
+    update({ ...d, based_on: { name: deployed && deployed.name, deployed_at: deployedAtRef.current } }); setPositions({}); setSel(null); setFlowKey((k) => k + 1);
+    say(msg);
+  };
+  const exportDesign = () => {
+    const { based_on, ...rest } = designRef.current || design;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(rest, null, 1)], { type: "application/json" }));
+    a.download = `${(rest.name || "design").replace(/[^A-Za-z0-9._-]+/g, "_")}.json`;
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  };
+  const importDesign = (file) => file.text().then((t) => {
+    let d; try { d = JSON.parse(t); } catch (e) { return say(`${file.name} is not JSON`, true); }
+    if (d && d.design && Array.isArray(d.design.blocks)) d = d.design;          // a history entry or an API answer
+    if (!d || !Array.isArray(d.blocks) || !Array.isArray(d.wires)) return say(`${file.name} is not an Owl Designer design (no blocks and wires)`, true);
+    if (changes.length && !confirm(`Replace the canvas (${changes.length} undeployed change(s)) with "${d.name || file.name}"?`)) return;
+    loadOnCanvas(d, `Opened "${d.name || file.name}" on the canvas: Deploy… shows what it would change`);
+  });
+  const openFromHistory = async (hid) => {
+    const h = await api("GET", `api/dsp/history/${encodeURIComponent(hid)}`);
+    if (changes.length && !confirm(`Replace the canvas (${changes.length} undeployed change(s)) with "${h.design.name}" as deployed ${new Date(h.deployed_at * 1000).toLocaleString()}?`)) return;
+    loadOnCanvas(h.design, `Opened "${h.design.name}" (deployed ${new Date(h.deployed_at * 1000).toLocaleString()}): Deploy… shows what it would change`);
+  };
+  const openSetAside = () => {
+    let dr = notice && notice.draft; if (!dr) { try { dr = JSON.parse(lsGet("owl.setAside") || "null"); } catch (e) {} }
+    if (!dr) return;
+    update({ ...dr, based_on: { name: deployed && deployed.name, deployed_at: deployedAtRef.current } }); setPositions({}); setSel(null); setFlowKey((k) => k + 1);
+    setNotice(null); lsSet("owl.setAside", null);
+    say(`Opened the old draft "${dr.name}". Deploying it REPLACES "${deployed && deployed.name}"`, true);
+  };
+  const dropSetAside = () => { setNotice(null); lsSet("owl.setAside", null); api("PUT", "api/dsp/draft", { draft: { ...designRef.current, based_on: { name: deployed && deployed.name, deployed_at: deployedAtRef.current } } }).catch(() => {}); };
+  // ---- the probe: drop 🎧 on a port, a block or a wire
+  const portsFor = (b) => b.kind === "proc" ? portsOf(types[b.type], b.params) : { inputs: b.inputs.filter((p) => p.media !== "video"), outputs: b.outputs.filter((p) => p.media !== "video") };
+  const startProbe = (block, port) => { if (block && port) playerRef.current.start(block, port); };
+  const probeTarget = (x, y) => {
+    const el = document.elementFromPoint(x, y);
+    if (!el) return null;
+    const nodeEl = el.closest(".react-flow__node");
+    if (nodeEl) {
+      const bid = nodeEl.getAttribute("data-id"), b = blocks.find((q) => q.id === bid);
+      if (!b) return null;
+      const portEl = el.closest(".port");
+      let pid = portEl && portEl.getAttribute("data-port");
+      if (!pid) { const ps = portsFor(b); pid = (ps.outputs.find((q) => q.id !== "monitor") || ps.outputs[0] || ps.inputs[0] || {}).id; }
+      return pid ? { block: bid, port: pid } : null;
+    }
+    const edgeEl = el.closest(".react-flow__edge");
+    if (edgeEl) {
+      const id = (edgeEl.getAttribute("data-testid") || "").replace(/^rf__edge-/, "");
+      const w = (design.wires || []).find((q) => q.id === id);
+      if (w) { const [b, p] = w.from.split("|"); return { block: b, port: p }; }
+    }
+    return null;
+  };
+  const probeLabel = (t) => {
+    if (!t) return null;
+    const b = blocks.find((q) => q.id === t.block); if (!b) return t.block + " · " + t.port;
+    const ps = portsFor(b), p = [...ps.outputs, ...ps.inputs].find((q) => q.id === t.port);
+    return `${b.label || (types[b.type] || {}).label || b.id} · ${p ? p.label : t.port}`;
+  };
+  // the injector plays INTO an input: an input port, a block (its first input) or a wire (its destination)
+  const injectTarget = (x, y) => {
+    const el = document.elementFromPoint(x, y);
+    if (!el) return null;
+    const nodeEl = el.closest(".react-flow__node");
+    if (nodeEl) {
+      const bid = nodeEl.getAttribute("data-id"), b = blocks.find((q) => q.id === bid);
+      if (!b) return null;
+      const portEl = el.closest(".port");
+      if (portEl) return portEl.classList.contains("in") ? { block: bid, port: portEl.getAttribute("data-port") } : null;
+      const ins = portsFor(b).inputs;
+      return ins.length ? { block: bid, port: ins[0].id } : null;
+    }
+    const edgeEl = el.closest(".react-flow__edge");
+    if (edgeEl) {
+      const id = (edgeEl.getAttribute("data-testid") || "").replace(/^rf__edge-/, "");
+      const w = (design.wires || []).find((q) => q.id === id);
+      if (w) { const [b, p] = w.to.split("|"); return { block: b, port: p }; }
+    }
+    return null;
+  };
+  const probeTargetRef = useRef(null); probeTargetRef.current = probeTarget;
+  const injectTargetRef = useRef(null); injectTargetRef.current = injectTarget;
+  const probeLabelRef = useRef(null); probeLabelRef.current = probeLabel;
+  // pointer drag (mouse, pen and touch alike; HTML5 drag-and-drop has no touch support and no feedback)
+  const onProbeDown = (e) => onToolDown(e, "probe");
+  const onInjectDown = (e) => onToolDown(e, "inject");
+  const onToolDown = (e, tool) => {
+    if (e.button != null && e.button !== 0) return;
+    e.preventDefault();
+    if (tool === "probe") playerRef.current.warm();
+    const targetOf = (x, y) => (tool === "probe" ? probeTargetRef : injectTargetRef).current(x, y);
+    let hover = null;
+    const mark = (t) => {
+      if (hover) hover.classList.remove("probe-hover");
+      hover = null;
+      if (t) { const el = document.querySelector(`.react-flow__node[data-id="${CSS.escape(t.block)}"] .port[data-port="${CSS.escape(t.port)}"]`); if (el) { el.classList.add("probe-hover"); hover = el; } }
+    };
+    const move = (ev) => { const t = targetOf(ev.clientX, ev.clientY); mark(t); setDragProbe({ x: ev.clientX, y: ev.clientY, target: t, label: probeLabelRef.current(t), tool }); };
+    const up = (ev) => {
+      window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", cancel);
+      mark(null); setDragProbe(null);
+      const t = targetOf(ev.clientX, ev.clientY);
+      if (t && tool === "probe") startProbe(t.block, t.port);
+      else if (t) setInject((cur) => (cur && cur.state === "playing") ? (say("The injector is playing: stop it first"), cur)
+        : { block: t.block, port: t.port, label: probeLabelRef.current(t), state: "setup", kind: (cur && cur.kind) || "pink",
+            level_db: (cur && cur.level_db) ?? -30, freq_hz: (cur && cur.freq_hz) || 1000, duration_s: (cur && cur.duration_s) || 30 });
+      else if (Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 6) say(tool === "probe" ? "Drag 🎧 onto a port, a block or a wire to hear it here (or select one and press Listen)"
+        : "Drag 🔊 onto an input (left side of a block), a block or a wire to play a test signal into it");
+    };
+    const cancel = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", cancel); mark(null); setDragProbe(null); };
+    window.addEventListener("pointermove", move); window.addEventListener("pointerup", up); window.addEventListener("pointercancel", cancel);
+    setDragProbe({ x: e.clientX, y: e.clientY, target: null, label: null, tool });
+  };
+  const setDevice = (bid, k, v) => update((d) => { const devs = { ...(d.devices || {}) }; const o = { ...(devs[bid] || {}), [k]: v }; if (!o.label) delete o.label; if (!o.hidden) delete o.hidden; if (Object.keys(o).length) devs[bid] = o; else delete devs[bid]; return { ...d, devices: devs }; });
+
+  if (err && !design) return h(EngineDown, { err });
+  if (!design || !inv) return h("div", { className: "page" }, "loading…");
+
+  const selBlock = sel && sel.kind === "node" ? blocks.find((b) => b.id === sel.id) : null;
+  const selWire = sel && sel.kind === "edge" ? (design.wires || []).find((w) => w.id === sel.id) : null;
+  const changes = deployed ? designDiff(design, deployed) : [];
+  const changesChip = deployedName ? h("span", { className: "chip ok", title: "The design running in the room now" }, `running: ${deployedName}`) : h("span", { className: "chip warn" }, "nothing deployed");
+  const draftChip = deployed && (changes.length
+    ? h("span", { className: "chip warn", title: "Not deployed yet:\n" + changes.join("\n") }, `draft: ${changes.length} change${changes.length === 1 ? "" : "s"} not deployed`)
+    : h("span", { className: "chip", title: "The canvas shows exactly what is running" }, "canvas = running"));
+  const usedIds = new Set(blocks.filter((b) => b.kind === "proc" || (focusHost && b.host === focusHost) || (design.wires || []).some((w) => w.from.split("|")[0] === b.id || w.to.split("|")[0] === b.id)).map((b) => b.id));
+  const nHidden = Object.values(design.devices || {}).filter((o) => o.hidden).length;
+  const bar = (cls, content) => h("div", { className: `bar ${cls}` }, content);
+  let noticeBar = null;
+  if (notice && notice.kind === "stale") noticeBar = bar("warn", [
+    h("span", { key: "t" }, `The canvas shows the running design "${deployedName}". An older draft "${notice.draft.name}"${notice.draft.saved_at ? ` (saved ${ago(notice.draft.saved_at)})` : ""} from before the last deploy was set aside: ${designDiff(notice.draft, deployed).length} differences, and deploying it would replace "${deployedName}".`),
+    h("button", { key: "o", className: "btn", onClick: openSetAside }, "Open the old draft"), h("button", { key: "d", className: "btn", onClick: dropSetAside }, "Discard it")]);
+  else if (notice && notice.kind === "moved") noticeBar = bar("warn", [
+    h("span", { key: "t" }, `The running design changed to "${notice.name}" (a deploy or rollback, maybe in another browser) while you were editing. Your draft is kept; Deploy would replace what runs now.`),
+    h("button", { key: "r", className: "btn", onClick: resetToDeployed }, "Show the running design"), h("button", { key: "k", className: "btn", onClick: () => setNotice(null) }, "Keep my draft")]);
+  else if (deployed && design.name !== deployed.name) noticeBar = bar("bad", [
+    h("span", { key: "t" }, `You are editing "${design.name}", not the running "${deployed.name}". Deploying it replaces the whole room design.`),
+    h("button", { key: "r", className: "btn", onClick: resetToDeployed }, `Back to "${deployed.name}"`)]);
+
+  return h(React.Fragment, null,
+    h("div", { className: "top" },
+      h("h1", null, "Owl Designer"),
+      h("div", { className: "tabs" }, ["design", "run", "panels", "routing"].map((m) => h("button", { key: m, className: mode === m ? "on" : "", onClick: () => setMode(m) }, m[0].toUpperCase() + m.slice(1)))),
+      h("span", { className: "sp" }),
+      changesChip, draftChip,
+      live.connected ? h("span", { className: "chip ok", title: "WebSocket to the dsp role: live values" }, "live") : h("span", { className: "chip warn", title: "no WebSocket: values poll" }, "polling"),
+      err ? h("span", { className: "chip bad" }, err) : (inv.error ? h("span", { className: "chip warn" }, inv.error) : null),
+      (mode === "design" || mode === "run") && h("span", { className: `btn probe-tool ${probe && probe.state === "playing" ? "primary" : ""}`, title: "Drag onto any port, block or wire to hear it on this computer",
+        onPointerDown: onProbeDown }, "🎧 Probe"),
+      (mode === "design" || mode === "run") && h("span", { className: `btn probe-tool ${inject && inject.state === "playing" ? "primary" : ""}`, title: "Drag onto an input, a block or a wire to play a test signal (noise, tone) into it",
+        onPointerDown: onInjectDown }, "🔊 Inject"),
+      (mode === "design" || mode === "run") && h("button", { className: "btn sheet-tab", onClick: () => setSheet(sheet === "palette" ? null : "palette") }, "＋ Block"),
+      (mode === "design" || mode === "run") && h("button", { className: "btn", disabled: busy, onClick: () => { if (!changes.length || confirm(`Discard ${changes.length} undeployed change(s) and show the running design?\n\n${changes.join("\n")}`)) resetToDeployed(); }, title: "Discard the draft, show what is running" }, "Reset"),
+      (mode === "design" || mode === "run") && h("button", { className: "btn", disabled: busy || !(status && status.has_prev), onClick: doRollback }, "Rollback"),
+      (mode === "design" || mode === "run") && h("button", { className: "btn primary", disabled: busy, onClick: doPlan }, "Deploy…")),
+    noticeBar,
+    h("div", { className: "main", style: noticeBar ? { top: "calc(var(--toph, 49px) + 56px)" } : null },
+      (mode === "design" || mode === "run") && h("div", { className: `side ${sheet === "palette" ? "" : "hidden"}` },
+        h("h3", null, "Design"),
+        h("input", { className: "insp", type: "text", value: design.name || "", onChange: (e) => update((d) => ({ ...d, name: e.target.value })), style: { width: "100%", padding: 5, border: "1px solid var(--line)", borderRadius: 6, background: "var(--bg)", color: "var(--ink)" } }),
+        h("label", { className: "insp", style: { display: "block", fontSize: 12, marginTop: 6 } }, "Network latency (ms)",
+          h("input", { type: "number", min: 1, max: 500, step: 1, value: design.latency_ms ?? "", placeholder: "each node's default (6)", disabled: run,
+            onChange: (e) => { const v = e.target.value; update((d) => { const { latency_ms, ...rest } = d; return v === "" ? rest : { ...rest, latency_ms: Number(v) }; }); },
+            style: { width: "100%", padding: 5, border: "1px solid var(--line)", borderRadius: 6, background: "var(--bg)", color: "var(--ink)" } })),
+        h("p", { className: "help", style: { marginTop: 2, fontSize: 11, color: "var(--muted)" } }, "How long receivers buffer streams between machines. One value for every room keeps them in step; raise it if a busy network makes audio drop out. A wire can set its own."),
+        h("div", { className: "row", style: { display: "flex", gap: 6, marginTop: 6 } },
+          h("button", { className: "btn", onClick: exportDesign, title: "Download the canvas as a JSON file" }, "Export"),
+          h("label", { className: "btn", style: { cursor: run ? "default" : "pointer", opacity: run ? 0.5 : 1 }, title: "Open a design file on the canvas" }, "Import…",
+            h("input", { type: "file", accept: ".json,application/json", disabled: run, style: { display: "none" }, onChange: (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) importDesign(f); } }))),
+        h(HistoryPanel, { onOpen: openFromHistory, disabled: run, deployedAt: deployedAtRef.current }),
+        h(SoundsPanel, { sounds, reload: loadSounds, say }),
+        h("h3", null, "Nodes"),
+        h(NodesPanel, { hub: inv.hub, onChange: (host) => { setFocusHost(host); setTimeout(() => setFlowKey((k) => k + 1), 3500); } }),
+        h("h3", null, "Blocks"),
+        h("div", { className: "pal" }, palette.map((t) => h("button", { key: t.type, onClick: () => addBlock(t), disabled: run }, t.label, h("small", null, t.group + " · " + t.description)))),
+        h("h3", null, "Devices"),
+        nHidden ? h("label", { className: "row insp", style: { fontSize: 12, gap: 6, display: "flex", alignItems: "center", marginBottom: 4 } }, h("input", { type: "checkbox", checked: showHidden, onChange: (e) => { setShowHidden(e.target.checked); setFlowKey((k) => k + 1); } }), `Show ${nHidden} hidden device${nHidden === 1 ? "" : "s"}`) : null,
+        h("div", { className: "insp kv" }, `${inv.blocks.filter((b) => b.source === "pipewire" && b.host === inv.hub).length} on the hub (${inv.hub}), ${inv.blocks.filter((b) => b.source === "nmos" && !b.is_hub).length} satellite node(s)`,
+          Object.keys(inv.satellites || {}).length ? h("div", null, "Satellite DSP: " + Object.values(inv.satellites).map((s) => `${s.host} (${s.ok ? "owl-node " + s.version : "unreachable"}${s.share && s.share.blocks && s.share.blocks.length ? `, ${s.share.blocks.length} block(s)` : ""})`).join(", ")) : null),
+        status && status.events && status.events.length ? [h("h3", { key: "eh" }, "Events"), h("div", { key: "ev", className: "events" }, status.events.slice(0, 8).map((e, i) => h("div", { key: i }, new Date(e.time * 1000).toLocaleTimeString() + " " + e.msg)))] : null),
+      (mode === "design" || mode === "run") && h("div", { className: `canvas${dragProbe ? " drop-probe" : ""}` },
+        h(Flow, { key: flowKey, nodes, edges, nodeTypes, onNodesChange, onEdgesChange, onConnect, isValidConnection, fitView: true,
+                  fitViewOptions: { padding: 0.15, nodes: usedIds.size ? [...usedIds].map((id) => ({ id })) : undefined },
+                  minZoom: 0.2, maxZoom: 2, nodesConnectable: !run, elementsSelectable: true, deleteKeyCode: run ? null : ["Backspace", "Delete"],
+                  onPaneClick: () => { setSel(null); setSheet(null); }, proOptions: { hideAttribution: true }, connectionRadius: 24 },
+          h(Background, { gap: 24, size: 1 }), h(Controls, { showInteractive: false }))),
+      (mode === "design" || mode === "run") && (selBlock || selWire) && h("div", { className: "side right" },
+        selBlock && selBlock.kind === "proc" && h(Inspector, { b: selBlock, t: types[selBlock.type], run, deployed: !!deployedName, voice: status && status.voice, sounds, say, setParam, setLabel, setHost, hub: inv.hub, sats: Object.values(inv.satellites || {}), liveSet, proc: status && status.procs && status.procs[selBlock.id],
+          remove: () => { update((d) => ({ ...d, blocks: d.blocks.filter((b) => b.id !== selBlock.id), wires: d.wires.filter((w) => !w.from.startsWith(selBlock.id + "|") && !w.to.startsWith(selBlock.id + "|")) })); setSel(null); } }),
+        selBlock && h(ListenRow, { b: selBlock, ports: portsFor(selBlock), probe, startProbe }),
+        selBlock && selBlock.kind === "device" && h(DeviceInfo, { b: selBlock, hub: inv.hub, run, setDevice, override: (design.devices || {})[selBlock.id] || {} }),
+        selWire && h("div", { className: "insp" }, h("button", { className: "btn", style: { marginBottom: 6 }, onClick: () => { const [b_, p_] = selWire.from.split("|"); startProbe(b_, p_); } }, "🎧 Listen to this wire")),
+        selWire && h(WireInfo, { w: selWire, blocks, st: status && status.wires && status.wires[selWire.id], plan, run,
+          setMove: (v) => update((d) => ({ ...d, wires: d.wires.map((w) => (w.id === selWire.id ? (v ? { ...w, move: true } : (({ move, ...rest }) => rest)(w)) : w)) })),
+          designLatency: design.latency_ms,
+          setLatency: (v) => update((d) => ({ ...d, wires: d.wires.map((w) => (w.id === selWire.id ? (v === "" ? (({ latency_ms, ...rest }) => rest)(w) : { ...w, latency_ms: Number(v) }) : w)) })),
+          remove: () => { update((d) => ({ ...d, wires: d.wires.filter((w) => w.id !== selWire.id) })); setSel(null); } }),
+        sel && sel.kind === "edge" && !selWire && h("div", { className: "insp" }, h("h3", null, "Existing link"), h("p", { className: "help" }, "Made by WirePlumber or an app, not by a design. The designer never removes it."))),
+      mode === "panels" && h(Panels, { design, update, deployed: !!deployedName, live, say }),
+      mode === "routing" && h("div", { className: "page", style: { padding: 0 } }, h("iframe", { src: "routing", title: "Routing" })),
+      probe && h(ProbePanel, { probe, player: playerRef.current, onStop: () => playerRef.current.stop() }),
+      inject && h(InjectPanel, { inject, setInject, raised: !!probe, say })),
+    plan && h(PlanModal, { plan, designChanges: changes, onClose: () => setPlan(null), onApply: () => doDeploy(plan.allowMissing), busy }),
+    toast && h("div", { className: `toast ${toast.err ? "err" : ""}` }, toast.msg),
+    dragProbe && h("div", { className: `probe-ghost ${dragProbe.target ? "" : "none"}`, style: { left: dragProbe.x, top: dragProbe.y } },
+      dragProbe.tool === "inject" ? "🔊 " + (dragProbe.label || "drop on an input") : "🎧 " + (dragProbe.label || "drop on a port")));
+}
+
+// the engine (dsp role) does not answer: say what to fix, for the hub install and for the Home Assistant add-on (F1)
+function EngineDown({ err }) {
+  const [info, setInfo] = useState(null);
+  useEffect(() => { api("GET", "api/info").then(setInfo).catch(() => {}); }, []);
+  const addon = info && info.addon;
+  return h("div", { className: "page", style: { maxWidth: 640 } }, h("h2", null, "Owl Designer"), h("p", { className: "chip bad", style: { whiteSpace: "normal" } }, err),
+    addon ? [
+      h("p", { key: "a" }, "This is the Home Assistant add-on: the designer runs here, the audio engine runs on another machine (the hub install of owl-node). It cannot reach the engine at ", h("code", null, info.dsp_api || "(not set)"), "."),
+      h("p", { key: "b" }, "In Home Assistant: Settings → Add-ons → Owl Designer → Configuration, set ", h("b", null, "engine_url"), " to ", h("code", null, "http://<engine IP>:8362"), " and restart the add-on. The engine machine needs owl-node installed with ", h("code", null, "install.sh --hub"), ".")]
+    : h("p", null, "The dsp role is not answering", info && info.dsp_api ? [" at ", h("code", { key: "c" }, info.dsp_api)] : null, ". On the hub: ", h("code", null, "docker compose ... --profile hub ps"), "."));
+}
+
+// ------------------------------------------------------------------ E1: nodes added by address
+function NodesPanel({ hub, onChange }) {
+  const [list, setList] = useState(null);
+  const [addr, setAddr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const load = useCallback(async () => { try { setList(await api("GET", "api/dsp/nodes")); } catch (e) {} }, []);
+  useEffect(() => { load(); const t = setInterval(load, 4000); return () => clearInterval(t); }, [load]);
+  const add = async () => {
+    if (!addr.trim()) return;
+    setBusy(true); setMsg(null);
+    try {
+      const r = await api("POST", "api/dsp/nodes", { address: addr.trim() });
+      setMsg({ ok: true, text: `Added ${r.label || r.host} (owl-node ${r.version || "?"}).` + (r.paired ? " Paired: it registers with this hub." : r.pair_error ? ` Not paired: ${r.pair_error}` : "") + " Its inputs and outputs appear on the canvas in a few seconds." });
+      setAddr(""); load(); onChange && onChange(r.host);
+    } catch (e) { setMsg({ ok: false, text: e.message }); }
+    setBusy(false);
+  };
+  const remove = async (n) => {
+    const inDesign = n.design_blocks ? `\n\nThe running design places ${n.design_blocks} block(s) on it: they stop working until it is added again.` : "";
+    if (!confirm(`Remove ${n.label} from this hub? Its devices leave the canvas and it is unpaired.${inDesign}`)) return;
+    try { const r = await api("DELETE", `api/dsp/nodes/${encodeURIComponent(n.host)}`); setMsg({ ok: !r.warning, text: r.warning || `Removed ${n.label}.` }); load(); onChange && onChange(null); }
+    catch (e) { setMsg({ ok: false, text: e.message }); }
+  };
+  const nodes = (list && list.nodes) || [];
+  return h("div", { className: "nodes" },
+    h("div", { className: "addrow" },
+      h("input", { type: "text", value: addr, placeholder: "node address, e.g. 192.0.2.20", onChange: (e) => setAddr(e.target.value), onKeyDown: (e) => { if (e.key === "Enter") add(); }, disabled: busy }),
+      h("button", { className: "btn", onClick: add, disabled: busy || !addr.trim() }, busy ? "…" : "Add")),
+    msg ? h("div", { className: `msg ${msg.ok ? "ok" : "err"}` }, msg.text) : h("div", { className: "msg", style: { color: "var(--muted)" } }, "IP or IP:port of a machine running owl-node with the dsp role (port 8362 by default)."),
+    nodes.map((n) => h("div", { key: n.host, className: "nd" },
+      h("div", { className: "t" }, h("span", { className: `dot ${n.ok ? "ok" : n.seen ? "bad" : ""}`, title: n.ok ? "answering" : n.error || "not answering yet" }),
+        h("b", { title: n.url }, n.label), n.added ? h("button", { className: "x", title: "Remove from this hub", onClick: () => remove(n) }, "×") : h("button", { className: "x", title: "Found in the registry; remove hides it", onClick: () => remove(n) }, "×")),
+      h("div", { className: "s" }, [n.url.replace(/^http:\/\//, ""), n.version ? `owl-node ${n.version}` : null, n.ok ? `${n.devices} device${n.devices === 1 ? "" : "s"}` : !n.seen && n.from_registry ? "registered, but no dsp role answers: install it there to see its devices" : /refused/i.test(n.error || "") ? "not answering (owl-node stopped?)" : (n.error || "not answering")].filter(Boolean).join(" · ")),
+      h("div", { className: "s" }, [n.paired ? `paired with ${n.paired.hub_name || "a hub"}` : n.from_registry ? "registered (node.yaml)" : "not registered: wires to it cannot carry audio yet",
+        n.transport && (n.transport.senders || n.transport.receivers) ? `AES67 ${n.transport.senders || 0} TX / ${n.transport.receivers || 0} RX` : null,
+        n.design_blocks ? `${n.design_blocks} block(s) in the design` : null].filter(Boolean).join(" · ")))),
+    list && !nodes.length ? h("div", { className: "msg", style: { color: "var(--muted)" } }, "No nodes yet.") : null);
+}
+
+function ListenRow({ b, ports, probe, startProbe }) {
+  const all = [...ports.outputs.map((p) => ({ ...p, dir: "out" })), ...ports.inputs.map((p) => ({ ...p, dir: "in" }))].filter((p) => (p.media || "audio") === "audio");
+  if (!all.length) return null;
+  return h("div", { className: "insp", style: { marginBottom: 4 } },
+    h("h3", null, "🎧 Listen on this computer"),
+    h("div", { style: { display: "flex", flexWrap: "wrap", gap: 4 } }, all.map((p) => {
+      const on = probe && probe.block === b.id && probe.port === p.id && probe.state === "playing";
+      return h("button", { key: p.dir + p.id, className: `btn ${on ? "primary" : ""}`, style: { padding: "3px 8px", fontSize: 12 }, title: p.dir === "in" ? "what arrives at this input" : "what leaves this output",
+        onClick: () => startProbe(b.id, p.id) }, `${p.dir === "in" ? "→ " : ""}${p.label}${p.dir === "out" ? " →" : ""}`);
+    })));
+}
+
+const HUB_ONLY_ENGINES = new Set(["voice", "rtsp"]);      // block engines that cannot run on a satellite
+const HUB_ONLY = { has: (engine, t) => HUB_ONLY_ENGINES.has(engine) || !!(t && t.hub_only) };
+
+function TextParam({ value, secret, onChange }) {
+  const [show, setShow] = useState(false);
+  return h("div", null,
+    h("input", { type: secret && !show ? "password" : "text", value, autoComplete: "off", spellCheck: false, onChange: (e) => onChange(e.target.value.trim()) }),
+    secret ? h("label", { className: "row", style: { margin: "4px 0 0", fontSize: 11 } }, h("input", { type: "checkbox", checked: show, onChange: (e) => setShow(e.target.checked) }), "show (it holds the camera's password or token)") : null);
+}
+
+// the camera's video through the hub's MediaMTX (WHEP, relayed by the controller like the Routing page's previews)
+function RtspPreview({ b, deployed }) {
+  const [state, setState] = useState(null);
+  const vref = useRef(null), pcRef = useRef(null);
+  const stop = () => { if (pcRef.current) pcRef.current.close(); pcRef.current = null; setState(null); };
+  useEffect(() => stop, [b.id]);
+  const start = async () => {
+    stop(); setState("connecting…");
+    const pc = pcRef.current = new RTCPeerConnection();
+    pc.addTransceiver("video", { direction: "recvonly" }); pc.addTransceiver("audio", { direction: "recvonly" });
+    pc.ontrack = (e) => { if (vref.current && e.track.kind === "video") vref.current.srcObject = e.streams[0] || new MediaStream([e.track]); };
+    pc.onconnectionstatechange = () => setState(pc.connectionState === "connected" ? "live (WebRTC from the hub)" : pc.connectionState);
+    try {
+      await pc.setLocalDescription(await pc.createOffer());
+      await new Promise((r) => { if (pc.iceGatheringState === "complete") return r(); pc.addEventListener("icegatheringstatechange", () => pc.iceGatheringState === "complete" && r()); setTimeout(r, 1500); });
+      const res = await fetch(`api/whep/owl-cam-${b.id}`, { method: "POST", headers: { "Content-Type": "application/sdp" }, body: pc.localDescription.sdp });
+      if (!res.ok) throw new Error(res.status === 404 ? "the hub is not pulling this camera (deploy first; video on?)"
+        : res.status === 400 ? "this browser cannot receive the camera's codec over WebRTC (H.265 cameras: most browsers need H.264 here). The camera still plays on video receivers; for a preview, use the camera's lower-resolution H.264 stream if it has one"
+        : `WHEP HTTP ${res.status}`);
+      await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
+    } catch (e) { setState("preview failed: " + e.message); }
+  };
+  const p_ = b.params || {};
+  if (p_.video === false || !p_.url) return null;
+  return h("div", { className: "kv", style: { marginTop: 10 } }, h("h3", null, "Video"),
+    state ? h("video", { ref: vref, autoPlay: true, muted: true, playsInline: true, controls: false, style: { width: "100%", borderRadius: 6, background: "#000", aspectRatio: "16/9" } }) : null,
+    h("div", { className: "row", style: { marginTop: 6 } },
+      state ? h("button", { className: "btn", onClick: stop }, "Stop preview") : h("button", { className: "btn", disabled: !deployed, onClick: start }, "▶ Preview"),
+      h("span", { className: "help" }, state || (deployed ? "" : "deploy to preview"))),
+    h("p", { className: "help" }, "Wire the video output to a node's video receiver to show the camera there. A browser shows H.265 cameras only where it can decode H.265."));
+}
+
+function VoiceInfo({ b, voice: v }) {
+  if (!v) return h("p", { className: "help" }, "The voice satellite is not running in the dsp role (OWL_VOICE off?).");
+  const mine = v.block === b.id;
+  return h("div", { className: "kv", style: { marginTop: 10 } },
+    h("h3", null, "Voice assistant now"),
+    mine ? null : h("p", { className: "chip warn", style: { whiteSpace: "normal" } }, v.wired_by === "guess" ? "The running design has no Voice assistant block, so the assistant guesses its mic. Deploy this design to make these wires the real ones." : "Deploy to make the assistant use these wires."),
+    h("div", null, h("b", null, "Hears: "), v.mic_node || "nothing (wire a source into listen)"), h("div", null, h("b", null, "Replies into: "), v.reply_node || "the default speaker"),
+    h("div", null, h("b", null, "Home Assistant: "), v.ha, v.ha_peer ? ` (${v.ha_peer})` : ""),
+    h("div", null, h("b", null, "Wake word: "), v.wake ? `on (“${v.wake_word || "chosen in HA"}”, ${v.wake_detections || 0} detections)` : "off (push-to-talk only)"),
+    v.last_text ? h("div", null, h("b", null, "Last heard: "), v.last_text) : null,
+    v.last_error ? h("div", { style: { color: "var(--bad)" } }, h("b", null, "Last error: "), v.last_error) : null,
+    h("p", { className: "help" }, "The wake word and the pipeline are chosen in Home Assistant (Settings → Voice assistants). Push to talk and the wake-word switch are on the Panels page and in HA."));
+}
+
+function Inspector({ b, t, run, deployed, setParam, setLabel, setHost, hub, sats, liveSet, remove, proc, voice, sounds, say }) {
+  const trigger = (action) => api("POST", "api/dsp/controls/set", { key: `${b.id}.${action}` }).catch((e) => say && say(e.message, true));
+  return h("div", { className: "insp" },
+    h("h3", null, `${t.label} · ${b.id}`),
+    h("p", { className: "help" }, t.description),
+    h("label", null, "Label"), h("input", { type: "text", value: b.label || "", onChange: (e) => setLabel(b.id, e.target.value) }),
+    !HUB_ONLY.has(t.engine, t) && h("label", null, "Runs on"), !HUB_ONLY.has(t.engine, t) && h("select", { value: b.host || hub || "", disabled: run, onChange: (e) => setHost(b.id, e.target.value) },
+      h("option", { value: hub || "" }, `${hub || "hub"} (hub)`),
+      (sats || []).filter((s_) => s_.host !== hub).map((s_) => h("option", { key: s_.host, value: s_.host }, `${s_.host} (satellite${s_.ok ? "" : ", unreachable"})`)),
+      b.host && b.host !== hub && !(sats || []).some((s_) => s_.host === b.host) ? h("option", { value: b.host }, `${b.host} (no dsp role seen)`) : null),
+    !HUB_ONLY.has(t.engine, t) && h("p", { className: "help" }, "The hub compiles the block and pushes it to that satellite's dsp role; wires across hosts get AES67 transport automatically."),
+    Object.entries(t.params || {}).map(([k, s]) => {
+      const v = (b.params || {})[k] ?? s.default;
+      const set = (nv) => (s.live && deployed && run ? liveSet(b.id, k, nv) : setParam(b.id, k, nv));
+      let ctl;
+      if (s.type === "text") ctl = [h("label", { key: "l" }, s.label || k), h(TextParam, { key: "t", value: v || "", secret: !!s.secret, onChange: set })];
+      else if (s.type === "sound") ctl = [h("label", { key: "l" }, s.label || k, s.live ? " " : null, s.live ? h("span", { className: "badge b-ok" }, "live") : null),
+        h("select", { key: "s", value: v || "", onChange: (e) => set(e.target.value) }, h("option", { value: "" }, (sounds || []).length ? "— choose a sound —" : "— the library is empty —"),
+          (sounds || []).map((x) => h("option", { key: x.name, value: x.name }, x.name)), v && !(sounds || []).some((x) => x.name === v) ? h("option", { value: v }, `${v} (not in the library)`) : null)];
+      else if (s.type === "bool") ctl = h("label", { className: "row", style: { margin: 0 } }, h("input", { type: "checkbox", checked: !!v, onChange: (e) => set(e.target.checked) }), s.label || k, s.live ? h("span", { className: "badge b-ok" }, "live") : null);
+      else if (s.type === "select") ctl = [h("label", { key: "l" }, s.label || k, s.live ? " " : null, s.live ? h("span", { className: "badge b-ok" }, "live") : null), h("select", { key: "s", value: String(v), onChange: (e) => set(e.target.value) }, (s.options || []).map((o) => h("option", { key: o, value: String(o) }, String(o))))];
+      else ctl = [h("label", { key: "l" }, s.label || k, s.live ? " " : null, s.live ? h("span", { className: "badge b-ok" }, "live") : null),
+        h("div", { key: "r", className: "row" },
+          s.min != null && s.max != null ? h("input", { type: "range", min: s.min, max: s.max, step: s.step || 1, value: v, onChange: (e) => set(Number(e.target.value)) }) : null,
+          h("input", { type: "number", min: s.min, max: s.max, step: s.step || 1, value: v, onChange: (e) => set(Number(e.target.value)) }))];
+      return h("div", { key: k }, ctl, s.help ? h("div", { className: "help" }, s.help) : null);
+    }),
+    (t.triggers || []).length ? h("div", { className: "row", style: { display: "flex", gap: 6, marginTop: 8 } },
+      t.triggers.map((tr) => h("button", { key: tr.id, className: `btn ${tr.id === "play" ? "primary" : ""}`, disabled: !deployed, onClick: () => trigger(tr.id),
+        title: deployed ? `${b.id}.${tr.id}` : "Deploy first" }, tr.id === "play" ? `▶ ${tr.label}` : tr.id === "stop" ? `■ ${tr.label}` : tr.label))) : null,
+    (t.triggers || []).length ? h("p", { className: "help" }, `Also Panels buttons, Home Assistant buttons and the API: ${t.triggers.map((tr) => `${b.id}.${tr.id}`).join(", ")}.`) : null,
+    t.engine !== "voice" && h("h3", null, "Control names"),
+    t.engine !== "voice" && h("p", { className: "names" }, "Named controls (API, Panels, HA): ", Object.keys(t.params || {}).filter((k) => !(t.params[k].secret || t.params[k].type === "text")).map((k, i) => h(React.Fragment, { key: k }, i ? ", " : "", h("code", null, `${slug(b.label || t.label)}.${k}`))), t.engine === "meter" ? [", ", h("code", { key: "m" }, `${slug(b.label || t.label)}.level`)] : (t.outputs || []).filter((p) => (p.media || "audio") === "audio").map((p) => [", ", h("code", { key: p.id }, `${slug(b.label || t.label)}.${p.id}.level`)]), ". Stable key: ", h("code", null, b.id + ".<param>"), " (what panels, presets and HA use, so renaming the block is safe)."),
+    t.engine === "voice" && h(VoiceInfo, { b, voice }),
+    t.engine === "rtsp" && h(RtspPreview, { b, deployed }),
+    t.engine === "pipewire" && h("p", { className: "help" }, "PipeWire nodes: " + (proc && proc.nodes ? Object.entries(proc.nodes).map(([n, ok]) => `${n}${ok ? "" : " (missing)"}`).join(", ") : Object.values(t.nodes || {}).map((n) => n.replace("${id}", b.id).replace(/\$\{[^}]*\}/g, "…")).join(", ") || "owl-" + b.id + "-*")),
+    !run && h("button", { className: "btn danger", onClick: remove, style: { marginTop: 12 } }, "Delete block"));
+}
+
+function DeviceInfo({ b, hub, run, setDevice, override }) {
+  const st = b.status;
+  return h("div", { className: "insp" },
+    h("h3", null, b.label),
+    b.source === "pipewire" && !run ? [
+      h("label", { key: "nl" }, "Name on the canvas"),
+      h("input", { key: "ni", type: "text", value: override.label || "", placeholder: b.label, onChange: (e) => setDevice(b.id, "label", e.target.value) }),
+      h("p", { key: "nh", className: "help" }, `The system calls it “${b.sysLabel}”. The name is saved with the design.`),
+      h("label", { key: "hl", className: "row" }, h("input", { type: "checkbox", checked: !!override.hidden, onChange: (e) => setDevice(b.id, "hidden", e.target.checked) }), "Hide when not wired (e.g. a USB mic's headphone jack)")] : null,
+    h("div", { className: "kv" }, h("b", null, b.host === hub ? "hub" : "satellite"), ` · ${b.host}`, b.area ? ` · ${b.area}` : "", h("br"), b.sub, b.node ? h(React.Fragment, null, h("br"), h("code", null, b.node)) : null),
+    st ? h("div", { className: "kv", style: { marginTop: 8 } }, `owl-node ${st.version || "?"} · ${st.registered ? "registered" : "NOT registered"} · roles ${(st.roles || []).join(", ") || "?"}`, h("br"), st.ptp && st.ptp.state ? `PTP ${st.ptp.state}${st.ptp.offset_ns != null ? ` ${st.ptp.offset_ns} ns` : ""}` : `clock ${st.clock || "?"}`) : null,
+    h("h3", null, "Ports"),
+    h("ul", null, b.inputs.map((p) => h("li", { key: p.id }, `in · ${p.label} (${p.media}${p.channels ? `, ${p.channels} ch` : ""}${p.media_types ? ", " + p.media_types.join("/") : ""})`)),
+      b.outputs.map((p) => h("li", { key: p.id }, `out · ${p.label} (${p.media}${p.channels ? `, ${p.channels} ch` : ""}${p.media_type ? ", " + p.media_type : ""})`))),
+    b.live === false ? h("p", { className: "chip bad" }, "not present now") : null);
+}
+
+function SoundsPanel({ sounds, reload, say }) {
+  const [busy, setBusy] = useState(false);
+  const audio = useRef(null);
+  const upload = async (files) => {
+    setBusy(true);
+    for (const f of files) {
+      try {
+        const r = await fetch(`api/dsp/sounds?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f, headers: { "Content-Type": f.type || "application/octet-stream" } });
+        const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+        if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+        say(`Added ${j.name}`);
+      } catch (e) { say(`${f.name}: ${e.message}`, true); }
+    }
+    setBusy(false); reload();
+  };
+  const del = (name) => { if (confirm(`Delete ${name} from the library? Sound players that use it go quiet.`)) api("DELETE", `api/dsp/sounds/${encodeURIComponent(name)}`).then(reload, (e) => say(e.message, true)); };
+  const preview = (name) => {
+    if (audio.current) audio.current.pause();
+    audio.current = new Audio(`api/dsp/sounds/${encodeURIComponent(name)}/file`);
+    audio.current.play().catch((e) => say(`This browser cannot play ${name} (${e.message}); the hub can still play it`, true));
+  };
+  const size = (n) => n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} kB`;
+  return h("details", { className: "insp", style: { marginTop: 6, fontSize: 12 } },
+    h("summary", { style: { cursor: "pointer" } }, `Sounds (${sounds.length})`),
+    h("p", { className: "help", style: { fontSize: 11, color: "var(--muted)", margin: "4px 0" } }, "Doorbells, chimes, alarms: a Sound player block plays one when triggered. WAV, FLAC, Ogg, MP3 up to 25 MB."),
+    h("ul", { style: { listStyle: "none", padding: 0, margin: "4px 0" } }, sounds.map((x) => h("li", { key: x.name, style: { display: "flex", gap: 4, alignItems: "center", padding: "2px 0" } },
+      h("span", { style: { flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: x.name }, x.name),
+      h("span", { style: { color: "var(--muted)" } }, x.duration_s != null ? `${x.duration_s.toFixed(1)} s` : size(x.size)),
+      h("button", { className: "btn", style: { padding: "1px 6px" }, title: "Listen here", onClick: () => preview(x.name) }, "▶"),
+      h("button", { className: "btn", style: { padding: "1px 6px" }, title: "Delete", onClick: () => del(x.name) }, "✕")))),
+    h("label", { className: "btn", style: { cursor: busy ? "default" : "pointer", display: "inline-block" } }, busy ? "Uploading…" : "Upload…",
+      h("input", { type: "file", multiple: true, accept: "audio/*,.wav,.flac,.ogg,.oga,.opus,.mp3", disabled: busy, style: { display: "none" },
+        onChange: (e) => { const fs = [...e.target.files]; e.target.value = ""; if (fs.length) upload(fs); } })));
+}
+
+function HistoryPanel({ onOpen, disabled, deployedAt }) {
+  const [open, setOpen] = useState(false);
+  const [items, setItems] = useState(null);
+  useEffect(() => { if (open) api("GET", "api/dsp/history").then((r) => setItems(r.history || []), () => setItems([])); }, [open, deployedAt]);
+  return h("details", { className: "insp", style: { marginTop: 6, fontSize: 12 }, onToggle: (e) => setOpen(e.target.open) },
+    h("summary", { style: { cursor: "pointer" } }, "History (last deploys)"),
+    items === null ? h("div", { className: "help" }, "…") : !items.length ? h("div", { className: "help" }, "Nothing deployed yet.") :
+      h("ul", { style: { listStyle: "none", padding: 0, margin: "4px 0" } }, items.map((it) => h("li", { key: it.id, style: { display: "flex", gap: 6, alignItems: "center", padding: "2px 0" } },
+        h("span", { style: { flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: `${it.blocks} blocks, ${it.wires} wires` },
+          `${new Date(it.deployed_at * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} · ${it.name}${it.reason !== "deploy" ? ` (${it.reason})` : ""}`),
+        h("button", { className: "btn", disabled, style: { padding: "1px 6px" }, onClick: () => onOpen(it.id) }, "Open")))));
+}
+
+function WireInfo({ w, blocks, st, plan, run, remove, setMove, setLatency, designLatency }) {
+  const name = (ref) => { const [bid, pid] = ref.split("|"); const b = blocks.find((x) => x.id === bid); const p = b && (b.kind === "proc" ? { label: pid } : b.inputs.concat(b.outputs).find((x) => x.id === pid)); return `${b ? b.label : bid} · ${p ? p.label : pid}`; };
+  const impl = plan && plan.wires && plan.wires[w.id];
+  const src = blocks.find((x) => x.id === w.from.split("|")[0]), dst = blocks.find((x) => x.id === w.to.split("|")[0]);
+  const movable = src && src.kind === "device" && src.class === "app-out" && dst && dst.kind === "proc";
+  // a wire between machines rides an AES67 stream: its receiver's playout latency can be set (the design's, else this)
+  const hostOf = (b) => (b && (b.host || (b.kind === "proc" ? "hub" : null))) || null;
+  const network = impl ? impl.some((s) => s.startsWith("IS-05 patch")) : (src && dst && (src.source === "sap" || hostOf(src) !== hostOf(dst)));
+  return h("div", { className: "insp" },
+    h("h3", null, `Wire ${w.id}`),
+    h("div", { className: "kv" }, h("b", null, "from "), name(w.from), h("br"), h("b", null, "to "), name(w.to)),
+    movable && h("label", { className: "row", style: { marginTop: 8 } }, h("input", { type: "checkbox", checked: !!w.move, disabled: run, onChange: (e) => setMove(e.target.checked) }), "Move the stream into this block"),
+    movable && h("p", { className: "help" }, w.move ? "The app's stream is taken off its current output (the speaker) and plays only through this block: PipeWire target.object metadata, which WirePlumber follows and remembers. When the block is gone the stream falls back to its own output." : "Tap: the block gets a copy and the app keeps playing where it does (the AEC's reference works this way)."),
+    network && h("label", { className: "row", style: { marginTop: 8, gap: 6, display: "flex", alignItems: "center" } }, "Latency (ms)",
+      h("input", { type: "number", min: 1, max: 500, step: 1, value: w.latency_ms ?? "", disabled: run, style: { width: 80 },
+        placeholder: designLatency != null ? String(designLatency) : "default", onChange: (e) => setLatency(e.target.value) })),
+    network && h("p", { className: "help" }, "The receiving machine buffers this stream this long (empty: the design's network latency). Wires that share a stream share its latency."),
+    st ? h("div", { className: "kv", style: { marginTop: 8 } }, h("span", { className: `badge ${st.state === "ok" ? "b-ok" : st.state === "missing" ? "b-bad" : "b-warn"}` }, st.state), " ", (st.detail || []).join("; "),
+      st.rx ? h("div", null, `${st.rx.pkts_per_s} pkt/s · lost ${st.rx.lost} · ${(st.rx.rms_dbfs || []).map(fmtDb).join("/")} dBFS on the wire`) : null) : null,
+    impl ? [h("h3", { key: "h" }, "Compiles to"), h("ul", { key: "u" }, impl.map((s, i) => h("li", { key: i }, s)))] : h("p", { className: "help" }, "Press Deploy… to see what this wire compiles to."),
+    !run && h("button", { className: "btn danger", onClick: remove, style: { marginTop: 12 } }, "Delete wire"));
+}
+
+function PlanModal({ plan, onClose, onApply, busy, designChanges }) {
+  const sec = (title, items, cls) => (items && items.length ? [h("h4", { key: "h" + title }, title), h("ul", { key: "u" + title }, items.map((x, i) => h("li", { key: i, className: cls }, x)))] : null);
+  if (!plan.ok) return h("div", { className: "modal-bg", onClick: onClose }, h("div", { className: "modal", onClick: (e) => e.stopPropagation() },
+    h("h2", null, "The design does not compile"), h("ul", null, plan.errors.map((e, i) => h("li", { key: i, className: "rm" }, e))),
+    h("div", { className: "acts" }, h("button", { className: "btn", onClick: onClose }, "Close"))));
+  const d = plan.diff;
+  const im = plan.impact || {};
+  const vw = (im.voice && im.voice.warnings) || [];
+  const voiceBad = vw.filter((w) => /loses|instead of/.test(w));
+  return h("div", { className: "modal-bg", onClick: onClose }, h("div", { className: "modal", onClick: (e) => e.stopPropagation() },
+    h("h2", null, im.replaces ? `Replace “${im.current_name}” with “${im.new_name}”` : plan.changes ? `Deploy: ${plan.changes} change${plan.changes === 1 ? "" : "s"}` : designChanges && designChanges.length ? "Deploy: no audio path changes" : "Deploy: nothing changes (already running)"),
+    !plan.changes && designChanges && designChanges.length ? h("p", { className: "help" }, "The PipeWire graph stays as it is; deploying saves these design changes: " + designChanges.join(", ") + ".") : null,
+    im.replaces ? h("div", { className: "impact bad" }, h("b", null, `This is not an edit of the running design. “${im.current_name}” stops and “${im.new_name}” runs in its place.`),
+      im.removed_blocks && im.removed_blocks.length ? h("ul", null, h("li", null, `Removed: ${im.removed_blocks.map((x) => x.label).join(", ")}`),
+        im.lost_controls ? h("li", null, `${im.lost_controls} Home Assistant entities and named controls go away with them`) : null,
+        im.lost_panel_items && im.lost_panel_items.length ? h("li", null, `Panel controls left without a block: ${im.lost_panel_items.join("; ")}`) : null) : null)
+      : im.removed_blocks && im.removed_blocks.length ? h("div", { className: "impact warn" }, `Removes ${im.removed_blocks.map((x) => x.label).join(", ")}${im.lost_controls ? ` (${im.lost_controls} Home Assistant entities / controls go with them)` : ""}.`) : null,
+    vw.length ? h("div", { className: `impact ${voiceBad.length ? "bad" : "warn"}` }, h("b", null, "Voice assistant"), h("ul", null, vw.map((w, i) => h("li", { key: i }, w)))) : null,
+    im.voice && im.voice.mic_after && !vw.length ? h("p", { className: "help" }, `Voice assistant: hears ${im.voice.mic_after}, replies into ${im.voice.reply_after || "the default speaker"}.`) : null,
+    plan.allowMissing ? h("div", { className: "chip warn", style: { display: "block", whiteSpace: "normal", padding: 8, margin: "6px 0" } }, "Some devices are absent right now (an app's stream only exists while it plays; a satellite may be down). Their wires stay pending and are wired within 5 s of the device appearing: ", h("ul", null, plan.absent.map((e, i) => h("li", { key: i }, e.replace(/^wire \w+ /, ""))))) : null,
+    plan.warnings && plan.warnings.length ? h("ul", null, plan.warnings.map((w, i) => h("li", { key: i, style: { color: "var(--warn)" } }, w))) : null,
+    sec("Start block processes", d.procs.start, "add"), sec("Restart (params changed)", d.procs.restart, "add"), sec("Stop block processes", d.procs.stop, "rm"),
+    sec("Make PipeWire links", d.links.add, "add"), sec("Remove PipeWire links", d.links.remove, "rm"),
+    sec("Set IS-05 patches", d.patches.set, "add"), sec("Disconnect IS-05 patches", d.patches.clear, "rm"),
+    sec("Start meters", d.taps.start, "add"), sec("Stop meters", d.taps.stop, "rm"),
+    d.moves ? sec("Move app streams into blocks", d.moves.set, "add") : null, d.moves ? sec("Release app streams (back to their own output)", d.moves.clear, "rm") : null,
+    sec("Unchanged", [...d.procs.keep.map((x) => "process " + x), ...d.links.keep.map((x) => "link " + x), ...d.patches.keep.map((x) => "patch " + x)], "keep"),
+    h("h4", null, "Wires"), h("ul", null, Object.entries(plan.wires).map(([k, v]) => h("li", { key: k }, h("b", null, k + ": "), v.join("; ")))),
+    h("div", { className: "acts" }, h("button", { className: "btn", onClick: onClose }, "Cancel"), h("button", { className: `btn primary ${im.replaces || voiceBad.length ? "danger-fill" : ""}`, disabled: busy, onClick: onApply }, im.replaces ? `Replace “${im.current_name}”` : plan.allowMissing ? `Deploy anyway (${Object.keys(plan.pending || {}).length} wire${Object.keys(plan.pending || {}).length === 1 ? "" : "s"} pending)` : plan.changes || (designChanges && designChanges.length) ? "Apply" : "Re-apply anyway"))));
+}
+
+const slug = (x) => (String(x || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "x");
+const widgetFor = (c) => !c ? "fader" : c.kind === "meter" ? "meter" : c.type === "bool" ? "toggle" : c.type === "select" ? "select" : c.type === "trigger" ? "button" : c.type === "text" ? "text" : "fader";
+const fmtVal = (c, v) => v == null ? "–" : typeof v === "boolean" ? (v ? "on" : "off") : typeof v === "number" ? (Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1).replace(/\.0$/, "")) + (c && c.unit ? " " + c.unit : "") : String(v);
+
+// ------------------------------------------------------------------ live values over the WebSocket (D2)
+function useLive(enabled) {
+  const [st, setSt] = useState({ connected: false, listing: null, values: {}, meters: {}, detail: {}, lastPreset: null });
+  const wsRef = useRef(null), pend = useRef({});
+  useEffect(() => {
+    if (!enabled) return;
+    let ws, stop = false, timer;
+    const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + location.pathname.replace(/[^/]*$/, "") + "api/dsp/ws";
+    const connect = () => {
+      try { ws = new WebSocket(url); } catch (e) { timer = setTimeout(connect, 3000); return; }
+      wsRef.current = ws;
+      ws.onopen = () => setSt((s) => ({ ...s, connected: true }));
+      ws.onclose = () => { setSt((s) => ({ ...s, connected: false })); if (!stop) timer = setTimeout(connect, 2000); };
+      ws.onerror = () => { try { ws.close(); } catch (e) {} };
+      ws.onmessage = (ev) => {
+        let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+        if (m.type === "hello") { const values = {}; for (const c of m.controls) values[c.key] = c.value; setSt((s) => ({ ...s, listing: m, values, lastPreset: m.last_preset })); }
+        else if (m.type === "control") { const p = pend.current[m.key]; if (p && Date.now() - p < 500 && m.source === "ws") return; setSt((s) => ({ ...s, values: { ...s.values, [m.key]: m.value } })); }
+        else if (m.type === "meters") setSt((s) => ({ ...s, meters: m.values || {}, detail: m.detail || {} }));
+        else if (m.type === "preset") setSt((s) => ({ ...s, lastPreset: m.name }));
+        else if (m.type === "voice") setSt((s) => ({ ...s, values: { ...s.values, "voice.state": m.state, "voice.mic_live": m.mic_live, "voice.last_text": m.last_text, "voice.last_reply": m.last_reply, "voice.ha": m.ha, "voice.ptt_hold": m.hold, "voice.wake_word": m.wake } }));
+        else if (m.type === "design") { try { ws.send(JSON.stringify({ type: "list" })); } catch (e) {} }
+      };
+    };
+    connect();
+    return () => { stop = true; clearTimeout(timer); if (ws) ws.close(); };
+  }, [enabled]);
+  const set = useCallback((key, value, fade) => {
+    pend.current[key] = Date.now();
+    setSt((s) => ({ ...s, values: { ...s.values, [key]: value } }));
+    const ws = wsRef.current;
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "set", key, value, fade_s: fade || 0 }));
+    else api("POST", "api/dsp/controls/set", { key, value, fade_s: fade || 0 }).catch(() => {});
+  }, []);
+  const refresh = useCallback(() => { const ws = wsRef.current; if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "list" })); }, []);
+  return { ...st, set, refresh };
+}
+
+// ------------------------------------------------------------------ Page meter
+// Per-channel bars, peak hold, clip/hot lamp, stale state and a dBFS readout.
+const PM_FLOOR = -60;
+const PM_CH = ["L", "R", "3", "4"];
+const pmPct = (db) => (db == null || !isFinite(db) ? 0 : Math.max(0, Math.min(100, ((db - PM_FLOOR) / -PM_FLOOR) * 100)));
+const pmDb = (db) => (db == null || !isFinite(db) ? "–" : db.toFixed(1));
+
+function PageMeter({ label, lvl, d }) {
+  const rms = d.rms || [], pk = d.peak || [];
+  const n = Math.max(1, Math.min(4, rms.length || pk.length || 1));
+  const ref = useRef({ hold: [], t: 0 });
+  const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+  const st = ref.current;
+  const dt = st.t ? Math.min(0.9, Math.max(0.05, (now - st.t) / 1000)) : 0.25;
+  st.t = now;
+  const rows = [];
+  for (let ch = 0; ch < n; ch++) {
+    const r = rms[ch] != null ? rms[ch] : null;
+    const p = pk[ch] != null ? pk[ch] : null;
+    const top = r == null ? p : p == null ? r : Math.max(r, p);
+    let held = st.hold[ch] == null ? null : st.hold[ch] - 12 * dt;   // 12 dB/s decay
+    if (top != null && (held == null || top > held)) held = top;
+    if (held != null && held < PM_FLOOR) held = null;
+    st.hold[ch] = held;
+    rows.push({ ch, r, held });
+  }
+  const clip = (d.clip || 0) > 0.0005;
+  const hot = !clip && pk.some((x) => x != null && x > -3);
+  const stale = !!d.stale;
+  const badge = stale ? h("span", { className: "pmbadge nodata", title: "This tap delivered no frames in the last second: the block is not running or its output is not linked" }, "no data")
+    : clip ? h("span", { className: "pmbadge clip" }, "CLIP") : hot ? h("span", { className: "pmbadge hot" }, "hot")
+    : (lvl == null || d.signal === false) ? h("span", { className: "pmbadge", title: "Tap is running; the audio is silent (below −70 dBFS)" }, "silent") : null;
+  return h("div", { className: "pm" + (stale ? " stale" : "") },
+    h("div", { className: "pmh" }, h("b", null, label), h("span", { className: "pmr" }, badge, h("span", { className: "pmn" }, pmDb(lvl), " dBFS"))),
+    rows.map((x) => h("div", { key: x.ch, className: "pmrow" },
+      n > 1 ? h("span", { className: "ch" }, PM_CH[x.ch]) : null,
+      h("div", { className: "pmbar" },
+        h("i", { className: "pmfill", style: { width: pmPct(x.r) + "%" } }),
+        x.held != null ? h("i", { className: "pmhold", style: { left: Math.min(99, pmPct(x.held)) + "%" } }) : null),
+      h("span", { className: "pmn num" }, pmDb(x.r)))),
+    n === 1 ? h("div", { className: "pmscale" }, h("span", null, "−60"), h("span", null, "−36"), h("span", null, "−24"), h("span", null, "−12"), h("span", null, "0")) : null);
+}
+
+// ------------------------------------------------------------------ Panels (D2)
+function Widget({ item, c, live, edit, onCfg, editing, onPatch, onRemove, dragProps }) {
+  const v = c ? live.values[c.key] : undefined;
+  const w = item.widget || widgetFor(c);
+  // "Speaker level" + "level" -> "Speaker level", not "Speaker level level"
+  const joinLabel = (a, b) => (!a ? b || "" : !b ? a : a.toLowerCase().endsWith(b.toLowerCase()) ? a : `${a} ${b}`);
+  const label = item.label || (c ? joinLabel((c.block_label || "").trim(), (c.label || "").trim()) : item.key);
+  let body;
+  if (!c) body = h("div", { className: "help" }, `control ${item.key} is not in the deployed design`);
+  else if (w === "fader") {
+    const min = item.min != null ? item.min : (c.min != null ? c.min : 0), max = item.max != null ? item.max : (c.max != null ? c.max : 100);
+    body = [h("div", { key: "l", className: "wl" }, h("span", null, label), h("span", { className: "wv" }, fmtVal(c, v))),
+      h("input", { key: "r", type: "range", min, max, step: c.step || (c.type === "int" ? 1 : 0.5), value: v == null ? min : v, disabled: edit, onInput: (e) => live.set(c.key, Number(e.target.value)) })];
+  } else if (w === "toggle") body = [h("div", { key: "l", className: "wl" }, h("span", null, label)), h("button", { key: "b", className: v ? "on" : "", disabled: edit, onClick: () => live.set(c.key, !v) }, v ? (item.on_label || "On") : (item.off_label || "Off"))];
+  else if (w === "select") body = [h("div", { key: "l", className: "wl" }, h("span", null, label)), h("select", { key: "s", value: v == null ? "" : String(v), disabled: edit, onChange: (e) => live.set(c.key, e.target.value) }, (c.options || []).map((o) => h("option", { key: o, value: String(o) }, String(o))))];
+  else if (w === "button") body = [h("div", { key: "l", className: "wl" }, h("span", null, label)), h("button", { key: "b", className: c.kind === "preset" && live.lastPreset && c.label === `Recall ${live.lastPreset}` ? "on" : "", disabled: edit, onClick: () => live.set(c.key, true) }, item.button_label || c.label)];
+  else if (w === "meter") {
+    body = h(PageMeter, { label, lvl: live.meters[c.key], d: live.detail[c.key] || {} });
+  } else body = [h("div", { key: "l", className: "wl" }, h("span", null, label), h("span", { className: "wv" + (c.key === "voice.mic_live" && v ? " miclive" : ""), style: c.key === "voice.mic_live" && v ? { color: "#fff", background: "#c62828", padding: "2px 8px", borderRadius: 99 } : undefined }, c.key === "voice.mic_live" ? (v ? "MIC LIVE" : "mic off") : fmtVal(c, v)))];
+  const cfg = editing && c && h("div", { className: "cfg" },
+    "Label", h("input", { type: "text", value: item.label || "", placeholder: `${c.block_label || ""} ${c.label}`.trim(), onChange: (e) => onPatch({ label: e.target.value }) }),
+    "Widget", h("select", { value: w, onChange: (e) => onPatch({ widget: e.target.value }) }, (c.kind === "meter" ? ["meter"] : c.type === "bool" ? ["toggle"] : c.type === "select" ? ["select"] : c.type === "trigger" ? ["button"] : ["fader", "text"]).map((o) => h("option", { key: o, value: o }, o))),
+    "Size", h("select", { value: item.size || "half", onChange: (e) => onPatch({ size: e.target.value }) }, ["half", "full"].map((o) => h("option", { key: o, value: o }, o))),
+    w === "fader" && c.type !== "bool" ? ["Range", h("div", { key: "rg", style: { display: "flex", gap: 4 } }, h("input", { type: "number", value: item.min != null ? item.min : (c.min != null ? c.min : ""), onChange: (e) => onPatch({ min: e.target.value === "" ? null : Number(e.target.value) }) }), h("input", { type: "number", value: item.max != null ? item.max : (c.max != null ? c.max : ""), onChange: (e) => onPatch({ max: e.target.value === "" ? null : Number(e.target.value) }) }))] : null,
+    h("span"), h("button", { className: "btn danger", onClick: onRemove }, "Remove"));
+  return h("div", { className: `w k-${w} ${item.size === "full" ? "full" : ""} ${editing ? "editing" : ""} ${c ? "" : "missing"}`, ...(edit ? dragProps : {}) },
+    edit && h("span", { className: "gear", title: "Configure", onClick: onCfg }, "⚙"), body, cfg);
+}
+
+function Panels({ design, update, deployed, live, say }) {
+  const [edit, setEdit] = useState(false);
+  const [pageId, setPageId] = useState(localStorage.getItem("owl.page") || null);
+  const [editing, setEditing] = useState(null);
+  const [filter, setFilter] = useState("");
+  const [over, setOver] = useState(false);
+  const [savePreset, setSavePreset] = useState(null);
+  const panels = (design && design.panels) || [];
+  const page = panels.find((p) => p.id === pageId) || panels[0] || null;
+  useEffect(() => { if (page) localStorage.setItem("owl.page", page.id); }, [page && page.id]);
+  const listing = live.listing;
+  const controls = useMemo(() => { const m = {}; if (listing) { for (const c of listing.controls) m[c.key] = c; for (const c of listing.meters) m[c.key] = c; } return m; }, [listing]);
+  const saveT = useRef(null);
+  const setPanels = (fn) => update((d) => {
+    const np = typeof fn === "function" ? fn(d.panels || []) : fn;
+    if (deployed) { clearTimeout(saveT.current); saveT.current = setTimeout(() => api("PUT", "api/dsp/panels", { panels: np }).catch((e) => say("panels: " + e.message, true)), 600); }
+    return { ...d, panels: np };
+  });
+  const patchPage = (fn) => setPanels((ps) => ps.map((p) => (p.id === page.id ? fn(p) : p)));
+  const addPage = () => { const name = prompt("Page name (a room, a design)", "Living room"); if (!name) return; const id = newId("page", new Set(panels.map((p) => p.id))); setPanels((ps) => [...ps, { id, name, items: [] }]); setPageId(id); setEdit(true); };
+  const addMetersPage = () => {
+    const ms = (listing && listing.meters) || Object.values(controls).filter((c) => c.kind === "meter");
+    if (!ms.length) return say("This design has no meters to show", true);
+    const seen = new Set();
+    const items = ms.map((m) => { const id = newId("i", seen); seen.add(id); return { id, key: m.key, widget: "meter", size: "half" }; });
+    const id = newId("page", new Set(panels.map((p) => p.id)));
+    setPanels((ps) => [...ps, { id, name: "Signals", items }]); setPageId(id); setEdit(false);
+    say(`${items.length} meters on a new Signals page — drag to reorder, Edit page to rename`);
+  };
+  const addItem = (key, before) => { const c = controls[key]; if (!c || !page) return; patchPage((p) => { if (p.items.some((it) => it.key === key)) return p; const it = { id: newId("i", new Set(p.items.map((x) => x.id))), key, widget: widgetFor(c), size: ["fader", "meter"].includes(widgetFor(c)) ? "full" : "half" }; const items = [...p.items]; const idx = before ? items.findIndex((x) => x.id === before) : -1; if (idx >= 0) items.splice(idx, 0, it); else items.push(it); return { ...p, items }; }); };
+  const moveItem = (id, beforeId) => patchPage((p) => { const items = [...p.items]; const from = items.findIndex((x) => x.id === id); if (from < 0 || id === beforeId) return p; const [it] = items.splice(from, 1); const to = beforeId ? items.findIndex((x) => x.id === beforeId) : items.length; items.splice(to < 0 ? items.length : to, 0, it); return { ...p, items }; });
+  const onDrop = (e, beforeId) => { e.preventDefault(); e.stopPropagation(); setOver(false); const key = e.dataTransfer.getData("text/owl-control"); const id = e.dataTransfer.getData("text/owl-item"); if (key) addItem(key, beforeId); else if (id) moveItem(id, beforeId); };
+  const presets = (listing && listing.presets) || (design && design.presets) || [];
+  const recall = async (p) => { try { const r = await api("POST", "api/dsp/presets/recall", { preset: p.id }); say(`Preset "${p.name}" recalled${r.fade_s ? ` (${r.fade_s} s fade)` : ""}${r.skipped.length ? `; skipped ${r.skipped.join(", ")}` : ""}`); } catch (e) { say(e.message, true); } };
+  const delPreset = async (p) => { if (!confirm(`Delete preset "${p.name}"?`)) return; try { await api("DELETE", "api/dsp/presets/" + encodeURIComponent(p.id)); live.refresh(); } catch (e) { say(e.message, true); } };
+  const doSavePreset = async (f) => {
+    const keys = f.scope === "page" && page ? page.items.map((it) => it.key).filter((k) => controls[k] && controls[k].kind === "param") : Object.values(controls).filter((c) => c.kind === "param" && c.live).map((c) => c.key);
+    try { const r = await api("POST", "api/dsp/presets", { name: f.name, keys, fade_s: Number(f.fade) || 0, id: f.id || undefined }); say(`Preset "${r.name}" saved with ${Object.keys(r.values).length} controls`); setSavePreset(null); live.refresh(); } catch (e) { say(e.message, true); }
+  };
+  if (!design) return h("div", { className: "page" }, "loading…");
+  const groups = {};
+  if (listing) for (const c of [...listing.controls, ...listing.meters]) { if (filter && !(`${c.name} ${c.label} ${c.block_label || ""}`.toLowerCase().includes(filter.toLowerCase()))) continue; (groups[c.block_label || (c.kind === "preset" ? "Presets" : "Other")] = groups[c.block_label || (c.kind === "preset" ? "Presets" : "Other")] || []).push(c); }
+  return h("div", { className: "pan" },
+    h("div", { className: "pages" }, h("h3", null, "Pages"),
+      panels.map((p) => h("button", { key: p.id, className: `pagebtn ${page && p.id === page.id ? "on" : ""}`, onClick: () => setPageId(p.id) }, p.name || p.id)),
+      h("button", { className: "pagebtn", onClick: addPage, style: { color: "var(--accent)" } }, "＋ New page"),
+      h("button", { className: "pagebtn", onClick: addMetersPage, title: "New page with a meter for every signal in the deployed design", style: { color: "var(--accent)" } }, "＋ Signals page")),
+    h("div", { className: "body" },
+      !deployed && h("p", { className: "chip warn", style: { display: "inline-block", marginBottom: 10 } }, "Nothing is deployed: pages are saved in the draft and go live with Deploy"),
+      page ? [
+        h("div", { key: "h", className: "hdr" },
+          edit ? h("input", { type: "text", value: page.name || "", onChange: (e) => patchPage((p) => ({ ...p, name: e.target.value })), style: { fontSize: 18, fontWeight: 650, padding: 4, border: "1px solid var(--line)", borderRadius: 6, background: "var(--bg)", color: "var(--ink)", flex: 1 } }) : h("h2", null, page.name),
+          live.connected ? h("span", { className: "chip ok" }, "live") : h("span", { className: "chip bad" }, "no live link"),
+          edit && h("button", { className: "btn danger", onClick: () => { if (confirm(`Delete page "${page.name}"?`)) { setPanels((ps) => ps.filter((p) => p.id !== page.id)); setPageId(null); } } }, "Delete page"),
+          h("button", { className: `btn ${edit ? "primary" : ""}`, onClick: () => { setEdit(!edit); setEditing(null); } }, edit ? "Done" : "Edit page")),
+        (presets.length || edit) && h("div", { key: "p", className: "presets" },
+          presets.map((p) => h("button", { key: p.id, className: `pb ${live.lastPreset === p.name ? "on" : ""}`, onClick: () => (edit ? setSavePreset({ name: p.name, fade: p.fade_s || 0, scope: "page", id: p.id, update: true }) : recall(p)), title: edit ? "Update this preset from the live values" : `Recall (${Object.keys(p.values || {}).length} controls${p.fade_s ? `, ${p.fade_s} s fade` : ""})` },
+            p.name, p.fade_s ? h("small", null, `${p.fade_s} s`) : null, edit ? h("span", { className: "x", onClick: (e) => { e.stopPropagation(); delPreset(p); } }, "✕") : null)),
+          edit && deployed && h("button", { className: "pb", style: { color: "var(--accent)" }, onClick: () => setSavePreset({ name: "", fade: 1, scope: "page" }) }, "＋ Save preset…")),
+        (() => {
+          const ms = page.items.filter((it) => controls[it.key] && controls[it.key].kind === "meter");
+          if (!ms.length) return null;
+          const ds = ms.map((it) => live.detail[it.key] || {});
+          const nodata = ds.filter((d) => d.stale).length;
+          const hot = ds.filter((d) => !d.stale && ((d.peak_level != null && d.peak_level > -3) || d.clip > 0.0005)).length;
+          const silent = ds.filter((d) => !d.stale && d.level == null).length;
+          const ok = ds.length - nodata - hot - silent;
+          return h("div", { key: "st", className: "sigstrip" },
+            h("span", { className: "ss ok" }, `${ok} reporting`),
+            hot ? h("span", { className: "ss hot" }, `${hot} hot/clipping`) : null,
+            silent ? h("span", { className: "ss" }, `${silent} silent`) : null,
+            nodata ? h("span", { className: "ss bad", title: "Taps that delivered no levels in the last update — check the block is running and its output is connected" }, `${nodata} no data`) : null);
+        })(),
+        h("div", { key: "g", className: "pgrid", onDragOver: (e) => { if (edit) { e.preventDefault(); setOver(true); } }, onDragLeave: () => setOver(false), onDrop: (e) => edit && onDrop(e, null) },
+          page.items.map((it) => h(Widget, { key: it.id, item: it, c: controls[it.key], live, edit, editing: editing === it.id, onCfg: () => setEditing(editing === it.id ? null : it.id),
+            onPatch: (patch) => patchPage((p) => ({ ...p, items: p.items.map((x) => (x.id === it.id ? { ...x, ...patch } : x)) })),
+            onRemove: () => { patchPage((p) => ({ ...p, items: p.items.filter((x) => x.id !== it.id) })); setEditing(null); },
+            dragProps: { draggable: true, onDragStart: (e) => { e.dataTransfer.setData("text/owl-item", it.id); e.dataTransfer.effectAllowed = "move"; }, onDragOver: (e) => { e.preventDefault(); e.stopPropagation(); }, onDrop: (e) => onDrop(e, it.id) } })),
+          edit && h("div", { className: `drop ${over ? "over" : ""}` }, page.items.length ? "Drop a control here to add it (drag items to reorder)" : "Drag controls from the list, or tap ＋ next to one"),
+          !edit && !page.items.length && h("div", { className: "drop" }, "This page is empty. Press Edit page to add controls."))]
+        : h("div", { className: "drop", style: { maxWidth: 760 } }, "No pages yet. ＋ New page, then drag the controls of the deployed design onto it. A page is a phone remote for one room.")),
+    edit && h("div", { className: "ctls" }, h("h3", null, "Controls of the deployed design"),
+      !listing && h("p", { className: "help" }, deployed ? "waiting for the live link…" : "Deploy a design first: its controls appear here."),
+      h("div", { className: "ctl-list" }, h("input", { type: "search", placeholder: "filter", value: filter, onChange: (e) => setFilter(e.target.value) }),
+        Object.entries(groups).map(([g, cs]) => [h("div", { key: "g" + g, className: "cg" }, g), ...cs.map((c) => h("div", { key: c.key, className: "ci", draggable: true, onDragStart: (e) => { e.dataTransfer.setData("text/owl-control", c.key); e.dataTransfer.effectAllowed = "copy"; }, title: `${c.name}  (${c.key})` },
+          h("b", null, c.label), h("code", null, c.kind === "meter" ? "meter" : c.type + (c.live === false ? " · restart" : "")), page && h("button", { onClick: () => addItem(c.key) }, "＋")))]))),
+    savePreset && h("div", { className: "modal-bg", onClick: () => setSavePreset(null) }, h("div", { className: "modal", onClick: (e) => e.stopPropagation() },
+      h("h2", null, savePreset.update ? `Update preset "${savePreset.name}"` : "Save a preset"),
+      h("p", { className: "help" }, "A preset stores the live values of the chosen controls. Recall sets them back, fading gains over the fade time; it is also a control (presets.recall) and an HA select and button."),
+      !savePreset.update && [h("label", { key: "l" }, "Name"), h("input", { key: "i", type: "text", value: savePreset.name, onChange: (e) => setSavePreset({ ...savePreset, name: e.target.value }), autoFocus: true })],
+      h("label", null, "Fade (s) for numeric live controls"), h("input", { type: "number", min: 0, step: 0.5, value: savePreset.fade, onChange: (e) => setSavePreset({ ...savePreset, fade: e.target.value }) }),
+      h("label", null, "Which controls"), h("select", { value: savePreset.scope, onChange: (e) => setSavePreset({ ...savePreset, scope: e.target.value }) }, h("option", { value: "page" }, `the controls on this page (${page ? page.items.filter((it) => controls[it.key] && controls[it.key].kind === "param").length : 0})`), h("option", { value: "all" }, "every live control of the design")),
+      h("div", { className: "acts" }, h("button", { className: "btn", onClick: () => setSavePreset(null) }, "Cancel"), h("button", { className: "btn primary", disabled: !savePreset.name, onClick: () => doSavePreset(savePreset) }, savePreset.update ? "Update" : "Save")))));
+}
+
+ReactDOM.createRoot(document.getElementById("app")).render(h(ReactFlowProvider, null, h(App)));

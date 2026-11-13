@@ -1,0 +1,5 @@
+.git
+docs
+**/__pycache__
+**/.ruff_cache
+owl-node/tests

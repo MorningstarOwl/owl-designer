@@ -324,6 +324,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._static("routing.html")
         if p.startswith("/vendor/"):
             return self._static(p[1:], cache=True)
+        if p in ("/designer.js", "/designer.css"):          # the designer page's code and styles (not cached: they change)
+            return self._static(p[1:])
         if p.startswith("/api/dsp/"):
             return self._proxy("GET")
         if p == "/api/graph":

@@ -5,8 +5,8 @@ DSP compiler/deployer, the APIs, the Wyoming voice satellite, video, the install
 Findings come from reading the code; nothing was built or run (the repository has no tests to run).
 
 Status: **section 1 (security) is deferred**; **section 2 (bugs) is fixed in 0.7.3**; **section 3 items 1-2 are done in
-0.8.0, items 4 and 7 in 0.9.0; items 3, 5 and 6 are designed below, not built**; **section 4 is done in 0.10.0** (see
-the notes under each item).
+0.8.0, items 4 and 7 in 0.9.0; items 3, 5 and 6 are designed below, not built**; **section 4 is done in 0.10.0**; **section 5 is done
+(items 1-5) or deliberately deferred (item 6)** (see the notes under each item).
 
 ## 1. Security (deferred)
 
@@ -138,15 +138,36 @@ the notes under each item).
 
 1. No tests. The compiler, SDP parser, IS-05 state machine and block templates are pure and easy to unit-test; run
    AMWA nmos-testing in CI.
+   *Done:* 85 tests in `owl-node/tests/` (unit, HTTP handlers, and live ones against a private PipeWire + WirePlumber
+   started by `tests/with-pipewire.sh`), a hygiene check that caught a real bug (six Thread subclasses shadowed
+   `Thread._stop`, crashing on Python <= 3.12), and `tests/nmos-conformance.sh`: IS-04-01 (50 pass), IS-05-01 (62)
+   and IS-05-02 (56), no failures, with `amwa/nmos-testing`. `ruff` for bugs and dead code only.
 2. CI builds only the add-on; nothing builds, lints or publishes the `owl-node` image (prebuilt multi-arch GHCR images
    would remove the 20-40 min Pi build).
+   *Done:* `.github/workflows/owl-node.yml`: versions agree, lint, tests with live PipeWire, NMOS conformance, the
+   image on native amd64 + arm64 runners (pull requests: amd64 build only), published as `:main` / `:sha-*` from
+   `main` and `:X.Y.Z` / `:latest` from tags `vX.Y.Z`. `install.sh` pulls the released image (`--build` to build).
 3. The add-on is duplicated (`owl_designer/` and `owl-node/ha-addon/owl_designer/`) plus a committed
    `owlnode.tar.gz`; CI only rebuilds on `owl_designer/**`, so a controller change alone ships nothing. With a
    prebuilt image, CI can build from source directly.
+   *Done:* `owl_designer/Dockerfile` builds from the repository root, copying the controller and pages from
+   `owl-node/`; the duplicate folder, `build-repo.sh` and the archive are gone; the add-on workflow also rebuilds on
+   controller/page changes. `.github/scripts/check-versions.py` keeps the one version in step.
 4. `owl-node/README.md` links files that are not in the repo (`scripts/checks/*`, `docs/owl-designer-portable-plan.md`,
    `dsp/designs/`, `upgrade-hub.sh`, `upgrade-satellite.sh`) and mixes user docs with a lab notebook; same for the long
    dated comments in `voice.py`.
+   *Done:* split into `docs/architecture.md` (reference, broken links removed, new modules listed),
+   `docs/lab-notes.md` (the "things that bit", with a key to the house's machine names) and a short developer
+   `owl-node/README.md`; `voice.py`'s comments keep the reasons, not the dates.
 5. Commit messages are all "owl-designer 0.7.x"; add an engine CHANGELOG, CONTRIBUTING and issue templates.
+   *Done:* `owl-node/CHANGELOG.md`, `CONTRIBUTING.md` (tests, measurements, the release process), bug/feature issue
+   forms, a PR template, private security reports. Commits on this branch describe what and why.
 6. ~10 hand-rolled `BaseHTTPRequestHandler` routers and a custom WebSocket; a 118 KB single-file `designer.html`. A
    small framework (aiohttp/Starlette) would centralise validation, auth and WebSockets; a UI build step would let the
    designer be split up.
+   *Partly done:* the designer page is now `designer.html` (structure), `designer.css` and `designer.js`, still with
+   no build step. *Deferred on purpose:* moving the servers to aiohttp/Starlette rewrites every endpoint and the
+   threading model at once, adds dependencies to an image that has none beyond Debian packages, and buys little until
+   the security work (section 1: a token, Origin checks) needs a middleware layer; do them together then. Likewise a UI
+   build step (bundler, components in modules) is worth it when the designer is next reworked, not as a move on its
+   own: the page works, is tested headless, and has no toolchain to maintain.
