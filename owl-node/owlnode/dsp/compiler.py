@@ -147,6 +147,9 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True, p
                 d.errors.append(f"block {bid}: no satellite dsp role on {host!r} (it is down, or owl-node there predates D3)")
                 continue
             absent.append(f"satellite {host} has no dsp role now")
+        if bt.raw.get("hub_only") and host != hub:
+            d.errors.append(f"block {bid}: a {bt.label} runs on the hub only (its output can be wired to any room)")
+            continue
         ctx = bt.ctx(bid, b.get("label"), b.get("params"))
         nm = bt.node_map(ctx)
         if bt.engine == "voice":

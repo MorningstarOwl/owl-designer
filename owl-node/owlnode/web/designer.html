@@ -124,6 +124,8 @@ body { background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -appl
 .probe-panel .lv { height: 8px; flex: 1; background: var(--hover); border-radius: 4px; overflow: hidden; }
 .probe-panel .lv i { display: block; height: 100%; background: linear-gradient(90deg, #2e7d32, #43a047 60%, #f9a825 82%, #e53935 95%); transition: width .08s linear; }
 .probe-panel .err { color: var(--bad); margin-top: 4px; }
+.probe-panel select, .probe-panel input[type=number] { font: inherit; padding: 2px 4px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
+.probe-panel .warnline { color: var(--warn); font-size: 11px; margin-top: 6px; }
 .impact { border-radius: 8px; padding: 10px 12px; margin: 8px 0; font-size: 13px; }
 .impact.bad { background: var(--bad-bg); color: var(--bad); } .impact.warn { background: var(--warn-bg); color: var(--warn); }
 .impact b { font-weight: 650; } .impact ul { margin: 4px 0 0; }
@@ -340,6 +342,54 @@ function ProbePanel({ probe, player, onStop }) {
       h("div", { key: "h", className: "pn", style: { marginTop: 6, marginBottom: 0 } }, "Drag 🎧 onto another port to move it. Plays on this computer only; keep it quiet near the living-room mic.")] : null);
 }
 
+// ------------------------------------------------------------------ the injector
+// A test signal played INTO an input (inject.py on the dsp role): white/pink noise or a sine at an RMS level, for a
+// limited time. Nothing plays until Start; it keeps playing if this page closes and stops by itself at the end.
+function InjectPanel({ inject: inj, setInject, raised, say }) {
+  const set = (k, v) => setInject((s) => ({ ...s, [k]: v }));
+  const lvlTimer = useRef(null);
+  useEffect(() => {                      // follow it while it plays (time left; ended by its timer or elsewhere)
+    if (inj.state !== "playing") return;
+    const t = setInterval(() => api("GET", "api/dsp/inject").then((r) => {
+      const me = (r.injections || []).find((x) => x.id === inj.id);
+      setInject((s) => s && s.id === inj.id ? (me ? { ...s, remaining_s: me.remaining_s } : { ...s, state: "ended" }) : s);
+    }, () => {}), 1000);
+    return () => clearInterval(t);
+  }, [inj.state, inj.id]);
+  const start = () => api("POST", "api/dsp/inject", { block: inj.block, port: inj.port, kind: inj.kind, level_db: Number(inj.level_db), freq_hz: Number(inj.freq_hz), duration_s: Number(inj.duration_s) })
+    .then((r) => setInject((s) => ({ ...s, state: "playing", id: r.id, remaining_s: r.remaining_s, host: r.host, error: null })),
+          (e) => setInject((s) => ({ ...s, state: "error", error: e.message })));
+  const stop = () => (inj.id ? api("DELETE", `api/dsp/inject/${encodeURIComponent(inj.id)}`).catch(() => {}) : Promise.resolve()).then(() => set("state", "ended"));
+  const level = (v) => {
+    set("level_db", v);
+    if (inj.state !== "playing") return;
+    clearTimeout(lvlTimer.current);
+    lvlTimer.current = setTimeout(() => api("POST", `api/dsp/inject/${encodeURIComponent(inj.id)}`, { level_db: Number(v) }).catch((e) => say(e.message, true)), 120);
+  };
+  const playing = inj.state === "playing";
+  return h("div", { className: "probe-panel", style: raised ? { bottom: 210 } : null },
+    h("div", { className: "ph" }, h("span", null, "🔊"), h("b", { title: inj.label }, inj.label || "Inject"),
+      playing ? h("button", { className: "btn danger", onClick: stop }, "Stop") : h("button", { className: "btn", onClick: () => setInject(null) }, "Close")),
+    h("div", { className: "pr" }, h("span", null, "signal"),
+      h("select", { value: inj.kind, disabled: playing, onChange: (e) => set("kind", e.target.value) },
+        h("option", { value: "pink" }, "pink noise"), h("option", { value: "white" }, "white noise"), h("option", { value: "sine" }, "sine")),
+      inj.kind === "sine" ? h("input", { type: "number", min: 20, max: 20000, step: 1, value: inj.freq_hz, disabled: playing, style: { width: 70 }, onChange: (e) => set("freq_hz", e.target.value) }) : null,
+      inj.kind === "sine" ? h("span", null, "Hz") : null),
+    h("div", { className: "pr" }, h("span", null, "level"),
+      h("input", { type: "range", min: -60, max: -3, step: 1, value: inj.level_db, onChange: (e) => level(e.target.value) }),
+      h("span", { style: { width: 64, textAlign: "right", fontVariantNumeric: "tabular-nums" } }, `${inj.level_db} dBFS`)),
+    h("div", { className: "pr" }, h("span", null, "for"),
+      h("select", { value: inj.duration_s, disabled: playing, onChange: (e) => set("duration_s", Number(e.target.value)) },
+        [10, 30, 60, 120, 300, 600].map((d) => h("option", { key: d, value: d }, d < 60 ? `${d} s` : `${d / 60} min`))),
+      playing ? h("span", { className: "pn", style: { margin: 0 } }, `${inj.remaining_s ?? ""} s left${inj.host ? ` · on ${inj.host}` : ""}`) : null),
+    !playing && inj.state !== "error" ? h("button", { className: "btn primary", style: { marginTop: 8, width: "100%" }, onClick: start },
+      inj.state === "ended" ? "Play again" : "Start") : null,
+    inj.state === "error" ? [h("div", { key: "e", className: "err" }, inj.error),
+      h("button", { key: "b", className: "btn", style: { marginTop: 6 }, onClick: () => set("state", "setup") }, "Back")] : null,
+    inj.state === "ended" ? h("div", { className: "pn" }, "ended") : null,
+    h("div", { className: "warnline" }, "Added to whatever plays into this input, and heard wherever it goes from there: start low."));
+}
+
 // ------------------------------------------------------------------ nodes
 function Meter({ stats, ch }) {
   if (!stats) return null;
@@ -473,7 +523,11 @@ function App() {
   const [showHidden, setShowHidden] = useState(false);
   const [focusHost, setFocusHost] = useState(null);     // a node just added: frame its devices too
   const [probe, setProbe] = useState(null);             // {block, port, state, label, note, error}
-  const [dragProbe, setDragProbe] = useState(null);     // {x, y, target, label} while the 🎧 is being dragged
+  const [dragProbe, setDragProbe] = useState(null);     // {x, y, target, label, tool} while 🎧 or 🔊 is being dragged
+  const [inject, setInject] = useState(null);           // {block, port, label, state: setup|playing|ended|error, id, ...}
+  const [sounds, setSounds] = useState([]);             // the sound library (sounds.py)
+  const loadSounds = () => api("GET", "api/dsp/sounds").then((r) => setSounds(r.sounds || []), () => {});
+  useEffect(() => { loadSounds(); }, []);
   const playerRef = useRef(null);
   if (!playerRef.current) playerRef.current = new ProbePlayer(setProbe);
   useEffect(() => () => playerRef.current.stop(true), []);
@@ -816,30 +870,59 @@ function App() {
     const ps = portsFor(b), p = [...ps.outputs, ...ps.inputs].find((q) => q.id === t.port);
     return `${b.label || (types[b.type] || {}).label || b.id} · ${p ? p.label : t.port}`;
   };
+  // the injector plays INTO an input: an input port, a block (its first input) or a wire (its destination)
+  const injectTarget = (x, y) => {
+    const el = document.elementFromPoint(x, y);
+    if (!el) return null;
+    const nodeEl = el.closest(".react-flow__node");
+    if (nodeEl) {
+      const bid = nodeEl.getAttribute("data-id"), b = blocks.find((q) => q.id === bid);
+      if (!b) return null;
+      const portEl = el.closest(".port");
+      if (portEl) return portEl.classList.contains("in") ? { block: bid, port: portEl.getAttribute("data-port") } : null;
+      const ins = portsFor(b).inputs;
+      return ins.length ? { block: bid, port: ins[0].id } : null;
+    }
+    const edgeEl = el.closest(".react-flow__edge");
+    if (edgeEl) {
+      const id = (edgeEl.getAttribute("data-testid") || "").replace(/^rf__edge-/, "");
+      const w = (design.wires || []).find((q) => q.id === id);
+      if (w) { const [b, p] = w.to.split("|"); return { block: b, port: p }; }
+    }
+    return null;
+  };
   const probeTargetRef = useRef(null); probeTargetRef.current = probeTarget;
+  const injectTargetRef = useRef(null); injectTargetRef.current = injectTarget;
   const probeLabelRef = useRef(null); probeLabelRef.current = probeLabel;
   // pointer drag (mouse, pen and touch alike; HTML5 drag-and-drop has no touch support and no feedback)
-  const onProbeDown = (e) => {
+  const onProbeDown = (e) => onToolDown(e, "probe");
+  const onInjectDown = (e) => onToolDown(e, "inject");
+  const onToolDown = (e, tool) => {
     if (e.button != null && e.button !== 0) return;
     e.preventDefault();
-    playerRef.current.warm();
+    if (tool === "probe") playerRef.current.warm();
+    const targetOf = (x, y) => (tool === "probe" ? probeTargetRef : injectTargetRef).current(x, y);
     let hover = null;
     const mark = (t) => {
       if (hover) hover.classList.remove("probe-hover");
       hover = null;
       if (t) { const el = document.querySelector(`.react-flow__node[data-id="${CSS.escape(t.block)}"] .port[data-port="${CSS.escape(t.port)}"]`); if (el) { el.classList.add("probe-hover"); hover = el; } }
     };
-    const move = (ev) => { const t = probeTargetRef.current(ev.clientX, ev.clientY); mark(t); setDragProbe({ x: ev.clientX, y: ev.clientY, target: t, label: probeLabelRef.current(t) }); };
+    const move = (ev) => { const t = targetOf(ev.clientX, ev.clientY); mark(t); setDragProbe({ x: ev.clientX, y: ev.clientY, target: t, label: probeLabelRef.current(t), tool }); };
     const up = (ev) => {
       window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", cancel);
       mark(null); setDragProbe(null);
-      const t = probeTargetRef.current(ev.clientX, ev.clientY);
-      if (t) startProbe(t.block, t.port);
-      else if (Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 6) say("Drag 🎧 onto a port, a block or a wire to hear it here (or select one and press Listen)");
+      const t = targetOf(ev.clientX, ev.clientY);
+      if (t && tool === "probe") startProbe(t.block, t.port);
+      else if (t) setInject((cur) => (cur && cur.state === "playing") ? (say("The injector is playing: stop it first"), cur)
+        : { block: t.block, port: t.port, label: probeLabelRef.current(t), state: "setup", kind: (cur && cur.kind) || "pink",
+            level_db: (cur && cur.level_db) ?? -30, freq_hz: (cur && cur.freq_hz) || 1000, duration_s: (cur && cur.duration_s) || 30 });
+      else if (Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 6) say(tool === "probe" ? "Drag 🎧 onto a port, a block or a wire to hear it here (or select one and press Listen)"
+        : "Drag 🔊 onto an input (left side of a block), a block or a wire to play a test signal into it");
     };
     const cancel = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", cancel); mark(null); setDragProbe(null); };
     window.addEventListener("pointermove", move); window.addEventListener("pointerup", up); window.addEventListener("pointercancel", cancel);
-    setDragProbe({ x: e.clientX, y: e.clientY, target: null, label: null });
+    setDragProbe({ x: e.clientX, y: e.clientY, target: null, label: null, tool });
   };
   const setDevice = (bid, k, v) => update((d) => { const devs = { ...(d.devices || {}) }; const o = { ...(devs[bid] || {}), [k]: v }; if (!o.label) delete o.label; if (!o.hidden) delete o.hidden; if (Object.keys(o).length) devs[bid] = o; else delete devs[bid]; return { ...d, devices: devs }; });
 
@@ -877,6 +960,8 @@ function App() {
       err ? h("span", { className: "chip bad" }, err) : (inv.error ? h("span", { className: "chip warn" }, inv.error) : null),
       (mode === "design" || mode === "run") && h("span", { className: `btn probe-tool ${probe && probe.state === "playing" ? "primary" : ""}`, title: "Drag onto any port, block or wire to hear it on this computer",
         onPointerDown: onProbeDown }, "🎧 Probe"),
+      (mode === "design" || mode === "run") && h("span", { className: `btn probe-tool ${inject && inject.state === "playing" ? "primary" : ""}`, title: "Drag onto an input, a block or a wire to play a test signal (noise, tone) into it",
+        onPointerDown: onInjectDown }, "🔊 Inject"),
       (mode === "design" || mode === "run") && h("button", { className: "btn sheet-tab", onClick: () => setSheet(sheet === "palette" ? null : "palette") }, "＋ Block"),
       (mode === "design" || mode === "run") && h("button", { className: "btn", disabled: busy, onClick: () => { if (!changes.length || confirm(`Discard ${changes.length} undeployed change(s) and show the running design?\n\n${changes.join("\n")}`)) resetToDeployed(); }, title: "Discard the draft, show what is running" }, "Reset"),
       (mode === "design" || mode === "run") && h("button", { className: "btn", disabled: busy || !(status && status.has_prev), onClick: doRollback }, "Rollback"),
@@ -896,6 +981,7 @@ function App() {
           h("label", { className: "btn", style: { cursor: run ? "default" : "pointer", opacity: run ? 0.5 : 1 }, title: "Open a design file on the canvas" }, "Import…",
             h("input", { type: "file", accept: ".json,application/json", disabled: run, style: { display: "none" }, onChange: (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) importDesign(f); } }))),
         h(HistoryPanel, { onOpen: openFromHistory, disabled: run, deployedAt: deployedAtRef.current }),
+        h(SoundsPanel, { sounds, reload: loadSounds, say }),
         h("h3", null, "Nodes"),
         h(NodesPanel, { hub: inv.hub, onChange: (host) => { setFocusHost(host); setTimeout(() => setFlowKey((k) => k + 1), 3500); } }),
         h("h3", null, "Blocks"),
@@ -912,7 +998,7 @@ function App() {
                   onPaneClick: () => { setSel(null); setSheet(null); }, proOptions: { hideAttribution: true }, connectionRadius: 24 },
           h(Background, { gap: 24, size: 1 }), h(Controls, { showInteractive: false }))),
       (mode === "design" || mode === "run") && (selBlock || selWire) && h("div", { className: "side right" },
-        selBlock && selBlock.kind === "proc" && h(Inspector, { b: selBlock, t: types[selBlock.type], run, deployed: !!deployedName, voice: status && status.voice, setParam, setLabel, setHost, hub: inv.hub, sats: Object.values(inv.satellites || {}), liveSet, proc: status && status.procs && status.procs[selBlock.id],
+        selBlock && selBlock.kind === "proc" && h(Inspector, { b: selBlock, t: types[selBlock.type], run, deployed: !!deployedName, voice: status && status.voice, sounds, say, setParam, setLabel, setHost, hub: inv.hub, sats: Object.values(inv.satellites || {}), liveSet, proc: status && status.procs && status.procs[selBlock.id],
           remove: () => { update((d) => ({ ...d, blocks: d.blocks.filter((b) => b.id !== selBlock.id), wires: d.wires.filter((w) => !w.from.startsWith(selBlock.id + "|") && !w.to.startsWith(selBlock.id + "|")) })); setSel(null); } }),
         selBlock && h(ListenRow, { b: selBlock, ports: portsFor(selBlock), probe, startProbe }),
         selBlock && selBlock.kind === "device" && h(DeviceInfo, { b: selBlock, hub: inv.hub, run, setDevice, override: (design.devices || {})[selBlock.id] || {} }),
@@ -925,10 +1011,12 @@ function App() {
         sel && sel.kind === "edge" && !selWire && h("div", { className: "insp" }, h("h3", null, "Existing link"), h("p", { className: "help" }, "Made by WirePlumber or an app, not by a design. The designer never removes it."))),
       mode === "panels" && h(Panels, { design, update, deployed: !!deployedName, live, say }),
       mode === "routing" && h("div", { className: "page", style: { padding: 0 } }, h("iframe", { src: "routing", title: "Routing" })),
-      probe && h(ProbePanel, { probe, player: playerRef.current, onStop: () => playerRef.current.stop() })),
+      probe && h(ProbePanel, { probe, player: playerRef.current, onStop: () => playerRef.current.stop() }),
+      inject && h(InjectPanel, { inject, setInject, raised: !!probe, say })),
     plan && h(PlanModal, { plan, designChanges: changes, onClose: () => setPlan(null), onApply: () => doDeploy(plan.allowMissing), busy }),
     toast && h("div", { className: `toast ${toast.err ? "err" : ""}` }, toast.msg),
-    dragProbe && h("div", { className: `probe-ghost ${dragProbe.target ? "" : "none"}`, style: { left: dragProbe.x, top: dragProbe.y } }, "🎧 " + (dragProbe.label || "drop on a port")));
+    dragProbe && h("div", { className: `probe-ghost ${dragProbe.target ? "" : "none"}`, style: { left: dragProbe.x, top: dragProbe.y } },
+      dragProbe.tool === "inject" ? "🔊 " + (dragProbe.label || "drop on an input") : "🎧 " + (dragProbe.label || "drop on a port")));
 }
 
 // the engine (dsp role) does not answer: say what to fix, for the hub install and for the Home Assistant add-on (F1)
@@ -995,7 +1083,8 @@ function ListenRow({ b, ports, probe, startProbe }) {
     })));
 }
 
-const HUB_ONLY = new Set(["voice", "rtsp"]);      // block engines that cannot run on a satellite
+const HUB_ONLY_ENGINES = new Set(["voice", "rtsp"]);      // block engines that cannot run on a satellite
+const HUB_ONLY = { has: (engine, t) => HUB_ONLY_ENGINES.has(engine) || !!(t && t.hub_only) };
 
 function TextParam({ value, secret, onChange }) {
   const [show, setShow] = useState(false);
@@ -1050,21 +1139,25 @@ function VoiceInfo({ b, voice: v }) {
     h("p", { className: "help" }, "The wake word and the pipeline are chosen in Home Assistant (Settings → Voice assistants). Push to talk and the wake-word switch are on the Panels page and in HA."));
 }
 
-function Inspector({ b, t, run, deployed, setParam, setLabel, setHost, hub, sats, liveSet, remove, proc, voice }) {
+function Inspector({ b, t, run, deployed, setParam, setLabel, setHost, hub, sats, liveSet, remove, proc, voice, sounds, say }) {
+  const trigger = (action) => api("POST", "api/dsp/controls/set", { key: `${b.id}.${action}` }).catch((e) => say && say(e.message, true));
   return h("div", { className: "insp" },
     h("h3", null, `${t.label} · ${b.id}`),
     h("p", { className: "help" }, t.description),
     h("label", null, "Label"), h("input", { type: "text", value: b.label || "", onChange: (e) => setLabel(b.id, e.target.value) }),
-    !HUB_ONLY.has(t.engine) && h("label", null, "Runs on"), !HUB_ONLY.has(t.engine) && h("select", { value: b.host || hub || "", disabled: run, onChange: (e) => setHost(b.id, e.target.value) },
+    !HUB_ONLY.has(t.engine, t) && h("label", null, "Runs on"), !HUB_ONLY.has(t.engine, t) && h("select", { value: b.host || hub || "", disabled: run, onChange: (e) => setHost(b.id, e.target.value) },
       h("option", { value: hub || "" }, `${hub || "hub"} (hub)`),
       (sats || []).filter((s_) => s_.host !== hub).map((s_) => h("option", { key: s_.host, value: s_.host }, `${s_.host} (satellite${s_.ok ? "" : ", unreachable"})`)),
       b.host && b.host !== hub && !(sats || []).some((s_) => s_.host === b.host) ? h("option", { value: b.host }, `${b.host} (no dsp role seen)`) : null),
-    !HUB_ONLY.has(t.engine) && h("p", { className: "help" }, "The hub compiles the block and pushes it to that satellite's dsp role; wires across hosts get AES67 transport automatically."),
+    !HUB_ONLY.has(t.engine, t) && h("p", { className: "help" }, "The hub compiles the block and pushes it to that satellite's dsp role; wires across hosts get AES67 transport automatically."),
     Object.entries(t.params || {}).map(([k, s]) => {
       const v = (b.params || {})[k] ?? s.default;
       const set = (nv) => (s.live && deployed && run ? liveSet(b.id, k, nv) : setParam(b.id, k, nv));
       let ctl;
       if (s.type === "text") ctl = [h("label", { key: "l" }, s.label || k), h(TextParam, { key: "t", value: v || "", secret: !!s.secret, onChange: set })];
+      else if (s.type === "sound") ctl = [h("label", { key: "l" }, s.label || k, s.live ? " " : null, s.live ? h("span", { className: "badge b-ok" }, "live") : null),
+        h("select", { key: "s", value: v || "", onChange: (e) => set(e.target.value) }, h("option", { value: "" }, (sounds || []).length ? "— choose a sound —" : "— the library is empty —"),
+          (sounds || []).map((x) => h("option", { key: x.name, value: x.name }, x.name)), v && !(sounds || []).some((x) => x.name === v) ? h("option", { value: v }, `${v} (not in the library)`) : null)];
       else if (s.type === "bool") ctl = h("label", { className: "row", style: { margin: 0 } }, h("input", { type: "checkbox", checked: !!v, onChange: (e) => set(e.target.checked) }), s.label || k, s.live ? h("span", { className: "badge b-ok" }, "live") : null);
       else if (s.type === "select") ctl = [h("label", { key: "l" }, s.label || k, s.live ? " " : null, s.live ? h("span", { className: "badge b-ok" }, "live") : null), h("select", { key: "s", value: String(v), onChange: (e) => set(e.target.value) }, (s.options || []).map((o) => h("option", { key: o, value: String(o) }, String(o))))];
       else ctl = [h("label", { key: "l" }, s.label || k, s.live ? " " : null, s.live ? h("span", { className: "badge b-ok" }, "live") : null),
@@ -1073,6 +1166,10 @@ function Inspector({ b, t, run, deployed, setParam, setLabel, setHost, hub, sats
           h("input", { type: "number", min: s.min, max: s.max, step: s.step || 1, value: v, onChange: (e) => set(Number(e.target.value)) }))];
       return h("div", { key: k }, ctl, s.help ? h("div", { className: "help" }, s.help) : null);
     }),
+    (t.triggers || []).length ? h("div", { className: "row", style: { display: "flex", gap: 6, marginTop: 8 } },
+      t.triggers.map((tr) => h("button", { key: tr.id, className: `btn ${tr.id === "play" ? "primary" : ""}`, disabled: !deployed, onClick: () => trigger(tr.id),
+        title: deployed ? `${b.id}.${tr.id}` : "Deploy first" }, tr.id === "play" ? `▶ ${tr.label}` : tr.id === "stop" ? `■ ${tr.label}` : tr.label))) : null,
+    (t.triggers || []).length ? h("p", { className: "help" }, `Also Panels buttons, Home Assistant buttons and the API: ${t.triggers.map((tr) => `${b.id}.${tr.id}`).join(", ")}.`) : null,
     t.engine !== "voice" && h("h3", null, "Control names"),
     t.engine !== "voice" && h("p", { className: "names" }, "Named controls (API, Panels, HA): ", Object.keys(t.params || {}).filter((k) => !(t.params[k].secret || t.params[k].type === "text")).map((k, i) => h(React.Fragment, { key: k }, i ? ", " : "", h("code", null, `${slug(b.label || t.label)}.${k}`))), t.engine === "meter" ? [", ", h("code", { key: "m" }, `${slug(b.label || t.label)}.level`)] : (t.outputs || []).filter((p) => (p.media || "audio") === "audio").map((p) => [", ", h("code", { key: p.id }, `${slug(b.label || t.label)}.${p.id}.level`)]), ". Stable key: ", h("code", null, b.id + ".<param>"), " (what panels, presets and HA use, so renaming the block is safe)."),
     t.engine === "voice" && h(VoiceInfo, { b, voice }),
@@ -1096,6 +1193,41 @@ function DeviceInfo({ b, hub, run, setDevice, override }) {
     h("ul", null, b.inputs.map((p) => h("li", { key: p.id }, `in · ${p.label} (${p.media}${p.channels ? `, ${p.channels} ch` : ""}${p.media_types ? ", " + p.media_types.join("/") : ""})`)),
       b.outputs.map((p) => h("li", { key: p.id }, `out · ${p.label} (${p.media}${p.channels ? `, ${p.channels} ch` : ""}${p.media_type ? ", " + p.media_type : ""})`))),
     b.live === false ? h("p", { className: "chip bad" }, "not present now") : null);
+}
+
+function SoundsPanel({ sounds, reload, say }) {
+  const [busy, setBusy] = useState(false);
+  const audio = useRef(null);
+  const upload = async (files) => {
+    setBusy(true);
+    for (const f of files) {
+      try {
+        const r = await fetch(`api/dsp/sounds?name=${encodeURIComponent(f.name)}`, { method: "POST", body: f, headers: { "Content-Type": f.type || "application/octet-stream" } });
+        const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+        if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+        say(`Added ${j.name}`);
+      } catch (e) { say(`${f.name}: ${e.message}`, true); }
+    }
+    setBusy(false); reload();
+  };
+  const del = (name) => { if (confirm(`Delete ${name} from the library? Sound players that use it go quiet.`)) api("DELETE", `api/dsp/sounds/${encodeURIComponent(name)}`).then(reload, (e) => say(e.message, true)); };
+  const preview = (name) => {
+    if (audio.current) audio.current.pause();
+    audio.current = new Audio(`api/dsp/sounds/${encodeURIComponent(name)}/file`);
+    audio.current.play().catch((e) => say(`This browser cannot play ${name} (${e.message}); the hub can still play it`, true));
+  };
+  const size = (n) => n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} kB`;
+  return h("details", { className: "insp", style: { marginTop: 6, fontSize: 12 } },
+    h("summary", { style: { cursor: "pointer" } }, `Sounds (${sounds.length})`),
+    h("p", { className: "help", style: { fontSize: 11, color: "var(--muted)", margin: "4px 0" } }, "Doorbells, chimes, alarms: a Sound player block plays one when triggered. WAV, FLAC, Ogg, MP3 up to 25 MB."),
+    h("ul", { style: { listStyle: "none", padding: 0, margin: "4px 0" } }, sounds.map((x) => h("li", { key: x.name, style: { display: "flex", gap: 4, alignItems: "center", padding: "2px 0" } },
+      h("span", { style: { flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: x.name }, x.name),
+      h("span", { style: { color: "var(--muted)" } }, x.duration_s != null ? `${x.duration_s.toFixed(1)} s` : size(x.size)),
+      h("button", { className: "btn", style: { padding: "1px 6px" }, title: "Listen here", onClick: () => preview(x.name) }, "▶"),
+      h("button", { className: "btn", style: { padding: "1px 6px" }, title: "Delete", onClick: () => del(x.name) }, "✕")))),
+    h("label", { className: "btn", style: { cursor: busy ? "default" : "pointer", display: "inline-block" } }, busy ? "Uploading…" : "Upload…",
+      h("input", { type: "file", multiple: true, accept: "audio/*,.wav,.flac,.ogg,.oga,.opus,.mp3", disabled: busy, style: { display: "none" },
+        onChange: (e) => { const fs = [...e.target.files]; e.target.value = ""; if (fs.length) upload(fs); } })));
 }
 
 function HistoryPanel({ onOpen, disabled, deployedAt }) {

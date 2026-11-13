@@ -65,6 +65,8 @@ class Controls:
         self.voice = None                  # D3: the PTT voice satellite (voice.py), set by the server in hub mode
         self._design_sig = None
         self.health = None                 # health.Health, set by the server (hub mode)
+        self.sounds = None                 # sounds.Library and sounds.Player, set by the server (hub mode)
+        self.player = None
         self._cache = None
         dep.on_change = self._on_deployer_change
 
@@ -86,7 +88,7 @@ class Controls:
             d = self.dep.design or {}
             # the shape of the controls (values are read live, _live): a live change replaces the design object, which
             # must not rebuild the listing and bump the version at every fader step
-            sig = (len(d.get("blocks", [])), tuple(sorted(f"{b['id']}:{b.get('label')}:{b.get('type')}" for b in d.get("blocks", []))),
+            sig = (tuple(self.sounds.names()) if self.sounds else (), len(d.get("blocks", [])), tuple(sorted(f"{b['id']}:{b.get('label')}:{b.get('type')}" for b in d.get("blocks", []))),
                    len(d.get("presets") or []), tuple(p.get("name") for p in d.get("presets") or []))
             if not force and self._cache is not None and sig == self._design_sig:
                 return self._cache
@@ -111,11 +113,19 @@ class Controls:
                     c = {"key": key, "name": f"{base}.{pid}", "block": b["id"], "block_label": lbl, "block_type": bt.type,
                          "param": pid, "label": spec.get("label") or pid, "type": spec.get("type", "number"),
                          "live": bool(spec.get("live")), "value": params.get(pid), "kind": "param"}
+                    if c["type"] == "sound":             # which library sound: a select of the library (HA select too)
+                        c["type"], c["options"] = "select", self.sounds.names() if self.sounds else []
                     for k in ("min", "max", "step", "unit", "options", "help"):
                         if k in spec:
                             c[k] = spec[k]
                     if c["type"] == "number" and "unit" not in c and pid.endswith("_db"):
                         c["unit"] = "dB"
+                    by_key[key] = c
+                    by_name[c["name"]] = c
+                for t in bt.raw.get("triggers") or []:   # a Sound player's Play / Stop: buttons
+                    key = f"{b['id']}.{t['id']}"
+                    c = {"key": key, "name": f"{base}.{t['id']}", "block": b["id"], "block_label": lbl, "block_type": bt.type,
+                         "label": t.get("label") or t["id"], "type": "trigger", "live": True, "kind": "trigger", "action": t["id"]}
                     by_key[key] = c
                     by_name[c["name"]] = c
                 ports = bt.ports(params)
@@ -248,6 +258,14 @@ class Controls:
             return self.recall(value, source=source)
         if c["kind"] == "meter":
             raise DeployError(f"{c['name']} is a meter (read-only)")
+        if c["kind"] == "trigger":
+            if not self.player:
+                raise DeployError("no sound player on this hub")
+            from .sounds import SoundError
+            try:
+                return dict(self.player.trigger(c["block"], c["action"], source=source), key=c["key"], name=c["name"])
+            except SoundError as e:
+                raise DeployError(str(e))
         if c["kind"] == "voice":
             try:
                 if c["field"] == "ptt":

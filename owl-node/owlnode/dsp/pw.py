@@ -59,7 +59,17 @@ def dump(timeout=10):
     out = subprocess.run(["pw-dump", "--no-colors"], capture_output=True, timeout=timeout, text=True)
     if out.returncode != 0:
         raise RuntimeError(f"pw-dump: {out.stderr.strip()[:200]}")
-    return Graph(json.loads(out.stdout or "[]"))
+    return Graph(parse_dump(out.stdout))
+
+
+def parse_dump(text):
+    """pw-dump's snapshot: the first JSON array. When objects come or go while it runs, pw-dump appends a second
+    document with those changes ("Extra data" for json.loads, seen on a busy graph); the next dump catches them."""
+    text = (text or "").lstrip()
+    if not text:
+        return []
+    objs, _ = json.JSONDecoder().raw_decode(text)
+    return objs if isinstance(objs, list) else []
 
 
 def link(out_port_id, in_port_id):

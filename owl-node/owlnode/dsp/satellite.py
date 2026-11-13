@@ -58,7 +58,7 @@ def graph_objects(timeout=10):
     if out.returncode != 0:
         raise RuntimeError(f"pw-dump: {out.stderr.strip()[:200]}")
     objs = []
-    for o in json.loads(out.stdout or "[]"):
+    for o in pw.parse_dump(out.stdout):
         t = o.get("type")
         info = o.get("info") or {}
         if t == "PipeWire:Interface:Node":

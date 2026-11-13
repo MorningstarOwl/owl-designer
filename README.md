@@ -23,7 +23,7 @@ press **Deploy**, and the hub turns them into PipeWire links on each machine and
 
 [Features](#features) · [How it fits together](#how-it-fits-together) · [Requirements](#requirements) ·
 [Install](#install) · [Home Assistant](#connect-home-assistant) · [Your first design](#your-first-design) ·
-[Voice assistant](#echo-cancellation-and-the-voice-assistant) · [Cameras](#rtsp-cameras) ·
+[Voice assistant](#echo-cancellation-and-the-voice-assistant) · [Sounds and test signals](#sounds-and-test-signals) · [Cameras](#rtsp-cameras) ·
 [Dante and AES67 gear](#dante-and-other-aes67-gear) · [Blocks](#blocks) ·
 [Updating](#updating) · [Monitoring](#monitoring) · [If the hub fails](#if-the-hub-fails) · [Ports](#network-ports) · [Troubleshooting](#troubleshooting) · [Status](#status-and-roadmap)
 
@@ -42,6 +42,10 @@ press **Deploy**, and the hub turns them into PipeWire links on each machine and
 - **RTSP cameras.** Paste a camera link: its audio becomes a source you can wire anywhere, its video can be previewed
   and sent to any node's video receiver (hardware HEVC decoding on a Raspberry Pi 5).
 - **🎧 Listening probe.** Drag the probe onto any port, block or wire and hear that point on the computer you are using.
+- **🔊 Test signal injector.** Drag it onto any input, on any machine, and play pink or white noise or a sine into it at a
+  set level for a set time: check a signal path end to end without a source of your own.
+- **Sounds.** Upload doorbells, chimes and alarms in the designer; a **Sound player** block plays one when triggered
+  (a Panels button, a Home Assistant button, an automation) into any room.
 - **Safe deploys.** Every change is shown before it is applied, replacing a whole design is called out, and a failed
   deploy rolls back by itself.
 - **Dante and AES67 gear.** Streams that Dante devices (in AES67 mode) and other AES67 equipment announce on the
@@ -177,7 +181,8 @@ its wake word on the new device, then turn on the wake-word switch (on the Panel
    Wires between machines need nothing else.
 3. **Deploy…** shows exactly what will change — processes started, links made, patches set — and warns when a deploy
    would replace the whole design or cut off the voice assistant. Apply; a failure rolls back.
-4. **Run** shows live meters on every port and the state of every wire. Drag **🎧 Probe** onto anything to hear it.
+4. **Run** shows live meters on every port and the state of every wire. Drag **🎧 Probe** onto anything to hear it,
+   and **🔊 Inject** onto an input to play a test signal into it.
 5. **Panels** turn named controls into pages for your phone: drag controls onto a page, set ranges and labels.
 6. **Export** saves the canvas as a file, **Import…** opens one, and **History** (Design panel) lists the last 20
    deployed designs: open one on the canvas, then Deploy… shows what it would change.
@@ -197,6 +202,22 @@ The **AEC** block has two inputs and one output that matters:
 Wire the **Voice assistant** block's *reply* into the ducker's *sidechain* so answers lower the music. Set the AEC's
 *Mic channels* to match the mic (Deploy warns when they differ). The microphone's placement matters more than any
 setting: close to where people talk, away from the speakers.
+
+## Sounds and test signals
+
+**Sounds.** Open **Sounds** in the Design panel and upload files (WAV, FLAC, Ogg Vorbis/Opus or MP3; up to 25 MB each,
+500 MB in all; they are kept on the hub). Add a **Sound player** block, pick its sound, wire its output where it should
+be heard (a speaker, another room, or the ducker's sidechain so the music dips like for an announcement) and deploy.
+Each player has **Play** and **Stop**: buttons in its inspector, in Panels and in Home Assistant
+(`button.owl_dsp_<hub>_<block id>_play`), and in the API (`POST /api/dsp/controls/set {"key": "<block>.play"}`). Its sound is
+also a select entity in Home Assistant, so an automation can choose the sound, then press Play. *Loop* repeats it
+until Stop (alarms). Sounds are not part of the hub backup: keep your originals.
+
+**Test signals.** Drag **🔊 Inject** onto an input (the left side of a block), a block, or a wire (its destination),
+choose pink noise, white noise or a sine, a level (RMS, dBFS) and a duration, and press Start. It plays on the machine
+that input belongs to, is added to whatever already plays there, and stops by itself when the time is up (at most 10
+minutes) even if you close the page; the level can be moved while it plays. Combine it with the probe or the Run-mode
+meters to follow the signal through the design. Start low: it goes wherever that input leads.
 
 ## RTSP cameras
 
@@ -239,6 +260,7 @@ For Dante:
 | Voice | **Voice assistant** | Home Assistant Wyoming satellite: *listen* and *reply* are its mic and speaker |
 | Sources | **RTSP source** | a camera or any RTSP stream: audio output, video output |
 | Sources | **App Input** | a named sink an app plays into (`squeezelite -o NAME`); its monitor is the output |
+| Sources | **Sound player** | plays a library sound when its Play control is triggered (doorbell, chime, alarm; loop for alarms) |
 | Dynamics | **Compressor** · **Limiter** · **Ducker** · **Gain** | all parameters live |
 | EQ | **Parametric EQ** · **DJ EQ** | shelves + 3 bands per channel · 3-band (a template for any LADSPA plugin) |
 | Routing | **Delay** · **Mixer 4x2** · **Router 4:1** | lip-sync and speaker alignment · four inputs to one · select one of four |

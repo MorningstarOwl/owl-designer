@@ -395,7 +395,8 @@ class BlockType:
                 "secret_params": sorted(k for k, v in self.params.items() if v.get("secret")),
                 "engine": self.engine, "params": self.params, "inputs": self.inputs, "outputs": self.outputs,
                 "defaults": self.defaults(), "nodes": {k: v.get("node") for k, v in self.nodes.items()},
-                "test": bool(self.test), "match": self.match or None}
+                "test": bool(self.test), "match": self.match or None, "hub_only": bool(self.raw.get("hub_only")),
+                "triggers": self.raw.get("triggers") or []}
 
     def setup_cmds(self, ctx, card=None):
         """[(cmd string, params it depends on)] rendered for this instance; ${card} = the ALSA card index."""

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.0
+- Designer: **🔊 Inject** next to the probe: drag it onto any input, on any machine, to play pink/white noise or a sine
+  at a set level for a set time. **Sounds** in the Design panel: upload doorbells, chimes and alarms; a new **Sound
+  player** block plays one when its Play button is pressed (inspector, Panels, Home Assistant). Needs owl-node 0.11.0.
+
 ## 0.10.0
 - Designer: **Export** / **Import…** design files and a **History** of the last 20 deployed designs (Design panel)
   to open on the canvas (needs owl-node 0.10.0 on the hub).

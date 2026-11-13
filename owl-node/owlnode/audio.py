@@ -245,7 +245,8 @@ class Proc:
 def pw_nodes():
     try:
         out = subprocess.run(["pw-dump", "--no-colors"], capture_output=True, timeout=10, text=True).stdout
-        objs = json.loads(out or "[]")
+        out = (out or "").lstrip()
+        objs = json.JSONDecoder().raw_decode(out)[0] if out else []   # the snapshot; pw-dump may append changes
     except Exception:
         return None, {}
     nodes, ports = {}, {}

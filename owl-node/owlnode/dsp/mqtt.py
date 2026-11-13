@@ -215,6 +215,10 @@ class Bridge(threading.Thread):
             elif c["type"] == "select":
                 comp = "select"
                 base["options"] = [str(x) for x in c.get("options") or []]
+            elif c["type"] == "trigger":              # a Sound player's Play / Stop
+                comp = "button"
+                base.pop("state_topic", None)
+                base.update({"payload_press": "PRESS", "icon": "mdi:play" if c.get("action") == "play" else "mdi:stop"})
             else:
                 comp = "text"
             out.append((o, comp, base))

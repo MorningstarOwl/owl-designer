@@ -1,0 +1,59 @@
+# Sound player: plays a sound from the library (uploaded in the designer's Design panel: doorbells, chimes, alarms,
+# notification sounds) when its Play control is triggered: a Panels button, a Home Assistant button
+# (button.owl_dsp_<hub>_<block id>_play), or POST /api/dsp/controls/set {"key": "<block>.play"}. Wire its output anywhere: a
+# speaker, the ducker's sidechain (it ducks the music like an announcement), another room. The block itself is a
+# filter-chain sink -> volume -> source that runs all the time, so its wires stay linked; each Play runs pw-play of the
+# file into the sink (owlnode/dsp/sounds.py). Runs on the hub, where the library is.
+type: sound
+label: Sound player
+group: Sources
+description: "Plays a library sound when triggered (doorbell, chime, alarm): Play / Stop in Panels, Home Assistant and the API."
+hub_only: true
+inputs: []
+outputs:
+  - {id: out, label: out, channels: 2}
+params:
+  sound: {label: Sound, type: sound, default: "", live: true, help: "Upload sounds in the Design panel (Sounds)"}
+  gain_db: {label: Volume (dB), type: number, default: -6, min: -60, max: 12, step: 0.5, live: true}
+  loop: {label: Loop until stopped (alarms), type: bool, default: false, live: true}
+triggers:
+  - {id: play, label: Play}
+  - {id: stop, label: Stop}
+engine: pipewire
+nodes:
+  out: {node: "owl-${id}-out", dir: out}
+  sink: {node: "owl-${id}", dir: in}          # what pw-play plays into (not a port of the block)
+controls:
+  - {node: sink, each: "2", control: "g#:Gain 1", value: "${lin:p.gain_db}"}
+conf: |
+  { name = libpipewire-module-filter-chain
+      args = {
+          node.description = "${label}"
+          media.name = "${label}"
+          filter.graph = {
+              nodes = [ @each(2){ { type = builtin name = g# label = mixer control = { "Gain 1" = ${lin:p.gain_db} } } } ]
+              inputs = [ @each(2){ "g#:In 1" } ]
+              outputs = [ @each(2){ "g#:Out" } ]
+          }
+          capture.props = {
+              node.name = "owl-${id}"
+              node.description = "${label}: player"
+              media.class = Audio/Sink
+              audio.channels = 2
+              audio.position = [ FL FR ]
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+          playback.props = {
+              node.name = "owl-${id}-out"
+              node.description = "${label}: out"
+              media.class = Audio/Source
+              audio.channels = 2
+              audio.position = [ FL FR ]
+              node.autoconnect = false
+              priority.session = 0
+              owl.dsp.block = "${id}"
+          }
+      }
+  }
