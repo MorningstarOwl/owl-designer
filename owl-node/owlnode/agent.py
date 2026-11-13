@@ -145,7 +145,9 @@ class Agent:
     def r_sender(self, s):
         ep = self.eps[s["id"]]
         return {"id": s["id"], "version": ep.version, "label": s["label"], "description": s["description"],
-                "tags": {"urn:x-owl:pipewire-node": [s["node"]], "urn:x-owl:sap-session": [s["session"]]},
+                # urn:x-owl:channels: the designer's compiler puts several sources side by side in one sender
+                "tags": {"urn:x-owl:pipewire-node": [s["node"]], "urn:x-owl:sap-session": [s["session"]],
+                         "urn:x-owl:channels": [str(s["channels"])]},
                 "flow_id": s["flow_id"], "transport": "urn:x-nmos:transport:rtp.mcast", "device_id": self.n.device_id,
                 "manifest_href": f"{self.base}/x-nmos/connection/{IS05}/single/senders/{s['id']}/transportfile",
                 "interface_bindings": [self.n.media_if], "subscription": ep.subscribed}
@@ -316,8 +318,15 @@ class Agent:
                 continue
             a, tp = ep.active, ep.active["transport_params"][0]
             if a["master_enable"] and tp.get("rtp_enabled") and tp.get("multicast_ip"):
+                fmt = {}
+                if (a.get("transport_file") or {}).get("data"):
+                    try:
+                        fmt = ep.parse_sdp(a["transport_file"]["data"])
+                    except sdp.SDPError:
+                        pass
                 self.mon.watch(ep.key, tp["multicast_ip"], tp.get("destination_port") or 5004,
-                               tp.get("interface_ip") or self.n.ip, tp.get("source_ip"))
+                               tp.get("interface_ip") or self.n.ip, tp.get("source_ip"),
+                               channels=fmt.get("channels") or 2, width=2 if fmt.get("encoding") == "L16" else 3)
             else:
                 self.mon.unwatch(ep.key)
 

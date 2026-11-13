@@ -175,15 +175,18 @@ class Inventory:
         a receiver or sender whose node is absent from the satellite's graph is still a device block (live: false;
         its links stay pending on the satellite until the node appears). Found 2026-11-10: a block test design
         unpatched pinode RX 1 and the strict restore of the Living room design then had no pw:pinode:aes67-rx-pinode-1."""
+        from .compiler import sender_channels
         out = []
         tr = self.node_transport.get(host) or {}
         for r in tr.get("receivers", []):
             n = r["pw_node"]
             if graph is not None and graph.node(n):
                 continue
+            sub = self.senders.get((r.get("subscription") or {}).get("sender_id") or "")
+            rch = sender_channels(sub) if sub else 2
             out.append({"id": f"pw:{host}:{n}", "kind": "device", "source": "pipewire", "host": host, "label": f"AES67 RX {r.get('label')}",
                         "sub": "AES67 receiver (not patched: no node yet)", "class": "source", "node": n, "inputs": [],
-                        "outputs": [{"id": "out", "label": "capture", "media": "audio", "channels": 2, "pw": {"node": n, "dir": "out", "monitor": False}}],
+                        "outputs": [{"id": "out", "label": "capture", "media": "audio", "channels": rch, "pw": {"node": n, "dir": "out", "monitor": False}}],
                         "live": False, "driver": None})
         for s_ in tr.get("senders", []):
             n = s_["pw_node"]
@@ -191,7 +194,7 @@ class Inventory:
                 continue
             out.append({"id": f"pw:{host}:{n}", "kind": "device", "source": "pipewire", "host": host, "label": f"AES67 TX: {s_.get('label')}",
                         "sub": "AES67 sender (disabled: no node yet)", "class": "sink", "node": n,
-                        "inputs": [{"id": "in", "label": "in", "media": "audio", "channels": 2, "pw": {"node": n, "dir": "in"}}], "outputs": [],
+                        "inputs": [{"id": "in", "label": "in", "media": "audio", "channels": sender_channels(s_), "pw": {"node": n, "dir": "in"}}], "outputs": [],
                         "live": False, "driver": None})
         return out
 

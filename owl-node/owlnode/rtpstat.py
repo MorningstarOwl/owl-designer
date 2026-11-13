@@ -5,8 +5,10 @@ import math, select, socket, struct, threading, time
 
 
 class Watch:
-    def __init__(self, group, port, iface_ip, source_ip=None):
+    def __init__(self, group, port, iface_ip, source_ip=None, channels=2, width=3):
+        """channels / width (bytes per sample: 3 = L24, 2 = L16): the stream's format from its SDP, for the levels."""
         self.group, self.port, self.source_ip = group, port, source_ip
+        self.channels, self.width = max(1, int(channels or 2)), (2 if width == 2 else 3)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -20,11 +22,11 @@ class Watch:
         self.sock = s
         self.last_seq = None
         self.win = self._new()
-        self.stats = {"pkts_per_s": 0, "lost": 0, "lost_total": 0, "rms_dbfs": [None, None], "source": None,
+        self.stats = {"pkts_per_s": 0, "lost": 0, "lost_total": 0, "rms_dbfs": [None] * self.channels, "source": None,
                       "since": time.time(), "last_packet": None}
 
     def _new(self):
-        return {"t0": time.time(), "pkts": 0, "lost": 0, "sq": [0.0, 0.0], "n": 0, "src": None}
+        return {"t0": time.time(), "pkts": 0, "lost": 0, "sq": [0.0] * self.channels, "n": 0, "src": None}
 
     def feed(self, data, addr):
         if self.source_ip and addr[0] != self.source_ip:
@@ -46,11 +48,13 @@ class Watch:
         w["pkts"] += 1
         w["src"] = addr[0]
         pl = data[12 + 4 * cc:]
-        if w["n"] < 48000 and len(pl) >= 12:          # sample the level from the first second's worth
-            for i in range(0, len(pl) - 5, 6):         # assume L24 stereo (what our senders send)
-                for c in (0, 1):
-                    b = pl[i + 3 * c: i + 3 * c + 3]
-                    v = int.from_bytes(b, "big", signed=True) / 8388608.0
+        ch, bw = self.channels, self.width
+        frame = ch * bw
+        if w["n"] < 48000 and len(pl) >= frame:       # sample the level from the first second's worth
+            full = 8388608.0 if bw == 3 else 32768.0
+            for i in range(0, len(pl) - frame + 1, frame):
+                for c in range(ch):
+                    v = int.from_bytes(pl[i + bw * c: i + bw * c + bw], "big", signed=True) / full
                     w["sq"][c] += v * v
                 w["n"] += 1
         self.stats["last_packet"] = time.time()
@@ -58,9 +62,9 @@ class Watch:
     def roll(self):
         w, now = self.win, time.time()
         dt = max(now - w["t0"], 1e-3)
-        lvl = [None, None]
+        lvl = [None] * self.channels
         if w["n"]:
-            for c in (0, 1):
+            for c in range(self.channels):
                 ms = w["sq"][c] / w["n"]
                 lvl[c] = round(10 * math.log10(ms), 1) if ms > 1e-12 else None
         self.stats.update(pkts_per_s=round(w["pkts"] / dt), lost=w["lost"], rms_dbfs=lvl, source=w["src"])
@@ -81,15 +85,15 @@ class Monitor(threading.Thread):
         super().__init__(daemon=True, name="rtpstat")
         self.interval, self.watches, self.lock = interval, {}, threading.Lock()
 
-    def watch(self, key, group, port, iface_ip, source_ip=None):
+    def watch(self, key, group, port, iface_ip, source_ip=None, channels=2, width=3):
         with self.lock:
             old = self.watches.get(key)
-            if old and (old.group, old.port, old.source_ip) == (group, port, source_ip):
+            if old and (old.group, old.port, old.source_ip, old.channels, old.width) == (group, port, source_ip, channels, width):
                 return
             if old:
                 old.close()
             try:
-                self.watches[key] = Watch(group, port, iface_ip, source_ip)
+                self.watches[key] = Watch(group, port, iface_ip, source_ip, channels, width)
             except OSError as e:
                 self.watches.pop(key, None)
                 print(f"rtpstat: cannot watch {group}:{port}: {e}", flush=True)

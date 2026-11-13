@@ -126,12 +126,17 @@ owl-node/install.sh
 Same detection, plus one AES67 sender and one receiver (building takes 20–40 minutes on a Pi). Then, in the hub's
 designer, type the machine's IP in **Nodes** and press **Add**: the hub pairs it and its inputs and outputs appear.
 
-Each different source that leaves a machine needs a sender of its own there: music to the kitchen and the news to the
-bedroom, both from the hub, use two hub senders (re-run the hub's `install.sh` with its full list of streams, e.g.
-`--tx "Living Room" --tx "Living Room 2" --rx "Living Room RX 1"`: any `--tx`/`--rx`/`--vtx`/`--vrx` replaces all of
-them; likewise two `--rx` on a machine that receives two streams). With too few, Deploy warns and the sources share
-a sender, which mixes them. A node with a PTP hardware clock also stands by as the network's clock: if the hub is off,
-one node takes over so the others stay in step (`--ptp backup`, the default; `--ptp follower` opts out).
+Streams between machines work like Dante flows: a sender carries several sources side by side, each on its own
+channels (1-2, 3-4, …), and a receiving machine takes the stream once and plays only the channels wired to it. The
+hub's sender has 8 channels, so four different stereo sources can leave the hub at once (music to the kitchen, the
+news to the bedroom, …) over one stream; a node's sender is stereo. For more, re-run `install.sh` with its full list
+of streams, e.g. `--tx 'Living Room|channels=8' --rx 'Living Room RX 1'` (any `--tx`/`--rx`/`--vtx`/`--vrx`
+replaces all of them). With too few channels, Deploy warns and sources share channels, which mixes them. A hub
+installed before 0.8 keeps its stereo sender until it is re-installed that way. An 8-channel stream is about
+10 Mbit/s of multicast; a switch without IGMP snooping sends it to every port.
+
+A node with a PTP hardware clock also stands by as the network's clock: if the hub is off, one node takes over so the
+others stay in step (`--ptp backup`, the default; `--ptp follower` opts out).
 
 <p><img src="docs/images/nodes.png" alt="The Nodes box: two nodes added by IP, answering and paired" width="300"></p>
 

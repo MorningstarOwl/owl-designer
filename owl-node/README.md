@@ -66,7 +66,10 @@ below), and **Routing** (the N2 grid, unchanged, as a view). **Deploy…** shows
 start/stop/restart, links and patches to make/remove, meters) before anything changes; **Rollback** re-applies the
 previous deployed design (twice = redo); **Reset** discards the draft.
 
-**A wire is a wire.** The compiler (`owlnode/dsp/compiler.py`) decides the transport: both ends on the hub = a
+**A wire is a wire.** The compiler (`owlnode/dsp/compiler.py`) decides the transport, and the channels: a sender of N
+channels (`channels:` in `node.yaml`, `urn:x-owl:channels` in IS-04) carries several sources side by side, each
+distinct source on its own channels (kept across deploys, `tx_alloc` in `dsp-state.json`), and the receiving side links
+only those channels of its receiver; both ends on the hub = a
 PipeWire link; a satellite output into a hub input = an IS-05 patch of a hub AES67 receiver (reused if it already
 carries that sender, else a free one) plus a link from the receiver's node; a hub output into a satellite input = a link
 into the hub's AES67 sender plus a patch of the satellite's receiver; satellite to satellite = a patch (video included,

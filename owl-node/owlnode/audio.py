@@ -114,7 +114,7 @@ def tx_conf(n, s, tp):
             source.ip = {esc(tp.get('source_ip') or n.ip)}
             destination.ip = {esc(tp.get('destination_ip') or s['group'])}
             destination.port = {int(tp.get('destination_port') or s['port'])}
-            net.mtu = 1280
+            net.mtu = {config.TX_MTU}
             net.ttl = {n.ttl}
             net.loop = {str(n.loopback).lower()}
             sess.min-ptime = 1

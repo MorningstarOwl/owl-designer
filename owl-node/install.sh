@@ -24,7 +24,10 @@
 #   roles: agent (NMOS), audio (AES67), hub (registry, designer, dsp engine), dsp (D3: a satellite runs processing
 #   blocks the hub's designer places on it; the hub finds it on :8362), video-enc, video-dec
 #
-#   --tx LABEL[@GROUP]     a stereo sender (repeatable); group defaults to 239.69.<n>.<last octet of the host IP>
+#   --tx 'LABEL[@GROUP][|channels=N]'   a sender (repeatable); group defaults to 239.69.<n>.<last octet of the host
+#                          IP); channels 1-8 (default 2; 8 for a hub's default sender): the designer puts several
+#                          sources side by side in one sender (channels 1-2, 3-4, ...), so one 8-channel sender carries
+#                          four stereo streams to other machines
 #   --rx LABEL[>SINK]      a stereo receiver (repeatable); >SINK links it to a host sink (default: linked to nothing)
 #   --vtx 'LABEL[|k=v,...]'  N3 video sender (repeatable; adds role video-enc): source=testsrc|v4l2, device=/dev/videoN,
 #                          format=yuy2|mjpeg, width=, height=, fps=, codec=h265|h264, encap=rtp|ts, bitrate=<kbps>,
@@ -221,7 +224,15 @@ if systemctl --user is-active -q owl-aes67.service 2>/dev/null; then
   else echo "N1's owl-aes67 user unit is running; it would duplicate the PTP driver and senders. Re-run with --replace-n1 (stops it, leaves its files)" >&2; exit 1; fi
 fi
 # E2: a sender and a receiver unless told otherwise (what a node needs to be wired across hosts)
-if [ "$KEEP_STREAMS" = 0 ] && [[ ",$ROLES," == *",audio,"* ]] && [ ${#TX[@]} = 0 ] && [ ${#RX[@]} = 0 ]; then TX=("$LABEL"); RX=("$LABEL RX 1"); fi
+# (a hub's sender has 8 channels: it is where most streams to other rooms start; four stereo sources fit side by side)
+if [ "$KEEP_STREAMS" = 0 ] && [[ ",$ROLES," == *",audio,"* ]] && [ ${#TX[@]} = 0 ] && [ ${#RX[@]} = 0 ]; then
+  if [ $HUB = 1 ]; then TX=("$LABEL|channels=8"); else TX=("$LABEL"); fi
+  RX=("$LABEL RX 1")
+fi
+for t in ${TX[@]+"${TX[@]}"}; do
+  case "$t" in *"|"*) o="${t#*|}"
+    [[ "$o" =~ ^channels=[1-8]$ ]] || { echo "--tx '$t': the only option is channels=1..8 (e.g. --tx 'Living Room|channels=8')" >&2; exit 2; };; esac
+done
 if [ -z "$ENABLE" ]; then
   if [ "$DRY" = 1 ]; then ENABLE=0
   elif ask "Start owl-node automatically when this machine boots?" y n; then ENABLE=1; else ENABLE=0; fi
@@ -263,8 +274,9 @@ vopts() { # vopts ID 'LABEL|k=v,k=v' sender|receiver  -> one YAML flow mapping (
   if [ "$KEEP_STREAMS" = 1 ]; then awk '/^audio:/{f=1} f' "$ETC/node.yaml"; else
   echo "audio:"
   echo "  senders:"
-  i=0; for t in ${TX[@]+"${TX[@]}"}; do i=$((i+1)); l="${t%@*}"; g=""; [[ "$t" == *@* ]] && g="${t##*@}"
-    echo "    - {id: tx$i, label: \"$(yq "$l")\"$([ -n "$g" ] && echo ", group: $g")}"; done
+  i=0; for t in ${TX[@]+"${TX[@]}"}; do i=$((i+1)); c=""; [[ "$t" == *"|"* ]] && { c="${t##*|channels=}"; t="${t%%|*}"; }
+    l="${t%@*}"; g=""; [[ "$t" == *@* ]] && g="${t##*@}"
+    echo "    - {id: tx$i, label: \"$(yq "$l")\"$([ -n "$g" ] && echo ", group: $g")$([ -n "$c" ] && echo ", channels: $c")}"; done
   if [ $i = 0 ]; then echo "    []"; fi
   echo "  receivers:"
   i=0; for r in ${RX[@]+"${RX[@]}"}; do i=$((i+1)); l="${r%%>*}"; k=""; [[ "$r" == *">"* ]] && k="${r#*>}"
