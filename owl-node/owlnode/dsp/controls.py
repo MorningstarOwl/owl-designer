@@ -64,6 +64,7 @@ class Controls:
         self.version = 0                   # bumps when the set of controls changes (design deployed/edited)
         self.voice = None                  # D3: the PTT voice satellite (voice.py), set by the server in hub mode
         self._design_sig = None
+        self.health = None                 # health.Health, set by the server (hub mode)
         self._cache = None
         dep.on_change = self._on_deployer_change
 
@@ -210,10 +211,12 @@ class Controls:
         ptp = hub_st.get("ptp") or {}
         nodes = (self.inv.nmos or {}).get("nodes") or []
         state = "none" if not d else "error" if self.dep.design_error else "ok"
+        h = self.health.check() if self.health else {"ok": True, "issues": []}
         return {"design.name": d.get("name") or "", "design.state": state, "design.error": self.dep.design_error or "",
                 "design.deployed_at": self.dep.state.get("deployed_at"),
                 "ptp.state": ptp.get("port_state") or "unknown", "ptp.offset_ns": ptp.get("offset_ns"),
-                "registry.nodes": len(nodes), "registry.error": self.inv.error or "", "dsp.repairs": self.dep.repairs}
+                "registry.nodes": len(nodes), "registry.error": self.inv.error or "", "dsp.repairs": self.dep.repairs,
+                "health.ok": h["ok"], "health.issues": [i["text"] for i in h["issues"]]}
 
     def listing(self):
         c = self.refresh()

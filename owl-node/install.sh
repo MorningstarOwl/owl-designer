@@ -54,7 +54,7 @@
 #                          node being promoted to hub: /var/lib/owl-node/hub-backup.json). Designs, panels, presets and
 #                          nodes come back; the nodes are paired with this hub (see the README: Replacing the hub)
 #   --registry none        a node: drop the registry of an earlier install; the hub pairs it from the designer instead
-#   --image TAG            owl-node image already loaded on this host (default owl-node:0.9.0)
+#   --image TAG            owl-node image already loaded on this host (default owl-node:0.10.0)
 #   --mqtt URL             hub only (D2): Home Assistant over MQTT, mqtt://user:pass@host:1883 -> OWL_MQTT_URL in .env
 #                          (the dsp role publishes HA discovery for every control). Or write
 #                          /var/lib/owl-node/mqtt.json {host, port, username, password} instead; neither = bridge off
@@ -66,7 +66,7 @@
 # Never touches the host's PipeWire/WirePlumber daemons or their config.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.9.0 MQTT_URL=""
+NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.10.0 MQTT_URL=""
 TX=() RX=() VTX=() VRX=() VDEV=() DRY=0 REMOVE=0 ENABLE="" START=1 REPLACE_N1=0 YES=0 MODE="" BUILD=auto PTP_UDP="" RESTORE_FROM=""
 while [ $# -gt 0 ]; do
   case "$1" in

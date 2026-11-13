@@ -24,6 +24,8 @@ DESIGN = os.path.join(config.STATE_DIR, "dsp-design.json")
 PREV = os.path.join(config.STATE_DIR, "dsp-design.prev.json")
 STATE = os.path.join(config.STATE_DIR, "dsp-state.json")
 DRAFT = os.path.join(config.STATE_DIR, "dsp-draft.json")
+HISTORY = os.path.join(config.STATE_DIR, "dsp-history")      # the last HISTORY_KEEP deployed designs, one file each
+HISTORY_KEEP = 20
 PW_DIR = os.path.join(config.RUN_DIR, "dsp")
 PATCH_GRACE = 15        # s a far end gets to restore its own patch before we re-patch
 SHARE_RETRY = 5         # s between pushes of a satellite's share while it does not match
@@ -897,6 +899,8 @@ class Deployer:
                 atomic_write(STATE, self.state)
                 self.patch_bad_since = {}
                 self.recompile_next = time.time() + 5
+                if reason in ("deploy", "rollback", "restore"):
+                    self._remember(design, reason)
                 self._notify(reason)
                 self.event(f"{reason}: {design.get('name')!r} applied in {time.time() - t0:.1f} s: {len(new.procs)} block process(es), "
                            f"{created} link(s) made, {removed} removed, {len(changes)} patch change(s), {len(pending)} pending"
@@ -1047,6 +1051,44 @@ class Deployer:
                     self.patch_bad_since[rid] = now + 30
 
     # ------------------------------------------------------------------ live controls
+    # ------------------------------------------------------------------ history
+    def _remember(self, design, reason):
+        """Keep a copy of a deployed design (the designer's History loads one back onto the canvas)."""
+        try:
+            os.makedirs(HISTORY, exist_ok=True)
+            ms = int(time.time() * 1000)
+            while any(f.startswith(f"{ms}-") for f in os.listdir(HISTORY)):
+                ms += 1                       # two in one millisecond (a failed deploy's automatic rollback): unique
+            hid = f"{ms}-{reason}"
+            atomic_write(os.path.join(HISTORY, hid + ".json"), {"id": hid, "reason": reason, "deployed_at": time.time(),
+                                                                 "design": design})
+            for old in sorted(f for f in os.listdir(HISTORY) if f.endswith(".json"))[:-HISTORY_KEEP]:
+                os.unlink(os.path.join(HISTORY, old))
+        except OSError as e:
+            self.event(f"design history: {e}")
+
+    def history(self):
+        out = []
+        try:
+            names = sorted((f for f in os.listdir(HISTORY) if f.endswith(".json")), reverse=True)
+        except OSError:
+            names = []
+        for f in names:
+            h = read_json(os.path.join(HISTORY, f), None)
+            if isinstance(h, dict) and isinstance(h.get("design"), dict):
+                d = h["design"]
+                out.append({"id": h["id"], "reason": h.get("reason"), "deployed_at": h.get("deployed_at"), "name": d.get("name"),
+                            "blocks": len(d.get("blocks") or []), "wires": len(d.get("wires") or [])})
+        return out
+
+    def history_item(self, hid):
+        if not hid or "/" in hid or hid.startswith("."):
+            raise DeployError("no such history entry")
+        h = read_json(os.path.join(HISTORY, hid + ".json"), None)
+        if not isinstance(h, dict):
+            raise DeployError("no such history entry")
+        return h
+
     def _block_lock(self, bid):
         with self._block_locks_guard:
             return self._block_locks.setdefault(bid, threading.Lock())

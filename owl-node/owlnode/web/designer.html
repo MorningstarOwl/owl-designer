@@ -755,6 +755,30 @@ function App() {
     if (notice && notice.kind === "moved") setNotice(null);
     say(d.deployed ? "Canvas reset to the deployed design" : "Canvas reset to the running state");
   };
+  // ---- export / import / history: a design as a file, or one deployed before, opened on the canvas (Deploy… shows the diff)
+  const loadOnCanvas = (d, msg) => {
+    update({ ...d, based_on: { name: deployed && deployed.name, deployed_at: deployedAtRef.current } }); setPositions({}); setSel(null); setFlowKey((k) => k + 1);
+    say(msg);
+  };
+  const exportDesign = () => {
+    const { based_on, ...rest } = designRef.current || design;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(rest, null, 1)], { type: "application/json" }));
+    a.download = `${(rest.name || "design").replace(/[^A-Za-z0-9._-]+/g, "_")}.json`;
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  };
+  const importDesign = (file) => file.text().then((t) => {
+    let d; try { d = JSON.parse(t); } catch (e) { return say(`${file.name} is not JSON`, true); }
+    if (d && d.design && Array.isArray(d.design.blocks)) d = d.design;          // a history entry or an API answer
+    if (!d || !Array.isArray(d.blocks) || !Array.isArray(d.wires)) return say(`${file.name} is not an Owl Designer design (no blocks and wires)`, true);
+    if (changes.length && !confirm(`Replace the canvas (${changes.length} undeployed change(s)) with "${d.name || file.name}"?`)) return;
+    loadOnCanvas(d, `Opened "${d.name || file.name}" on the canvas: Deploy… shows what it would change`);
+  });
+  const openFromHistory = async (hid) => {
+    const h = await api("GET", `api/dsp/history/${encodeURIComponent(hid)}`);
+    if (changes.length && !confirm(`Replace the canvas (${changes.length} undeployed change(s)) with "${h.design.name}" as deployed ${new Date(h.deployed_at * 1000).toLocaleString()}?`)) return;
+    loadOnCanvas(h.design, `Opened "${h.design.name}" (deployed ${new Date(h.deployed_at * 1000).toLocaleString()}): Deploy… shows what it would change`);
+  };
   const openSetAside = () => {
     let dr = notice && notice.draft; if (!dr) { try { dr = JSON.parse(lsGet("owl.setAside") || "null"); } catch (e) {} }
     if (!dr) return;
@@ -867,6 +891,11 @@ function App() {
             onChange: (e) => { const v = e.target.value; update((d) => { const { latency_ms, ...rest } = d; return v === "" ? rest : { ...rest, latency_ms: Number(v) }; }); },
             style: { width: "100%", padding: 5, border: "1px solid var(--line)", borderRadius: 6, background: "var(--bg)", color: "var(--ink)" } })),
         h("p", { className: "help", style: { marginTop: 2, fontSize: 11, color: "var(--muted)" } }, "How long receivers buffer streams between machines. One value for every room keeps them in step; raise it if a busy network makes audio drop out. A wire can set its own."),
+        h("div", { className: "row", style: { display: "flex", gap: 6, marginTop: 6 } },
+          h("button", { className: "btn", onClick: exportDesign, title: "Download the canvas as a JSON file" }, "Export"),
+          h("label", { className: "btn", style: { cursor: run ? "default" : "pointer", opacity: run ? 0.5 : 1 }, title: "Open a design file on the canvas" }, "Import…",
+            h("input", { type: "file", accept: ".json,application/json", disabled: run, style: { display: "none" }, onChange: (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) importDesign(f); } }))),
+        h(HistoryPanel, { onOpen: openFromHistory, disabled: run, deployedAt: deployedAtRef.current }),
         h("h3", null, "Nodes"),
         h(NodesPanel, { hub: inv.hub, onChange: (host) => { setFocusHost(host); setTimeout(() => setFlowKey((k) => k + 1), 3500); } }),
         h("h3", null, "Blocks"),
@@ -1067,6 +1096,19 @@ function DeviceInfo({ b, hub, run, setDevice, override }) {
     h("ul", null, b.inputs.map((p) => h("li", { key: p.id }, `in · ${p.label} (${p.media}${p.channels ? `, ${p.channels} ch` : ""}${p.media_types ? ", " + p.media_types.join("/") : ""})`)),
       b.outputs.map((p) => h("li", { key: p.id }, `out · ${p.label} (${p.media}${p.channels ? `, ${p.channels} ch` : ""}${p.media_type ? ", " + p.media_type : ""})`))),
     b.live === false ? h("p", { className: "chip bad" }, "not present now") : null);
+}
+
+function HistoryPanel({ onOpen, disabled, deployedAt }) {
+  const [open, setOpen] = useState(false);
+  const [items, setItems] = useState(null);
+  useEffect(() => { if (open) api("GET", "api/dsp/history").then((r) => setItems(r.history || []), () => setItems([])); }, [open, deployedAt]);
+  return h("details", { className: "insp", style: { marginTop: 6, fontSize: 12 }, onToggle: (e) => setOpen(e.target.open) },
+    h("summary", { style: { cursor: "pointer" } }, "History (last deploys)"),
+    items === null ? h("div", { className: "help" }, "…") : !items.length ? h("div", { className: "help" }, "Nothing deployed yet.") :
+      h("ul", { style: { listStyle: "none", padding: 0, margin: "4px 0" } }, items.map((it) => h("li", { key: it.id, style: { display: "flex", gap: 6, alignItems: "center", padding: "2px 0" } },
+        h("span", { style: { flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, title: `${it.blocks} blocks, ${it.wires} wires` },
+          `${new Date(it.deployed_at * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} · ${it.name}${it.reason !== "deploy" ? ` (${it.reason})` : ""}`),
+        h("button", { className: "btn", disabled, style: { padding: "1px 6px" }, onClick: () => onOpen(it.id) }, "Open")))));
 }
 
 function WireInfo({ w, blocks, st, plan, run, remove, setMove, setLatency, designLatency }) {

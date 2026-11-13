@@ -25,7 +25,7 @@ press **Deploy**, and the hub turns them into PipeWire links on each machine and
 [Install](#install) · [Home Assistant](#connect-home-assistant) · [Your first design](#your-first-design) ·
 [Voice assistant](#echo-cancellation-and-the-voice-assistant) · [Cameras](#rtsp-cameras) ·
 [Dante and AES67 gear](#dante-and-other-aes67-gear) · [Blocks](#blocks) ·
-[Updating](#updating) · [If the hub fails](#if-the-hub-fails) · [Ports](#network-ports) · [Troubleshooting](#troubleshooting) · [Status](#status-and-roadmap)
+[Updating](#updating) · [Monitoring](#monitoring) · [If the hub fails](#if-the-hub-fails) · [Ports](#network-ports) · [Troubleshooting](#troubleshooting) · [Status](#status-and-roadmap)
 
 ## Features
 
@@ -179,6 +179,8 @@ its wake word on the new device, then turn on the wake-word switch (on the Panel
    would replace the whole design or cut off the voice assistant. Apply; a failure rolls back.
 4. **Run** shows live meters on every port and the state of every wire. Drag **🎧 Probe** onto anything to hear it.
 5. **Panels** turn named controls into pages for your phone: drag controls onto a page, set ranges and labels.
+6. **Export** saves the canvas as a file, **Import…** opens one, and **History** (Design panel) lists the last 20
+   deployed designs: open one on the canvas, then Deploy… shows what it would change.
 
 <p><img src="docs/images/panels-phone.png" alt="A Panels page on a phone: volume, mute, preset, ducking, meters, push-to-talk" width="300"></p>
 
@@ -253,6 +255,16 @@ configuration with its ports, parameters and live controls. Adding a LADSPA plug
   senders, receivers, registry and start-at-boot choice; `--dry-run` shows the difference first.
 - **Home Assistant add-on:** HA offers updates by itself when a new version is released.
 - Versions are plain `X.Y.Z` everywhere (the add-on, the image, the release tag `vX.Y.Z`).
+
+## Monitoring
+
+- **Home Assistant:** the hub's device has a **Needs attention** diagnostic sensor (a problem sensor) whose
+  attributes list what is wrong: a node whose PTP is not locked, packet loss on a receiver in the last minute, a
+  patched receiver that gets no packets, a block that restarted in the last 10 minutes, a node that does not answer,
+  a design that does not apply. Build a notification automation on it.
+- **Prometheus / Grafana:** `http://<hub>:8362/metrics` (PTP lock and offset per node, packets and losses per
+  receiver, block restarts, meter levels, the same health issues by kind).
+- **API:** `GET :8362/api/dsp/health` returns the issues as JSON.
 
 ## If the hub fails
 

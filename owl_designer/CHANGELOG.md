@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.0
+- Designer: **Export** / **Import…** design files and a **History** of the last 20 deployed designs (Design panel)
+  to open on the canvas (needs owl-node 0.10.0 on the hub).
+- Engine (owl-node 0.10.0): faders and fades respond at once (one long-lived PipeWire control connection instead of a
+  process per change; 10 ms fade steps); all meters run in one process; a **Needs attention** sensor in Home Assistant
+  and Prometheus metrics at `:8362/metrics`.
+
 ## 0.9.0
 - Designer: **Network latency** in the Design panel (how long receivers buffer streams between machines; one value
   keeps rooms in step) and a latency per wire in its inspector (needs owl-node 0.9.0 on the hub and the nodes).

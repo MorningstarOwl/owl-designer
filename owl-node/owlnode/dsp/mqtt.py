@@ -245,6 +245,12 @@ class Bridge(threading.Thread):
                 cfg["unit_of_measurement"] = unit
                 cfg["state_class"] = "measurement"
             out.append((o, "sensor", cfg))
+        # one problem sensor for the whole system: ON when something needs attention, the list in its attributes
+        out.append(("health", "binary_sensor", {"name": "Needs attention", "unique_id": f"{self.node_id}_health",
+                                                "object_id": f"{self.node_id}_health", "device": dev, "availability": avail,
+                                                "state_topic": f"{self.base}/system/health/state", "device_class": "problem",
+                                                "payload_on": "ON", "payload_off": "OFF", "entity_category": "diagnostic",
+                                                "json_attributes_topic": f"{self.base}/system/health/attributes"}))
         return out
 
     def publish_all(self):
@@ -308,7 +314,9 @@ class Bridge(threading.Thread):
                 "design_state": (s["design.state"], {"error": s["design.error"], "repairs": s["dsp.repairs"]}),
                 "ptp_state": (s["ptp.state"], {"offset_ns": s["ptp.offset_ns"]}),
                 "ptp_offset_ns": (s["ptp.offset_ns"] if s["ptp.offset_ns"] is not None else "unknown", {}),
-                "registry_nodes": (s["registry.nodes"], {"error": s["registry.error"]})}
+                "registry_nodes": (s["registry.nodes"], {"error": s["registry.error"]}),
+                "health": ("OFF" if s.get("health.ok", True) else "ON", {"issues": s.get("health.issues") or [],
+                                                                         "count": len(s.get("health.issues") or [])})}
         for o, (st, attrs) in vals.items():
             if force or self._last_sys.get(o) != (st, json.dumps(attrs, sort_keys=True)):
                 self._last_sys[o] = (st, json.dumps(attrs, sort_keys=True))

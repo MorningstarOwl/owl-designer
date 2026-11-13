@@ -24,6 +24,9 @@ D2, named controls:
   GET  /api/dsp/mqtt                the HA bridge's state (broker, entities, errors; never the password)
   GET  /api/dsp/previews            which MediaMTX preview paths are live (for the HA add-on's designer)
   GET  /api/dsp/sap                 AES67 streams announced over SAP (Dante, ...), with their SDPs (OWL_SAP=off: none)
+  GET  /api/dsp/health              what needs attention (PTP, packet loss, restarts, nodes; health.py)
+  GET  /metrics                     Prometheus metrics of the whole system (health.py)
+  GET  /api/dsp/history             the last deployed designs; GET /api/dsp/history/<id> one of them
   GET  /api/dsp/backup              this hub's backup bundle (backup.py); it is also pushed to every satellite
   POST /api/dsp/restore             {backup}: restore a bundle on this hub (re-pairs the nodes, re-applies the design)
 D3, satellites (a node without the hub role runs this server in satellite mode: the PipeWire executor of its share,
@@ -53,6 +56,7 @@ from .nodes import NodeBook, NodeError
 from . import probe as P
 from . import sap as SAP
 from . import backup as BK
+from . import health as HL
 from .satellite import http as sat_http
 
 
@@ -229,6 +233,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.mqtt.status() if self.mqtt else {"enabled": False})
             if p == "/api/dsp/nodes":
                 return self._send(200, self._nodes())
+            if p == "/api/dsp/history":
+                return self._send(200, {"history": self.dep.history()})
+            if p.startswith("/api/dsp/history/"):
+                try:
+                    return self._send(200, self.dep.history_item(unquote(p[len("/api/dsp/history/"):])))
+                except DeployError as e:
+                    return self._send(404, {"error": str(e)})
+            if p == "/api/dsp/health":
+                return self._send(200, self.ctl.health.check() if self.ctl.health else {"ok": True, "issues": []})
+            if p == "/metrics":
+                data = HL.metrics(self.dep, self.inv, self.dep.taps, self.ctl.health, VERSION).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                return self.wfile.write(data)
             if p == "/api/dsp/backup":
                 return self._send(200, BK.make(self.dep.cfg.name))
             if p == "/api/dsp/sap":
@@ -443,6 +463,7 @@ def main():
     taps = Taps()
     dep = Deployer(cfg, inv, types, taps, ctl)
     controls = Controls(dep, types, inv, cfg)
+    controls.health = HL.Health(dep, inv)
     mqtt = Bridge(controls, cfg, controller_port=int(os.environ.get("OWL_CONTROLLER_PORT", "8361")))
     voice = None
     if os.environ.get("OWL_VOICE", "on") not in ("off", "0", "no"):

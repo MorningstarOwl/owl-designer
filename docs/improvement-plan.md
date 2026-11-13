@@ -5,7 +5,8 @@ DSP compiler/deployer, the APIs, the Wyoming voice satellite, video, the install
 Findings come from reading the code; nothing was built or run (the repository has no tests to run).
 
 Status: **section 1 (security) is deferred**; **section 2 (bugs) is fixed in 0.7.3**; **section 3 items 1-2 are done in
-0.8.0, items 4 and 7 in 0.9.0; items 3, 5 and 6 are designed below, not built** (see the notes under each item).
+0.8.0, items 4 and 7 in 0.9.0; items 3, 5 and 6 are designed below, not built**; **section 4 is done in 0.10.0** (see
+the notes under each item).
 
 ## 1. Security (deferred)
 
@@ -116,10 +117,22 @@ Status: **section 1 (security) is deferred**; **section 2 (bugs) is fixed in 0.7
 1. Every live control change holds the deployer lock, deep-copies the design, runs `pw-dump` + `pw-cli` and writes
    the design file; fades repeat this every 40 ms, and the 2 s reconcile holds the same lock during HTTP calls. Use a
    long-lived PipeWire connection, cached node ids and a separate lock for live controls.
+   *Done (0.10.0):* one long-lived `pw-cli` fed on stdin (`pw.PwCtl`), node ids from the graph dumps reconcile makes
+   anyway, no deployer lock (per-block lock + copy-on-write design under a short lock, a deploy counter so a racing
+   change never overwrites a new design), the design/share file written at most once a second. Measured on a real
+   PipeWire: 16 ms per change (idle graph) -> 0.03 ms. The controls listing no longer rebuilds per fader step.
 2. One `pw-record` process + numpy thread per meter tap; one multi-channel meter process would scale.
+   *Done (0.10.0):* meter banks: a tap is a channel range of one `pw-record` of up to 64 channels; taps coming and
+   going only add or remove links. Tested on PipeWire + WirePlumber (a tone in a tap's channels, silence next to it).
 3. 40 ms fade steps on plugins without smoothing can zipper.
+   *Done (0.10.0):* 10 ms steps (affordable now that a step is a line to a pipe): a 12 dB fade over 0.5 s moves in
+   0.24 dB steps instead of 1 dB. Ramps inside the plugins would remove the steps entirely; not needed so far.
 4. Metrics (Prometheus) and HA alerts for PTP loss, packet loss and restarts; more than one rollback generation;
    design export/import.
+   *Done (0.10.0):* `health.py` (PTP, loss in the last minute, silent receivers, restarts in the last 10 min, nodes
+   not answering, design/registry errors) -> `GET /api/dsp/health`, a Home Assistant "Needs attention" problem sensor
+   with the issues as attributes, and `GET /metrics` (Prometheus). The last 20 deployed designs are kept
+   (`dsp-history/`) and the designer's History opens one on the canvas; Export/Import save and open design files.
 
 ## 5. Engineering hygiene
 

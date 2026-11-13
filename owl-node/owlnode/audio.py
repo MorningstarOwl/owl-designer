@@ -192,6 +192,7 @@ def rx_conf(n, r, a, latency_ms=None):
 class Proc:
     def __init__(self, name, conf):
         self.name, self.conf, self.p, self.since, self.restarts, self.next_try = name, conf, None, None, 0, 0
+        self.total_restarts = 0             # never reset (restarts is the backoff counter): metrics, health
         self.path = os.path.join(PW_DIR, f"{name}.conf")
 
     @property
@@ -229,6 +230,7 @@ class Proc:
             log(f"{self.name} exited with {self.p.returncode}")
             self.p = None
             self.restarts += 1
+            self.total_restarts += 1
             self.next_try = time.time() + min(30, 2 ** self.restarts)
         if time.time() >= self.next_try:
             self.start()
@@ -236,6 +238,7 @@ class Proc:
     def info(self):
         return {"running": self.running(), "pid": self.p.pid if self.running() else None,
                 "up_s": round(time.time() - self.since) if self.running() else 0, "restarts": self.restarts,
+                "total_restarts": self.total_restarts,
                 "conf": self.digest}
 
 
