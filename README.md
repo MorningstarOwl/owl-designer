@@ -25,7 +25,7 @@ press **Deploy**, and the hub turns them into PipeWire links on each machine and
 [Install](#install) · [Home Assistant](#connect-home-assistant) · [Your first design](#your-first-design) ·
 [Voice assistant](#echo-cancellation-and-the-voice-assistant) · [Cameras](#rtsp-cameras) ·
 [Dante and AES67 gear](#dante-and-other-aes67-gear) · [Blocks](#blocks) ·
-[Updating](#updating) · [Ports](#network-ports) · [Troubleshooting](#troubleshooting) · [Status](#status-and-roadmap)
+[Updating](#updating) · [If the hub fails](#if-the-hub-fails) · [Ports](#network-ports) · [Troubleshooting](#troubleshooting) · [Status](#status-and-roadmap)
 
 ## Features
 
@@ -139,6 +139,10 @@ replaces all of them). With too few channels, Deploy warns and sources share cha
 installed before 0.8 keeps its stereo sender until it is re-installed that way. An 8-channel stream is about
 10 Mbit/s of multicast; a switch without IGMP snooping sends it to every port.
 
+Receivers buffer each stream for a few milliseconds (6 by default). **Network latency** in the designer's Design panel
+sets it for every stream the design uses (the same value everywhere keeps rooms in step; raise it if a busy network
+makes audio drop out), and a wire's inspector can set its own.
+
 A node with a PTP hardware clock also stands by as the network's clock: if the hub is off, one node takes over so the
 others stay in step (`--ptp backup`, the default; `--ptp follower` opts out).
 
@@ -249,6 +253,32 @@ configuration with its ports, parameters and live controls. Adding a LADSPA plug
   senders, receivers, registry and start-at-boot choice; `--dry-run` shows the difference first.
 - **Home Assistant add-on:** HA offers updates by itself when a new version is released.
 - Versions are plain `X.Y.Z` everywhere (the add-on, the image, the release tag `vX.Y.Z`).
+
+## If the hub fails
+
+**While it is off**, streams between nodes keep playing: each node keeps its own patches and its part of the design,
+and with PTP hardware clocks one node takes over as the network clock (`--ptp backup`), so they stay in step. What
+stops is what runs on the hub: its own sound devices and the blocks placed on it, wires that pass through it, the
+designer, Home Assistant controls, the voice assistant and the camera relay.
+
+**Replacing it.** Every node keeps a copy of the hub's latest backup (the hub refreshes it within about 30 seconds of
+any change: the design with its panels and presets, the previous design, the canvas draft, the nodes, the wake-word
+switch and the MQTT settings). On the replacement machine:
+
+```bash
+owl-node/install.sh --hub --restore-from 192.0.2.20      # the address of any node
+```
+
+or turn a node into the hub, from the copy it holds:
+
+```bash
+owl-node/install.sh --hub --restore-from /var/lib/owl-node/hub-backup.json
+```
+
+The designs come back and every node is paired with the new hub. Then redo what the backup leaves out: the MQTT
+password (`--mqtt …`; it is never copied to other machines), wires to the old hub's own sound devices if the new
+machine's are different (they show greyed until re-wired), and in Home Assistant the Wyoming satellite's address.
+`GET :8362/api/dsp/backup` downloads the backup at any time; `POST :8362/api/dsp/restore` restores one.
 
 ## Network ports
 

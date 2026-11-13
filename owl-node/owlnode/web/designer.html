@@ -236,10 +236,11 @@ const designDiff = (a, b) => {
   if (!a || !b) return [];
   const out = [];
   if ((a.name || "") !== (b.name || "")) out.push(`name "${b.name}" → "${a.name}"`);
+  if ((a.latency_ms ?? null) !== (b.latency_ms ?? null)) out.push(`network latency ${b.latency_ms ?? "default"} → ${a.latency_ms ?? "default"} ms`);
   const ab = Object.fromEntries((a.blocks || []).map((x) => [x.id, x])), bb = Object.fromEntries((b.blocks || []).map((x) => [x.id, x]));
   for (const id in ab) if (!bb[id]) out.push(`+ block ${ab[id].label || id}`); else if (JSON.stringify([ab[id].type, ab[id].label, ab[id].host, ab[id].params || {}]) !== JSON.stringify([bb[id].type, bb[id].label, bb[id].host, bb[id].params || {}])) out.push(`~ block ${ab[id].label || id}`);
   for (const id in bb) if (!ab[id]) out.push(`− block ${bb[id].label || id}`);
-  const wk = (w) => `${w.from}>${w.to}${w.move ? "!" : ""}`;
+  const wk = (w) => `${w.from}>${w.to}${w.move ? "!" : ""}${w.latency_ms != null ? "@" + w.latency_ms : ""}`;
   const aw = new Set((a.wires || []).map(wk)), bw = new Set((b.wires || []).map(wk));
   const n1 = [...aw].filter((x) => !bw.has(x)).length, n2 = [...bw].filter((x) => !aw.has(x)).length;
   if (n1) out.push(`+ ${n1} wire${n1 === 1 ? "" : "s"}`);
@@ -861,6 +862,11 @@ function App() {
       (mode === "design" || mode === "run") && h("div", { className: `side ${sheet === "palette" ? "" : "hidden"}` },
         h("h3", null, "Design"),
         h("input", { className: "insp", type: "text", value: design.name || "", onChange: (e) => update((d) => ({ ...d, name: e.target.value })), style: { width: "100%", padding: 5, border: "1px solid var(--line)", borderRadius: 6, background: "var(--bg)", color: "var(--ink)" } }),
+        h("label", { className: "insp", style: { display: "block", fontSize: 12, marginTop: 6 } }, "Network latency (ms)",
+          h("input", { type: "number", min: 1, max: 500, step: 1, value: design.latency_ms ?? "", placeholder: "each node's default (6)", disabled: run,
+            onChange: (e) => { const v = e.target.value; update((d) => { const { latency_ms, ...rest } = d; return v === "" ? rest : { ...rest, latency_ms: Number(v) }; }); },
+            style: { width: "100%", padding: 5, border: "1px solid var(--line)", borderRadius: 6, background: "var(--bg)", color: "var(--ink)" } })),
+        h("p", { className: "help", style: { marginTop: 2, fontSize: 11, color: "var(--muted)" } }, "How long receivers buffer streams between machines. One value for every room keeps them in step; raise it if a busy network makes audio drop out. A wire can set its own."),
         h("h3", null, "Nodes"),
         h(NodesPanel, { hub: inv.hub, onChange: (host) => { setFocusHost(host); setTimeout(() => setFlowKey((k) => k + 1), 3500); } }),
         h("h3", null, "Blocks"),
@@ -884,6 +890,8 @@ function App() {
         selWire && h("div", { className: "insp" }, h("button", { className: "btn", style: { marginBottom: 6 }, onClick: () => { const [b_, p_] = selWire.from.split("|"); startProbe(b_, p_); } }, "🎧 Listen to this wire")),
         selWire && h(WireInfo, { w: selWire, blocks, st: status && status.wires && status.wires[selWire.id], plan, run,
           setMove: (v) => update((d) => ({ ...d, wires: d.wires.map((w) => (w.id === selWire.id ? (v ? { ...w, move: true } : (({ move, ...rest }) => rest)(w)) : w)) })),
+          designLatency: design.latency_ms,
+          setLatency: (v) => update((d) => ({ ...d, wires: d.wires.map((w) => (w.id === selWire.id ? (v === "" ? (({ latency_ms, ...rest }) => rest)(w) : { ...w, latency_ms: Number(v) }) : w)) })),
           remove: () => { update((d) => ({ ...d, wires: d.wires.filter((w) => w.id !== selWire.id) })); setSel(null); } }),
         sel && sel.kind === "edge" && !selWire && h("div", { className: "insp" }, h("h3", null, "Existing link"), h("p", { className: "help" }, "Made by WirePlumber or an app, not by a design. The designer never removes it."))),
       mode === "panels" && h(Panels, { design, update, deployed: !!deployedName, live, say }),
@@ -1061,16 +1069,23 @@ function DeviceInfo({ b, hub, run, setDevice, override }) {
     b.live === false ? h("p", { className: "chip bad" }, "not present now") : null);
 }
 
-function WireInfo({ w, blocks, st, plan, run, remove, setMove }) {
+function WireInfo({ w, blocks, st, plan, run, remove, setMove, setLatency, designLatency }) {
   const name = (ref) => { const [bid, pid] = ref.split("|"); const b = blocks.find((x) => x.id === bid); const p = b && (b.kind === "proc" ? { label: pid } : b.inputs.concat(b.outputs).find((x) => x.id === pid)); return `${b ? b.label : bid} · ${p ? p.label : pid}`; };
   const impl = plan && plan.wires && plan.wires[w.id];
   const src = blocks.find((x) => x.id === w.from.split("|")[0]), dst = blocks.find((x) => x.id === w.to.split("|")[0]);
   const movable = src && src.kind === "device" && src.class === "app-out" && dst && dst.kind === "proc";
+  // a wire between machines rides an AES67 stream: its receiver's playout latency can be set (the design's, else this)
+  const hostOf = (b) => (b && (b.host || (b.kind === "proc" ? "hub" : null))) || null;
+  const network = impl ? impl.some((s) => s.startsWith("IS-05 patch")) : (src && dst && (src.source === "sap" || hostOf(src) !== hostOf(dst)));
   return h("div", { className: "insp" },
     h("h3", null, `Wire ${w.id}`),
     h("div", { className: "kv" }, h("b", null, "from "), name(w.from), h("br"), h("b", null, "to "), name(w.to)),
     movable && h("label", { className: "row", style: { marginTop: 8 } }, h("input", { type: "checkbox", checked: !!w.move, disabled: run, onChange: (e) => setMove(e.target.checked) }), "Move the stream into this block"),
     movable && h("p", { className: "help" }, w.move ? "The app's stream is taken off its current output (the speaker) and plays only through this block: PipeWire target.object metadata, which WirePlumber follows and remembers. When the block is gone the stream falls back to its own output." : "Tap: the block gets a copy and the app keeps playing where it does (the AEC's reference works this way)."),
+    network && h("label", { className: "row", style: { marginTop: 8, gap: 6, display: "flex", alignItems: "center" } }, "Latency (ms)",
+      h("input", { type: "number", min: 1, max: 500, step: 1, value: w.latency_ms ?? "", disabled: run, style: { width: 80 },
+        placeholder: designLatency != null ? String(designLatency) : "default", onChange: (e) => setLatency(e.target.value) })),
+    network && h("p", { className: "help" }, "The receiving machine buffers this stream this long (empty: the design's network latency). Wires that share a stream share its latency."),
     st ? h("div", { className: "kv", style: { marginTop: 8 } }, h("span", { className: `badge ${st.state === "ok" ? "b-ok" : st.state === "missing" ? "b-bad" : "b-warn"}` }, st.state), " ", (st.detail || []).join("; "),
       st.rx ? h("div", null, `${st.rx.pkts_per_s} pkt/s · lost ${st.rx.lost} · ${(st.rx.rms_dbfs || []).map(fmtDb).join("/")} dBFS on the wire`) : null) : null,
     impl ? [h("h3", { key: "h" }, "Compiles to"), h("ul", { key: "u" }, impl.map((s, i) => h("li", { key: i }, s)))] : h("p", { className: "help" }, "Press Deploy… to see what this wire compiles to."),

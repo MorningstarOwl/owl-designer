@@ -19,6 +19,7 @@ from .rtpstat import Monitor
 IS04 = "v1.3"
 IS05 = "v1.1"
 HEARTBEAT = 5
+MIN_LATENCY_MS, MAX_LATENCY_MS = 1.0, 500.0   # receiver playout latency the designer may set
 # JPEG XS profiles a receiver accepts: what SVT JPEG XS decodes in 4:2:0 / 4:2:2 / 4:4:4 (no Bayer, no alpha)
 JXS_PROFILES = ["Main420.12", "High420.12", "Main422.10", "Main444.12", "High444.12"]
 
@@ -68,6 +69,10 @@ class Agent:
             self.eps[s["id"]] = Endpoint("sender", s, node, (saved.get("video_senders") or {}).get(s["key"]), self.ep_lock)
         for r in node.vreceivers:
             self.eps[r["id"]] = Endpoint("receiver", r, node, (saved.get("video_receivers") or {}).get(r["key"]), self.ep_lock)
+        # owl extension: per-receiver playout latency set by the hub's designer (x-owl/v1/receivers/<id>), overriding
+        # node.yaml's latency_ms; read by the audio role from state.json
+        self.rx_latency = {k: float(v) for k, v in (saved.get("receiver_latency") or {}).items()
+                           if isinstance(v, (int, float)) and MIN_LATENCY_MS <= v <= MAX_LATENCY_MS}
         self.static_version = new_version()
         self.node_version = new_version()
         self.lock = threading.RLock()
@@ -301,7 +306,8 @@ class Agent:
             self._persist()
 
     def _persist(self):
-        st = {"senders": {}, "receivers": {}, "video_senders": {}, "video_receivers": {}, "written": time.time()}
+        st = {"senders": {}, "receivers": {}, "video_senders": {}, "video_receivers": {}, "written": time.time(),
+              "receiver_latency": dict(self.rx_latency)}
         for ep in self.eps.values():
             a = ep.view_active()
             if ep.kind == "receiver" and a.get("transport_file", {}).get("data"):
@@ -501,6 +507,8 @@ class Agent:
             ep = self.eps[r["id"]]
             a = ep.active
             rx[r["id"]] = {"key": r["key"], "node": r["node"], "master_enable": a["master_enable"],
+                           "latency_ms": self.rx_latency.get(r["key"], r["latency_ms"]),
+                           "latency_override": self.rx_latency.get(r["key"]),
                            "sender_id": a.get("sender_id"), "transport": a["transport_params"][0],
                            "wire": self.mon.stats(r["key"]),
                            "process": (audio.get("receivers") or {}).get(r["key"])}
@@ -561,6 +569,23 @@ class Agent:
         return sdp.sender_sdp(live, tp.get("source_ip") or self.n.ip, gm, self.n.ptp_domain,
                               version=int(ep.version.split(":")[0]), rtp=rtp,
                               localmac=None if self.n.phc_if else (self.n.mac or "00-00-00-00-00-00"))
+
+    def set_latency(self, rid, ms):
+        """owl extension: an AES67 receiver's playout latency (None = node.yaml's). Restarts its receive process."""
+        r = next((x for x in self.n.receivers if x["id"] == rid), None)
+        if not r:
+            raise PatchError(404, "no such AES67 receiver")
+        if ms is not None:
+            if isinstance(ms, bool) or not isinstance(ms, (int, float)) or not MIN_LATENCY_MS <= ms <= MAX_LATENCY_MS:
+                raise PatchError(400, f"latency_ms must be a number {MIN_LATENCY_MS:g}..{MAX_LATENCY_MS:g} or null")
+        with self.ep_lock:
+            if ms is None:
+                self.rx_latency.pop(r["key"], None)
+            else:
+                self.rx_latency[r["key"]] = float(ms)
+            self._persist()
+        log(f"receiver {r['key']}: latency {'%g ms' % ms if ms is not None else 'back to node.yaml ' + format(r['latency_ms'], 'g') + ' ms'}")
+        return {"id": rid, "latency_ms": self.rx_latency.get(r["key"], r["latency_ms"]), "latency_override": self.rx_latency.get(r["key"])}
 
     # IS-04 v1.x deprecated receiver target (PUT /receivers/{id}/target) -> an immediate IS-05 activation
     def put_target(self, rid, body):
@@ -666,6 +691,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, ["status/"])
             if p[1:] == ["v1", "status"]:
                 return self._send(200, a.status())
+            if len(p) == 4 and p[1:3] == ["v1", "receivers"] and method == "PATCH":
+                body = self._body() or {}
+                if not isinstance(body, dict) or "latency_ms" not in body:
+                    raise PatchError(400, "body must be {latency_ms: number|null}")
+                return self._send(200, a.set_latency(p[3], body["latency_ms"]))
             return self._err(404, "not found")
         if p[0] != "x-nmos":
             return self._err(404, "not found")

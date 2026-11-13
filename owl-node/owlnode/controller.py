@@ -197,6 +197,17 @@ class Controller:
             self._park(old, receiver_id)
         return code, resp
 
+    def set_receiver_latency(self, receiver_id, latency_ms):
+        """owl-node extension: an AES67 receiver's playout latency (ms; None = the node's own default), on the agent
+        of the node the receiver belongs to (x-owl/v1/receivers/<id>). -> (HTTP code, body)."""
+        rx = self._get("receivers", receiver_id)
+        node = self._get("nodes", self._get("devices", rx["device_id"])["node_id"])
+        ep = ((node.get("api") or {}).get("endpoints") or [{}])[0]
+        if not ep.get("host"):
+            raise LookupError(f"node {node['id']} has no API endpoint")
+        return http("PATCH", f"http://{ep['host']}:{ep.get('port') or 8360}/x-owl/v1/receivers/{receiver_id}",
+                    {"latency_ms": latency_ms}, timeout=5)
+
     def patch_sdp(self, receiver_id, sdp, transport_params=None):
         """IS-05 PATCH of a receiver with a transport file of our own and no NMOS sender behind it (an RTSP camera
         relayed by the hub's MediaMTX): sender_id null, master_enable true."""

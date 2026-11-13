@@ -49,8 +49,12 @@
 #                          ptp/ptp4l-gm-udpv4.cfg), so Dante devices in AES67 mode and other AES67 gear, which expect
 #                          UDPv4, follow the house clock. Needs the PHC on the media interface itself (not a bridge
 #                          port). Kept on a re-run once installed; --no-ptp-udp removes it
+#   --restore-from NODE|FILE   hub: after starting, restore the backup of the previous hub, which every paired node
+#                          keeps (NODE = its address, e.g. 192.0.2.20 or 192.0.2.20:8362), or from a file (e.g. on a
+#                          node being promoted to hub: /var/lib/owl-node/hub-backup.json). Designs, panels, presets and
+#                          nodes come back; the nodes are paired with this hub (see the README: Replacing the hub)
 #   --registry none        a node: drop the registry of an earlier install; the hub pairs it from the designer instead
-#   --image TAG            owl-node image already loaded on this host (default owl-node:0.8.0)
+#   --image TAG            owl-node image already loaded on this host (default owl-node:0.9.0)
 #   --mqtt URL             hub only (D2): Home Assistant over MQTT, mqtt://user:pass@host:1883 -> OWL_MQTT_URL in .env
 #                          (the dsp role publishes HA discovery for every control). Or write
 #                          /var/lib/owl-node/mqtt.json {host, port, username, password} instead; neither = bridge off
@@ -62,13 +66,13 @@
 # Never touches the host's PipeWire/WirePlumber daemons or their config.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.8.0 MQTT_URL=""
-TX=() RX=() VTX=() VRX=() VDEV=() DRY=0 REMOVE=0 ENABLE="" START=1 REPLACE_N1=0 YES=0 MODE="" BUILD=auto PTP_UDP=""
+NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.9.0 MQTT_URL=""
+TX=() RX=() VTX=() VRX=() VDEV=() DRY=0 REMOVE=0 ENABLE="" START=1 REPLACE_N1=0 YES=0 MODE="" BUILD=auto PTP_UDP="" RESTORE_FROM=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME="$2"; shift 2;; --label) LABEL="$2"; shift 2;; --area) AREA="$2"; shift 2;;
     --roles) ROLES="$2"; shift 2;; --media-if) MEDIA_IF="$2"; shift 2;; --phc-if) PHC_IF="$2"; shift 2;;
-    --ptp-udp) PTP_UDP=1; shift;; --no-ptp-udp) PTP_UDP=0; shift;;
+    --ptp-udp) PTP_UDP=1; shift;; --no-ptp-udp) PTP_UDP=0; shift;; --restore-from) RESTORE_FROM="$2"; shift 2;;
     --registry) REGISTRY="$2"; shift 2;; --ptp) PTP="$2"; shift 2;; --image) IMAGE="$2"; shift 2;; --mqtt) MQTT_URL="$2"; shift 2;;
     --tx) TX+=("$2"); shift 2;; --rx) RX+=("$2"); shift 2;;
     --vtx) VTX+=("$2"); shift 2;; --vrx) VRX+=("$2"); shift 2;; --video-dev) VDEV+=("$2"); shift 2;;
@@ -215,6 +219,14 @@ fi
 case "$PTP" in keep|grandmaster|backup|follower|none) ;; *) echo "--ptp must be keep, grandmaster, backup, follower or none" >&2; exit 2;; esac
 if [ "$PTP" = none ] && [ "$PHC_IF" != none ]; then PHC_IF=none; PHC_DEV=/dev/null; fi
 if [ -z "$PTP_UDP" ]; then [ -e "$PTP_UDP_UNIT" ] && PTP_UDP=1 || PTP_UDP=0; fi        # keep what is installed
+if [ -n "$RESTORE_FROM" ]; then
+  [ $HUB = 1 ] || { echo "--restore-from is for a hub (it restores the previous hub's designs and nodes)" >&2; exit 2; }
+  [ "$START" = 1 ] || { echo "--restore-from needs the hub started (drop --no-start)" >&2; exit 2; }
+  # read a file now (as this user, before anything is reinstalled); a node address is fetched once the hub runs
+  if [ -f "$RESTORE_FROM" ]; then
+    RESTORE_FILE=$(mktemp); cp "$RESTORE_FROM" "$RESTORE_FILE" 2>/dev/null || sudo cat "$RESTORE_FROM" > "$RESTORE_FILE"
+  fi
+fi
 if [ "$PTP_UDP" = 1 ]; then
   [ $HUB = 1 ] || { echo "--ptp-udp is for the hub (the house's grandmaster)" >&2; exit 2; }
   [ "$PHC_IF" != none ] || { echo "--ptp-udp needs a PTP hardware clock" >&2; exit 2; }
@@ -476,6 +488,38 @@ if [ "$START" = 1 ]; then
     run sudo systemctl restart owl-node-ptpstat.service
   fi
   compose up -d --remove-orphans
+  if [ -n "$RESTORE_FROM" ] && [ "$DRY" = 0 ]; then
+    say "restoring the previous hub's backup from $RESTORE_FROM"
+    python3 - "$RESTORE_FROM" "${RESTORE_FILE:-}" <<'PY' || { echo "restore failed: run it again later with: owl-node/install.sh --hub --restore-from $RESTORE_FROM" >&2; exit 1; }
+import json, sys, time, urllib.request
+src, path = sys.argv[1], sys.argv[2]
+def get(url, timeout=5):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read())
+for _ in range(90):                     # the dsp role answers once its container is up
+    try:
+        get("http://127.0.0.1:8362/healthz", 2)
+        break
+    except Exception:
+        time.sleep(2)
+else:
+    sys.exit("the hub's dsp role did not come up on :8362")
+if path:
+    bundle = json.load(open(path))
+else:
+    url = src if "://" in src else "http://" + src
+    if url.count(":") < 2:
+        url += ":8362"
+    bundle = get(url.rstrip("/") + "/api/dsp/hub-backup", 10)
+req = urllib.request.Request("http://127.0.0.1:8362/api/dsp/restore", data=json.dumps({"backup": bundle}).encode(),
+                             method="POST", headers={"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=120) as r:
+    res = json.loads(r.read())
+print(f"restored hub {res.get('from_hub')!r}'s backup ({', '.join(res.get('restored') or [])}); "
+      f"nodes: {json.dumps(res.get('nodes') or {})}; deploy: {json.dumps(res.get('deploy'))}")
+PY
+    [ -n "${RESTORE_FILE:-}" ] && rm -f "$RESTORE_FILE"
+  fi
 fi
 echo "$([ $DRY = 1 ] && echo "[dry-run] would install" || echo installed) owl-node $NAME: roles=$ROLES media=$MEDIA_IF ($IP) phc=$PHC_IF ptp=$PTP$([ "$PTP_UDP" = 1 ] && echo "+udpv4")" \
      "registry=${REGISTRY:-paired-by-hub} $([ "$KEEP_STREAMS" = 1 ] && echo "streams=kept from the existing node.yaml" || echo "senders=${#TX[@]} receivers=${#RX[@]} video senders=${#VTX[@]} video receivers=${#VRX[@]}")" \

@@ -611,6 +611,46 @@ class Deployer:
         self._raw_applied = applied
         return changes
 
+    def _rx_override(self, rid):
+        """The latency override an owl-node reports for one of its receivers (its /x-owl/v1/status), or '?' unknown."""
+        nst = (self.inv.nmos or {}).get("status") or {}
+        for st in nst.values():
+            r = ((st or {}).get("receivers") or {}).get(rid)
+            if r is not None:
+                return r.get("latency_override")
+        return "?"
+
+    def _apply_latency(self, desired, force=False):
+        """Receivers' playout latency (design / wire latency_ms) on their nodes; receivers a previous design set and
+        this one does not go back to their node's default. Best effort: a node that is down is retried by reconcile."""
+        changes, applied = [], {}
+        before = dict(self.state.get("rx_latency") or {})
+        want = dict(getattr(desired, "rx_latency", None) or {})
+        for rid in set(before) | set(want):
+            ms = want.get(rid)
+            cur = self._rx_override(rid)
+            if not force and cur != "?" and cur == ms:
+                if ms is not None:
+                    applied[rid] = ms
+                continue
+            if not force and cur == "?" and before.get(rid) == ms:
+                if ms is not None:
+                    applied[rid] = ms
+                continue
+            try:
+                code, resp = self.ctl.set_receiver_latency(rid, ms)
+            except Exception as e:
+                code, resp = 0, str(e)
+            if code == 200:
+                if ms is not None:
+                    applied[rid] = ms
+                changes.append(f"receiver {rid[:8]} latency " + (f"{ms:g} ms" if ms is not None else "back to its node's default"))
+            else:
+                applied[rid] = before.get(rid)           # not done (node down?): kept as it was, reconcile retries
+                self.event(f"latency of receiver {rid[:8]} not set (HTTP {code} {str(resp)[:120]}); retrying")
+        self.state["rx_latency"] = {k: v for k, v in applied.items() if v is not None}
+        return changes
+
     def _apply_patches(self, desired, owned_before, adopted):
         changes = []
         self.inv.refresh(0)
@@ -777,6 +817,7 @@ class Deployer:
                 changes = self._apply_patches(new, owned_patches_before, adopted)
                 self._sync_mediamtx(new, refresh_pins=(reason == "deploy"))
                 changes += self._apply_raw_patches(new)
+                changes += self._apply_latency(new)
                 rx_nodes = [(self.inv.receivers[r].get("tags") or {}).get("urn:x-owl:pipewire-node", [None])[0]
                             for r in list(new.patches) + list(new.raw_patches)
                             if r in self.inv.receivers and r in {x["id"] for x in self.inv.hub_receivers}]
@@ -798,6 +839,7 @@ class Deployer:
                 changes += mv_changes
                 self.state = {"links": owned, "patches": dict(new.patches), "alloc": dict(new.alloc),
                               "tx_alloc": dict(new.tx_alloc), "procs": sorted(new.procs),
+                              "rx_latency": dict(self.state.get("rx_latency") or {}),
                               "taps": sorted(taps), "adopted": [], "deployed_at": time.time(), "name": design.get("name"),
                               "moves": mv_rec, "aliases": self.state.get("aliases") or {}, "shares": shares,
                               "raw_patches": dict(getattr(self, "_raw_applied", {}) or {}),
@@ -938,6 +980,15 @@ class Deployer:
             except Exception:
                 return
             now = time.time()
+            if (self.desired.rx_latency or self.state.get("rx_latency")) and now >= getattr(self, "lat_next", 0):
+                self.lat_next = now + 15
+                want = self.desired.rx_latency or {}
+                if any(self._rx_override(r) not in ("?", want.get(r)) for r in set(want) | set(self.state.get("rx_latency") or {})) \
+                        or any(self.state.get("rx_latency", {}).get(r) != v for r, v in want.items()):
+                    ch = self._apply_latency(self.desired)
+                    atomic_write(STATE, self.state)
+                    if ch:
+                        self.event("receiver latency: " + "; ".join(ch))
             for rid, sid in self.desired.patches.items():
                 if rid not in self.inv.receivers:
                     continue                     # the node is gone (satellite down); nothing to patch yet

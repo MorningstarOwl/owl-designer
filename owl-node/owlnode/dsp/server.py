@@ -24,11 +24,14 @@ D2, named controls:
   GET  /api/dsp/mqtt                the HA bridge's state (broker, entities, errors; never the password)
   GET  /api/dsp/previews            which MediaMTX preview paths are live (for the HA add-on's designer)
   GET  /api/dsp/sap                 AES67 streams announced over SAP (Dante, ...), with their SDPs (OWL_SAP=off: none)
+  GET  /api/dsp/backup              this hub's backup bundle (backup.py); it is also pushed to every satellite
+  POST /api/dsp/restore             {backup}: restore a bundle on this hub (re-pairs the nodes, re-applies the design)
 D3, satellites (a node without the hub role runs this server in satellite mode: the PipeWire executor of its share,
 see satellite.py; the hub's dsp finds it on :8362 through the registry):
   GET  /api/dsp/graph               this host's PipeWire graph for the hub's inventory
   GET  /api/dsp/share               PUT /api/dsp/share {share}      POST /api/dsp/control {set, procs}   POST /api/dsp/clear
   GET  /api/dsp/status              {mode: satellite, share, procs, wires, taps, events}
+  GET  /api/dsp/hub-backup          PUT /api/dsp/hub-backup {bundle}: the latest backup of the hub (for a replacement hub)
 """
 import json, os, signal, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,7 +42,7 @@ from ..config import atomic_write, read_json
 from ..controller import Controller
 from . import blocks as B
 from .controls import Controls
-from .deploy import DRAFT, DeployError, Deployer
+from .deploy import DESIGN, DRAFT, DeployError, Deployer
 from .inventory import Inventory
 from .meters import Taps
 from .mqtt import Bridge
@@ -49,6 +52,8 @@ from .ws import Session
 from .nodes import NodeBook, NodeError
 from . import probe as P
 from . import sap as SAP
+from . import backup as BK
+from .satellite import http as sat_http
 
 
 def log(*a):
@@ -90,6 +95,9 @@ class SatHandler(BaseHTTPRequestHandler):
                 return self._send(200, {"share": self.sd.share, "applied_at": self.sd.applied_at, "error": self.sd.error})
             if p == "/api/dsp/palette":
                 return self._send(200, {"types": sorted(B.load())})
+            if p == "/api/dsp/hub-backup":
+                b = BK.stored()
+                return self._send(200, b) if b else self._send(404, {"error": "no hub backup stored here yet"})
         except Exception as e:
             return self._send(500, {"error": f"{type(e).__name__}: {e}"})
         self._send(404, {"error": "not found (satellite dsp role)"})
@@ -125,6 +133,8 @@ class SatHandler(BaseHTTPRequestHandler):
                 return self._send(200, dict({"ok": True, "host": self.sd.cfg.name, "version": VERSION}, **self._identity()))
             if p == "/api/dsp/share":
                 return self._send(200, self.sd.apply(b.get("share") if "share" in b else b))
+            if p == "/api/dsp/hub-backup":
+                return self._send(200, BK.store(b))
         except (KeyError, ValueError, TypeError) as e:
             return self._send(400, {"ok": False, "error": f"bad request: {e}"})
         except Exception as e:
@@ -200,6 +210,7 @@ class Handler(BaseHTTPRequestHandler):
                 st["voice"] = self.ctl.voice.status() if self.ctl.voice else None
                 st["probes"] = P.active()
                 st["sap"] = self.sap.status() if self.sap else {"enabled": False}
+                st["backup"] = {"pushed": BACKUP_PUSHED}
                 st["ws_clients"] = Handler.ws_clients
                 st["controls_version"] = self.ctl.version
                 return self._send(200, st)
@@ -218,6 +229,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.mqtt.status() if self.mqtt else {"enabled": False})
             if p == "/api/dsp/nodes":
                 return self._send(200, self._nodes())
+            if p == "/api/dsp/backup":
+                return self._send(200, BK.make(self.dep.cfg.name))
             if p == "/api/dsp/sap":
                 if not self.sap:
                     return self._send(200, {"enabled": False, "streams": []})
@@ -303,6 +316,33 @@ class Handler(BaseHTTPRequestHandler):
                         "transport": {k: len(v) for k, v in (inv.node_transport.get(host) or {}).items()}})
         return {"hub": self.dep.cfg.name, "registry": self._registry_url(), "nodes": out, "removed": sorted(self.book.removed)}
 
+    def _restore(self, bundle):
+        """A hub backup -> this hub: files, nodes re-paired with this hub's registry, design re-applied."""
+        hub = self.dep.cfg.name
+        summary = BK.restore(bundle, hub)
+        book = NodeBook()
+        Handler.book = self.inv.book = book
+        me = {self.dep.cfg.ip, self._public_host().rsplit(":", 1)[0], "127.0.0.1", "localhost", hub}
+        paired = {}
+        for e in book.entries():
+            try:
+                r = book.add(e["url"], hub, self._registry_url(), self._hub_url(), me)
+                paired[e["host"]] = "paired" if r.get("paired") else f"added, not paired: {r.get('pair_error')}"
+            except NodeError as err:
+                paired[e["host"]] = f"not reachable now: {err}"
+        summary["nodes"] = paired
+        design = read_json(DESIGN, None)
+        if design:
+            self.inv.time = 0
+            try:
+                self.inv.refresh(0)
+                r = self.dep.apply(design, rollback=False, reason="restore", strict=False)
+                summary["deploy"] = {"ok": True, "pending": sorted((r or {}).get("pending") or [])}
+            except DeployError as err:
+                summary["deploy"] = {"ok": False, "error": str(err)}
+        log(f"restored the backup of hub {summary['from_hub']!r}: {', '.join(summary['restored'])}; nodes {paired}")
+        return dict(summary, ok=True)
+
     def do_DELETE(self):
         p = urlsplit(self.path).path
         try:
@@ -334,6 +374,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.inv.time = 0
                 log(f"node {r['host']} added by address ({r['url']}, owl-node {r.get('version')}, paired: {r['paired']})")
                 return self._send(200, r)
+            if p == "/api/dsp/restore":
+                return self._send(200, self._restore(b.get("backup") if "backup" in b else b))
             if p == "/api/dsp/plan":
                 design = b.get("design") or b
                 r = self.dep.plan(design, strict=not b.get("allow_missing"))
@@ -436,6 +478,7 @@ def main():
                 log(f"reconcile: {type(e).__name__}: {e}")
             time.sleep(2)
     threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=push_backups, args=(cfg, inv, stopping), daemon=True).start()
     try:
         srv.serve_forever()
     finally:
@@ -445,6 +488,32 @@ def main():
         controls.stop()
         dep.stop()
         log("stopped")
+
+
+BACKUP_PUSHED = {}       # satellite host -> {digest, at, error}: GET /api/dsp/status shows it
+
+
+def push_backups(cfg, inv, stopping, every=30):
+    """Keep the hub's backup on every satellite dsp role it talks to (sent when it changed or the satellite lacks it)."""
+    while not stopping:
+        try:
+            bundle = BK.make(cfg.name)
+            dig = BK.digest(bundle)
+            for host, c in list(inv.sats.items()):
+                if not c.ok or (BACKUP_PUSHED.get(host) or {}).get("digest") == dig:
+                    continue
+                try:
+                    code, r = sat_http("PUT", f"{c.url}/api/dsp/hub-backup", bundle, timeout=5)
+                    BACKUP_PUSHED[host] = {"digest": dig if code == 200 else None, "at": time.time(),
+                                           "error": None if code == 200 else f"HTTP {code} (owl-node there older than 0.8?)"}
+                except Exception as e:
+                    BACKUP_PUSHED[host] = {"digest": None, "at": time.time(), "error": f"{type(e).__name__}: {e}"}
+        except Exception as e:
+            log(f"backup push: {type(e).__name__}: {e}")
+        for _ in range(every):
+            if stopping:
+                return
+            time.sleep(1)
 
 
 def satellite_main(cfg):

@@ -32,6 +32,7 @@ side effects."""
 from . import blocks as B
 
 NO_WIRE = object()
+MIN_LATENCY_MS, MAX_LATENCY_MS = 1.0, 500.0     # the agent's limits for a receiver's playout latency
 
 
 class CompileError(Exception):
@@ -61,6 +62,7 @@ class Desired:
         self.voice_wires = {}        # wire id -> the hub node it names (the assistant's listen source / reply target)
         self.rtsp_video = {}         # RTSP blocks with video: block id -> {url, path, latency_ms, codec, label} (MediaMTX)
         self.raw_patches = {}        # receiver id -> {block, path, label, latency_ms, wire}: IS-05 patch with our own SDP
+        self.rx_latency = {}         # owl AES67 receiver id -> playout latency (ms) the design sets (else the node's own)
 
     def share(self, host, design_name):
         return self.shares.setdefault(host, new_share(host, design_name))
@@ -535,8 +537,24 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True, p
         d.voice_wires[wid] = dst["node"]
         return f"voice assistant replies play into {dst['node']}"
 
+    def latency_of(obj, what):
+        v = obj.get("latency_ms")
+        if v in (None, ""):
+            return None
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            d.errors.append(f"{what}: latency_ms {v!r} is not a number")
+            return None
+        if not MIN_LATENCY_MS <= v <= MAX_LATENCY_MS:
+            d.errors.append(f"{what}: latency_ms {v:g} is outside {MIN_LATENCY_MS:g}..{MAX_LATENCY_MS:g} ms")
+            return None
+        return v
+    design_latency = latency_of(design, "design")
+    wire_latency = {}
     for w in design.get("wires") or []:
         wid = w.get("id") or f"{w.get('from')}->{w.get('to')}"
+        wire_latency[wid] = latency_of(w, f"wire {wid}")
         del absent[:]
         src, dst = endpoint(w.get("from"), "from"), endpoint(w.get("to"), "to")
         if not src or not dst:
@@ -700,6 +718,22 @@ def compile_design(design, inv, types, prev_alloc=None, hub=None, strict=True, p
     mixed(d.links, " on the hub")
     for host, sh_ in d.shares.items():
         mixed(sh_["links"], f" on {host}")
+    # playout latency of the owl AES67 receivers the design uses: the wire's own setting, else the design's; a receiver
+    # carrying several wires (channel slots, one stream) has one latency: the largest asked for
+    owl_rx = set(hub_rx_pool) | {r["id"] for tr in transport.values() for r in tr.get("receivers") or []}
+    for wid, rid in d.wire_patch.items():
+        if rid not in owl_rx:
+            continue
+        v = wire_latency.get(wid) if wire_latency.get(wid) is not None else design_latency
+        if v is None:
+            continue
+        if rid in d.rx_latency and d.rx_latency[rid] != v:
+            d.warnings.append(f"wire {wid}: its receiver also carries a wire with latency {d.rx_latency[rid]:g} ms; one "
+                              f"stream has one latency, so it gets {max(v, d.rx_latency[rid]):g} ms")
+        d.rx_latency[rid] = max(v, d.rx_latency.get(rid, 0))
+    for wid, rid in d.wire_patch.items():
+        if rid in d.rx_latency and wid in d.wire_impl:
+            d.wire_impl[wid].append(f"receiver playout latency {d.rx_latency[rid]:g} ms")
     if d.voice and not d.voice["mic"]:
         d.warnings.append(f"the voice assistant ({d.voice['label']}) has nothing wired into 'listen': it cannot hear anything")
     if d.voice and not d.voice["reply"]:

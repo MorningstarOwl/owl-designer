@@ -5,7 +5,7 @@ DSP compiler/deployer, the APIs, the Wyoming voice satellite, video, the install
 Findings come from reading the code; nothing was built or run (the repository has no tests to run).
 
 Status: **section 1 (security) is deferred**; **section 2 (bugs) is fixed in 0.7.3**; **section 3 items 1-2 are done in
-0.8.0** (see the notes under each item).
+0.8.0, items 4 and 7 in 0.9.0; items 3, 5 and 6 are designed below, not built** (see the notes under each item).
 
 ## 1. Security (deferred)
 
@@ -72,12 +72,44 @@ Status: **section 1 (security) is deferred**; **section 2 (bugs) is fixed in 0.7
    UDPv4 PTP instance for Dante gear (opt-in rather than default: it needs the PHC on the media interface, and the L2
    nodes are unaffected). Not yet tried against a real Dante device.
 3. ST 2022-7 dual-network redundancy (only the first SDP leg is parsed today).
+   *Designed, not built:* it needs two network ports per machine and two switches, which a house rarely has, and
+   nothing here could test it. PipeWire cannot merge two copies of a stream, so the plan is a small C relay per
+   machine (like `owlrtpstat`): on send, copy each RTP packet of the sender's leg A out of the second NIC to group B;
+   on receive, join both legs, keep the first copy of each sequence number in a reorder window of the path difference,
+   and feed the result to `rtp-source` on loopback. The agent then advertises two legs (`transport_params` x 2,
+   `a=group:DUP` SDPs; the controller already sizes legs from the receiver's constraints) and `rtpstat` reports loss
+   per leg. Worth building when a household or installer asks for it with the hardware to test on.
 4. Per-flow latency and aligned multi-room playout (depends on bug 4).
-   Next: a per-receiver latency setting from the designer.
+   *Done (0.9.0):* a design-wide **Network latency** and a per-wire override in the designer; the compiler gives each
+   owl receiver one latency (the largest of its wires'), the deployer sets it on the node through an owl extension
+   (`PATCH /x-owl/v1/receivers/<id> {latency_ms}`, kept in `state.json`, used by the audio role's `rtp-source`) and
+   clears it when a design drops it. Equal latencies line rooms up to within the adaptive playout's slack;
+   sample-exact alignment still needs timestamp-locked playout (bug 4), on real hardware.
 5. NMOS IS-07 (events for panels/buttons), IS-08, IS-11, IS-12; an IPMX roadmap for video.
+   *Designed, not built:* each needs a consumer to be worth its weight, and none is in this system yet; Home Assistant
+   already gets every control and meter over MQTT. In order of value: **IS-08** on each agent, mapping its sources'
+   channels to its senders' channels, would let third-party NMOS controllers see and change the channel slots item 1
+   allocates (the hub compiler stays the main controller; the agent would apply IS-08 activations as PipeWire links,
+   which today only the hub's share mechanism makes). **IS-07** (REST + WebSocket on the hub's dsp role) would publish
+   named controls and meters as NMOS event sources for hardware panels and tally. **IS-11** matters for video sinks
+   with EDID (NVX-style displays), **IS-12** for third-party control surfaces. Each should be developed against the AMWA
+   NMOS testing tool, which the README's "Testing it without the hosts" already uses for IS-04/05.
 6. Video, NVX-style: HDMI audio de-embed/embed, multiview, a scalable video routing model.
+   *Designed, not built:* everything here needs capture hardware and decoders to develop against. **HDMI audio
+   de-embed** likely works already: most USB HDMI capture sticks are also a USB sound card, which appears as a device
+   block on the canvas like any other (to confirm with the household's stick); a convenience "audio follows video"
+   pairing in the designer would come next. **Embedding** audio into a video sender means muxing an audio branch into
+   `vpipe`'s MPEG-TS/RTP output. **Multiview** is a `compositor` in a decoder node's `vpipe` with N SRT callers, so a
+   video receiver becomes N receivers plus a layout. A scalable routing model (several streams per decoder, scaling,
+   switching without black frames) follows from multiview.
 7. The hub is a single point of failure (registry, engine, PTP grandmaster): a standby hub, or documented degraded
    behaviour.
+   *Done (0.9.0):* the hub pushes its backup (design, previous design, draft, nodes, wake-word switch, MQTT settings
+   without the password) to every satellite within ~30 s of a change; `install.sh --hub --restore-from <node | file>`
+   restores it on a replacement hub or a promoted node, moves references to the old hub's devices to the new name,
+   re-pairs every node and re-applies the design. The README's "If the hub fails" says what keeps running meanwhile
+   (node-to-node streams, and with `--ptp backup` the clock). A hot standby (two hubs, automatic takeover) is left out
+   on purpose: two engines must never deploy at once, and the manual swap covers a house.
 
 ## 4. Performance and reliability
 

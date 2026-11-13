@@ -150,7 +150,8 @@ def tx_conf(n, s, tp):
 """
 
 
-def rx_conf(n, r, a):
+def rx_conf(n, r, a, latency_ms=None):
+    """latency_ms: the designer's setting for this receiver (agent x-owl/v1/receivers), else node.yaml's."""
     tp = a["transport_params"][0]
     f = a.get("format") or {}
     enc = f.get("encoding") or "L24"
@@ -162,7 +163,7 @@ def rx_conf(n, r, a):
             local.ifname = {esc(n.media_if)}
             source.ip = {esc(tp['multicast_ip'])}
             source.port = {int(tp.get('destination_port') or 5004)}
-            sess.latency.msec = {r['latency_ms']:g}
+            sess.latency.msec = {latency_ms if latency_ms is not None else r['latency_ms']:g}
             sess.ts-direct = {str(TS_DIRECT[0]).lower()}
             sess.ignore-ssrc = true
             audio.format = "{'S24BE' if enc == 'L24' else 'S16BE'}"
@@ -323,7 +324,7 @@ def main():
                 continue
             tp = a["transport_params"][0]
             if a.get("master_enable") and tp.get("rtp_enabled") and tp.get("multicast_ip"):
-                want[f"rx-{r['key']}"] = rx_conf(n, r, a)
+                want[f"rx-{r['key']}"] = rx_conf(n, r, a, (st.get("receiver_latency") or {}).get(r["key"]))
         for name in list(procs):
             if name not in want or procs[name].conf != want[name]:
                 procs.pop(name).stop()

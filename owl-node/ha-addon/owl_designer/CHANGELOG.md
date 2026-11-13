@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.0
+- Designer: **Network latency** in the Design panel (how long receivers buffer streams between machines; one value
+  keeps rooms in step) and a latency per wire in its inspector (needs owl-node 0.9.0 on the hub and the nodes).
+- Engine (owl-node 0.9.0): every node keeps a backup of the hub; `install.sh --hub --restore-from <node>` brings the
+  designs, panels, presets and nodes back on a replacement hub.
+
 ## 0.8.0
 - Designer: AES67 streams that Dante devices (AES67 mode) and other AES67 gear announce on the network appear as
   sources, with each channel pair of a multichannel flow as its own output (needs the hub on owl-node 0.8.0).
