@@ -13,12 +13,12 @@ ptp.offset_ns, registry.nodes (read-only).
 
 Everything that changes a value goes through Controls.set(): the designer (HTTP/WebSocket), MQTT, presets. The Bus
 fans each change out to every subscriber (WebSocket sessions, the MQTT bridge)."""
-import copy, queue, threading, time
+import queue, threading, time
 
 from . import blocks as B
 from .deploy import DeployError
 
-FADE_STEP_S = 0.04
+FADE_STEP_S = 0.01          # 10 ms steps: a step is a line to the long-lived pw-cli (pw.PwCtl), so smooth is cheap
 
 
 class Bus:
@@ -64,6 +64,9 @@ class Controls:
         self.version = 0                   # bumps when the set of controls changes (design deployed/edited)
         self.voice = None                  # D3: the PTT voice satellite (voice.py), set by the server in hub mode
         self._design_sig = None
+        self.health = None                 # health.Health, set by the server (hub mode)
+        self.sounds = None                 # sounds.Library and sounds.Player, set by the server (hub mode)
+        self.player = None
         self._cache = None
         dep.on_change = self._on_deployer_change
 
@@ -83,7 +86,9 @@ class Controls:
     def refresh(self, force=False):
         with self.lock:
             d = self.dep.design or {}
-            sig = (id(d), len(d.get("blocks", [])), tuple(sorted(f"{b['id']}:{b.get('label')}:{b.get('type')}" for b in d.get("blocks", []))),
+            # the shape of the controls (values are read live, _live): a live change replaces the design object, which
+            # must not rebuild the listing and bump the version at every fader step
+            sig = (tuple(self.sounds.names()) if self.sounds else (), len(d.get("blocks", [])), tuple(sorted(f"{b['id']}:{b.get('label')}:{b.get('type')}" for b in d.get("blocks", []))),
                    len(d.get("presets") or []), tuple(p.get("name") for p in d.get("presets") or []))
             if not force and self._cache is not None and sig == self._design_sig:
                 return self._cache
@@ -108,11 +113,19 @@ class Controls:
                     c = {"key": key, "name": f"{base}.{pid}", "block": b["id"], "block_label": lbl, "block_type": bt.type,
                          "param": pid, "label": spec.get("label") or pid, "type": spec.get("type", "number"),
                          "live": bool(spec.get("live")), "value": params.get(pid), "kind": "param"}
+                    if c["type"] == "sound":             # which library sound: a select of the library (HA select too)
+                        c["type"], c["options"] = "select", self.sounds.names() if self.sounds else []
                     for k in ("min", "max", "step", "unit", "options", "help"):
                         if k in spec:
                             c[k] = spec[k]
                     if c["type"] == "number" and "unit" not in c and pid.endswith("_db"):
                         c["unit"] = "dB"
+                    by_key[key] = c
+                    by_name[c["name"]] = c
+                for t in bt.raw.get("triggers") or []:   # a Sound player's Play / Stop: buttons
+                    key = f"{b['id']}.{t['id']}"
+                    c = {"key": key, "name": f"{base}.{t['id']}", "block": b["id"], "block_label": lbl, "block_type": bt.type,
+                         "label": t.get("label") or t["id"], "type": "trigger", "live": True, "kind": "trigger", "action": t["id"]}
                     by_key[key] = c
                     by_name[c["name"]] = c
                 ports = bt.ports(params)
@@ -208,10 +221,12 @@ class Controls:
         ptp = hub_st.get("ptp") or {}
         nodes = (self.inv.nmos or {}).get("nodes") or []
         state = "none" if not d else "error" if self.dep.design_error else "ok"
+        h = self.health.check() if self.health else {"ok": True, "issues": []}
         return {"design.name": d.get("name") or "", "design.state": state, "design.error": self.dep.design_error or "",
                 "design.deployed_at": self.dep.state.get("deployed_at"),
                 "ptp.state": ptp.get("port_state") or "unknown", "ptp.offset_ns": ptp.get("offset_ns"),
-                "registry.nodes": len(nodes), "registry.error": self.inv.error or "", "dsp.repairs": self.dep.repairs}
+                "registry.nodes": len(nodes), "registry.error": self.inv.error or "", "dsp.repairs": self.dep.repairs,
+                "health.ok": h["ok"], "health.issues": [i["text"] for i in h["issues"]]}
 
     def listing(self):
         c = self.refresh()
@@ -243,6 +258,14 @@ class Controls:
             return self.recall(value, source=source)
         if c["kind"] == "meter":
             raise DeployError(f"{c['name']} is a meter (read-only)")
+        if c["kind"] == "trigger":
+            if not self.player:
+                raise DeployError("no sound player on this hub")
+            from .sounds import SoundError
+            try:
+                return dict(self.player.trigger(c["block"], c["action"], source=source), key=c["key"], name=c["name"])
+            except SoundError as e:
+                raise DeployError(str(e))
         if c["kind"] == "voice":
             try:
                 if c["field"] == "ptt":
@@ -387,21 +410,22 @@ class Controls:
 
 
 class Fade(threading.Thread):
-    """Linear ramp of one live numeric control over fade_s (40 ms steps); the last step persists the design."""
+    """Linear ramp of one live numeric control over fade_s (FADE_STEP_S steps, in the control's own unit: dB for a
+    gain, so the ramp sounds even); the last step persists the design."""
 
     def __init__(self, controls, c, start, end, secs, source):
         super().__init__(daemon=True)
         self.ctl, self.c, self.start_v, self.end_v, self.secs, self.source = controls, c, start, end, max(0.05, secs), source
-        self._stop = threading.Event()
+        self._halt = threading.Event()
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
     def run(self):
         t0 = time.time()
         n = max(1, int(self.secs / FADE_STEP_S))
         for i in range(1, n + 1):
-            if self._stop.is_set():
+            if self._halt.is_set():
                 return
             v = self.start_v + (self.end_v - self.start_v) * i / n
             if self.c["type"] == "int":
@@ -410,7 +434,7 @@ class Fade(threading.Thread):
                 self.ctl.dep.set_param(self.c["block"], self.c["param"], v, persist=(i == n), source=self.source, quiet=(i < n))
             except DeployError:
                 return
-            if i % 5 == 0 and i < n:
+            if i % max(1, round(0.2 / FADE_STEP_S)) == 0 and i < n:          # the UI and HA: 5 updates a second
                 self.ctl.bus.publish({"type": "control", "key": self.c["key"], "name": self.c["name"], "value": v, "source": self.source, "fading": True})
             time.sleep(max(0, t0 + i * self.secs / n - time.time()))
         with self.ctl.lock:

@@ -38,13 +38,16 @@ def _is_ip(v):
 
 
 class Endpoint:
-    def __init__(self, kind, cfg, node, saved=None):
+    def __init__(self, kind, cfg, node, saved=None, lock=None):
         self.kind, self.cfg, self.node = kind, cfg, node
         # audio: RTP (AES67). video: SRT (N3, H.265/H.264), or RTP over UDP (N4 JPEG XS, cfg transport "rtp")
         self.transport = cfg.get("transport") or ("srt" if cfg.get("kind") == "video" else "rtp")
         self.video = cfg.get("kind") == "video"
         self.id, self.key = cfg["id"], cfg["key"]
-        self.lock = threading.RLock()
+        # One lock per NODE, shared by all its endpoints (the agent passes it): an activation calls on_activate, which
+        # persists every endpoint's active state; with a lock per endpoint, two activations at once (scheduled ones
+        # sharing a requested_time, or two PATCHes) each held their own lock and waited for the other's forever.
+        self.lock = lock or threading.RLock()
         self.timer = None
         ip = node.ip or "0.0.0.0"
         if self.transport == "srt":

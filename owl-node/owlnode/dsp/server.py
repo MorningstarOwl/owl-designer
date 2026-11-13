@@ -22,13 +22,27 @@ D2, named controls:
   GET  /api/dsp/presets             POST /api/dsp/presets {name, keys|values, fade_s, id?}   DELETE /api/dsp/presets/<id>
   POST /api/dsp/presets/recall      {preset, fade_s?}
   GET  /api/dsp/mqtt                the HA bridge's state (broker, entities, errors; never the password)
+  GET  /api/dsp/previews            which MediaMTX preview paths are live (for the HA add-on's designer)
+  GET  /api/dsp/sap                 AES67 streams announced over SAP (Dante, ...), with their SDPs (OWL_SAP=off: none)
+  POST /api/dsp/inject              {block, port, kind, level_db, freq_hz, duration_s}: a test signal into an input
+                                    (inject.py; on a satellite's port, that satellite plays it); POST .../<id> {level_db};
+                                    DELETE .../<id>; GET /api/dsp/inject: what plays now
+  GET  /api/dsp/sounds              the sound library (sounds.py); POST /api/dsp/sounds?name=<file> {the file} adds one;
+                                    GET .../<name>/file; DELETE .../<name>. A Sound player block plays one on <block>.play
+  GET  /api/dsp/health              what needs attention (PTP, packet loss, restarts, nodes; health.py)
+  GET  /metrics                     Prometheus metrics of the whole system (health.py)
+  GET  /api/dsp/history             the last deployed designs; GET /api/dsp/history/<id> one of them
+  GET  /api/dsp/backup              this hub's backup bundle (backup.py); it is also pushed to every satellite
+  POST /api/dsp/restore             {backup}: restore a bundle on this hub (re-pairs the nodes, re-applies the design)
 D3, satellites (a node without the hub role runs this server in satellite mode: the PipeWire executor of its share,
 see satellite.py; the hub's dsp finds it on :8362 through the registry):
   GET  /api/dsp/graph               this host's PipeWire graph for the hub's inventory
   GET  /api/dsp/share               PUT /api/dsp/share {share}      POST /api/dsp/control {set, procs}   POST /api/dsp/clear
   GET  /api/dsp/status              {mode: satellite, share, procs, wires, taps, events}
+  GET  /api/dsp/hub-backup          PUT /api/dsp/hub-backup {bundle}: the latest backup of the hub (for a replacement hub)
 """
-import json, os, signal, sys, threading, time
+import json, os, signal, sys, threading, time, urllib.error
+from urllib.parse import parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
@@ -37,7 +51,7 @@ from ..config import atomic_write, read_json
 from ..controller import Controller
 from . import blocks as B
 from .controls import Controls
-from .deploy import DRAFT, DeployError, Deployer
+from .deploy import DESIGN, DRAFT, DeployError, Deployer
 from .inventory import Inventory
 from .meters import Taps
 from .mqtt import Bridge
@@ -46,6 +60,12 @@ from .voice import Voice
 from .ws import Session
 from .nodes import NodeBook, NodeError
 from . import probe as P
+from . import sap as SAP
+from . import backup as BK
+from . import health as HL
+from . import inject as INJ
+from . import sounds as SND
+from .satellite import http as sat_http
 
 
 def log(*a):
@@ -55,6 +75,7 @@ def log(*a):
 class SatHandler(BaseHTTPRequestHandler):
     """Satellite mode: the executor's API (no designer, no controls, no MQTT)."""
     sd = None
+    injector = INJ.Injector(log=lambda *a: log(*a))
     server_version = "owl-node-dsp/" + VERSION
     protocol_version = "HTTP/1.1"
 
@@ -87,6 +108,11 @@ class SatHandler(BaseHTTPRequestHandler):
                 return self._send(200, {"share": self.sd.share, "applied_at": self.sd.applied_at, "error": self.sd.error})
             if p == "/api/dsp/palette":
                 return self._send(200, {"types": sorted(B.load())})
+            if p == "/api/dsp/inject":
+                return self._send(200, {"injections": self.injector.active()})
+            if p == "/api/dsp/hub-backup":
+                b = BK.stored()
+                return self._send(200, b) if b else self._send(404, {"error": "no hub backup stored here yet"})
         except Exception as e:
             return self._send(500, {"error": f"{type(e).__name__}: {e}"})
         self._send(404, {"error": "not found (satellite dsp role)"})
@@ -99,6 +125,11 @@ class SatHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         p = urlsplit(self.path).path
+        if p.startswith("/api/dsp/inject/"):
+            try:
+                return self._send(200, self.injector.stop(p[len("/api/dsp/inject/"):]))
+            except INJ.InjectError as e:
+                return self._send(404, {"error": str(e)})
         if p == "/api/dsp/pair":
             try:
                 os.unlink(config.HUB_FILE)
@@ -122,6 +153,8 @@ class SatHandler(BaseHTTPRequestHandler):
                 return self._send(200, dict({"ok": True, "host": self.sd.cfg.name, "version": VERSION}, **self._identity()))
             if p == "/api/dsp/share":
                 return self._send(200, self.sd.apply(b.get("share") if "share" in b else b))
+            if p == "/api/dsp/hub-backup":
+                return self._send(200, BK.store(b))
         except (KeyError, ValueError, TypeError) as e:
             return self._send(400, {"ok": False, "error": f"bad request: {e}"})
         except Exception as e:
@@ -134,8 +167,15 @@ class SatHandler(BaseHTTPRequestHandler):
             b = self._body()
             if p == "/api/dsp/control":
                 return self._send(200, self.sd.control(b.get("set") or [], b.get("procs") or {}))
+            if p == "/api/dsp/inject":                  # the hub resolved the canvas port to this node's PipeWire node
+                return self._send(200, self.injector.start(b["node"], b.get("ports"), b.get("label"), b.get("kind") or "white",
+                                                           b.get("level_db", INJ.DEFAULT_DB), b.get("freq_hz") or 1000, b.get("duration_s") or 30))
+            if p.startswith("/api/dsp/inject/"):
+                return self._send(200, self.injector.set_level(p[len("/api/dsp/inject/"):], b["level_db"]))
             if p == "/api/dsp/clear":
                 return self._send(200, self.sd.clear())
+        except INJ.InjectError as e:
+            return self._send(400, {"ok": False, "error": str(e)})
         except Exception as e:
             return self._send(409, {"ok": False, "error": f"{type(e).__name__}: {e}"})
         self._send(404, {"error": "not found"})
@@ -149,6 +189,11 @@ class Handler(BaseHTTPRequestHandler):
     types = None
     ctl = None
     mqtt = None
+    sap = None
+    injector = INJ.Injector(log=lambda *a: log(*a))
+    sounds = None                 # sounds.Library (hub)
+    player = None                 # sounds.Player (hub)
+    inject_remote = {}            # hub id "<host>:<id>" -> (host, the satellite's id)
     ws_clients = 0
     server_version = "owl-node-dsp/" + VERSION
     protocol_version = "HTTP/1.1"
@@ -195,6 +240,8 @@ class Handler(BaseHTTPRequestHandler):
                 st["mqtt"] = self.mqtt.status() if self.mqtt else {"enabled": False}
                 st["voice"] = self.ctl.voice.status() if self.ctl.voice else None
                 st["probes"] = P.active()
+                st["sap"] = self.sap.status() if self.sap else {"enabled": False}
+                st["backup"] = {"pushed": BACKUP_PUSHED}
                 st["ws_clients"] = Handler.ws_clients
                 st["controls_version"] = self.ctl.version
                 return self._send(200, st)
@@ -213,6 +260,38 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.mqtt.status() if self.mqtt else {"enabled": False})
             if p == "/api/dsp/nodes":
                 return self._send(200, self._nodes())
+            if p == "/api/dsp/history":
+                return self._send(200, {"history": self.dep.history()})
+            if p.startswith("/api/dsp/history/"):
+                try:
+                    return self._send(200, self.dep.history_item(unquote(p[len("/api/dsp/history/"):])))
+                except DeployError as e:
+                    return self._send(404, {"error": str(e)})
+            if p == "/api/dsp/inject":
+                return self._send(200, {"injections": self._injections()})
+            if p == "/api/dsp/sounds":
+                return self._send(200, {"sounds": self.sounds.list(), "playing": self.player.status(),
+                                        "limits": {"file_mb": SND.MAX_FILE // 2**20, "total_mb": SND.MAX_TOTAL // 2**20}})
+            if p.startswith("/api/dsp/sounds/") and p.endswith("/file"):
+                return self._sound_file(unquote(p[len("/api/dsp/sounds/"):-len("/file")]))
+            if p == "/api/dsp/health":
+                return self._send(200, self.ctl.health.check() if self.ctl.health else {"ok": True, "issues": []})
+            if p == "/metrics":
+                data = HL.metrics(self.dep, self.inv, self.dep.taps, self.ctl.health, VERSION).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                return self.wfile.write(data)
+            if p == "/api/dsp/backup":
+                return self._send(200, BK.make(self.dep.cfg.name))
+            if p == "/api/dsp/sap":
+                if not self.sap:
+                    return self._send(200, {"enabled": False, "streams": []})
+                return self._send(200, dict(self.sap.status(), enabled=True, streams=self.sap.dir.list()))
+            if p == "/api/dsp/previews":
+                # MediaMTX's API is on the hub's loopback: the remote designer (HA add-on) reads preview state here
+                return self._send(200, {"previews": self.dep.ctl.previews()})
             if p == "/api/dsp/voice":
                 return self._send(200, self.ctl.voice.status() if self.ctl.voice else {"enabled": False})
         except Exception as e:
@@ -291,6 +370,140 @@ class Handler(BaseHTTPRequestHandler):
                         "transport": {k: len(v) for k, v in (inv.node_transport.get(host) or {}).items()}})
         return {"hub": self.dep.cfg.name, "registry": self._registry_url(), "nodes": out, "removed": sorted(self.book.removed)}
 
+    # ---- the sound library (sounds.py)
+    def _sounds_changed(self, what):
+        log(f"sounds: {what}")
+        self.ctl.refresh(force=True)                     # a Sound player's select lists the library
+        self.ctl.bus.publish({"type": "design", "name": (self.dep.design or {}).get("name"), "kind": "sounds",
+                              "version": self.ctl.version})
+
+    def _sound_upload(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > SND.MAX_FILE:
+            self.close_connection = True                 # the body is not read
+            return self._send(413, {"ok": False, "error": f"at most {SND.MAX_FILE // 2**20} MB per sound"})
+        data = self.rfile.read(n) if n else b""
+        name = (parse_qs(urlsplit(self.path).query).get("name") or ["sound"])[0]
+        try:
+            r = self.sounds.add(name, data)
+        except SND.SoundError as e:
+            return self._send(400, {"ok": False, "error": str(e)})
+        self._sounds_changed(f"added {r['name']} ({r['size']} bytes, {r['format']})")
+        return self._send(200, dict(r, ok=True))
+
+    def _sound_file(self, name):
+        try:
+            path = self.sounds.path(name)
+            fmt = self.sounds.info(name)["format"]
+        except SND.SoundError as e:
+            return self._send(404, {"error": str(e)})
+        with open(path, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", {"wav": "audio/wav", "flac": "audio/flac", "ogg": "audio/ogg", "mp3": "audio/mpeg"}.get(fmt, "application/octet-stream"))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    # ---- the injector (inject.py): canvas port -> this hub's PipeWire, or the satellite that has the port
+    def _injections(self):
+        out = [dict(i, host=self.dep.cfg.name) for i in self.injector.active()]
+        for host in sorted({h for h, _ in Handler.inject_remote.values()}):
+            c = self.inv.sats.get(host)
+            try:
+                code, r = sat_http("GET", f"{c.url}/api/dsp/inject", timeout=2) if c else (0, None)
+                live = {i["id"]: i for i in (r or {}).get("injections") or []} if code == 200 else {}
+            except Exception:
+                live = {}
+            for hid, (h, rid) in list(Handler.inject_remote.items()):
+                if h == host:
+                    if rid in live:
+                        out.append(dict(live[rid], id=hid, host=host))
+                    else:
+                        Handler.inject_remote.pop(hid, None)           # ended there
+        return out
+
+    def _inject_start(self, b):
+        try:
+            t = INJ.resolve_input(self.dep, b.get("block"), b.get("port"))
+            args = dict(kind=b.get("kind") or "white", level_db=b.get("level_db", INJ.DEFAULT_DB),
+                        freq_hz=b.get("freq_hz") or 1000, duration_s=b.get("duration_s") or 30)
+            if t["host"] == self.dep.cfg.name:
+                return self._send(200, dict(self.injector.start(t["node"], t["ports"], t["label"], **args), host=t["host"]))
+            c = self.inv.sats.get(t["host"])
+            if not c or not c.ok:
+                raise INJ.InjectError(f"{t['label']} is on {t['host']}, which does not answer now")
+            try:
+                code, r = sat_http("POST", f"{c.url}/api/dsp/inject", dict(args, node=t["node"], ports=t["ports"], label=t["label"]), timeout=10)
+            except urllib.error.HTTPError as e:
+                raise INJ.InjectError(f"{t['host']}: {json.loads(e.read() or b'{}').get('error') or e}")
+            except Exception as e:
+                raise INJ.InjectError(f"{t['host']}: {e} (owl-node there older than 0.11?)")
+            hid = f"{t['host']}:{r['id']}"
+            Handler.inject_remote[hid] = (t["host"], r["id"])
+            return self._send(200, dict(r, id=hid, host=t["host"]))
+        except INJ.InjectError as e:
+            return self._send(400, {"ok": False, "error": str(e)})
+
+    def _inject_remote_call(self, hid, method, body=None):
+        host, rid = Handler.inject_remote[hid]
+        c = self.inv.sats.get(host)
+        try:
+            code, r = sat_http(method, f"{c.url}/api/dsp/inject/{rid}", body, timeout=5)
+        except urllib.error.HTTPError as e:
+            raise INJ.InjectError(json.loads(e.read() or b"{}").get("error") or str(e))
+        except Exception as e:
+            raise INJ.InjectError(f"{host}: {e}")
+        if method == "DELETE":
+            Handler.inject_remote.pop(hid, None)
+        return dict(r, id=hid, host=host)
+
+    def _inject_level(self, iid, level_db):
+        try:
+            if level_db is None:
+                raise INJ.InjectError("give level_db")
+            if iid in Handler.inject_remote:
+                return self._send(200, self._inject_remote_call(iid, "POST", {"level_db": level_db}))
+            return self._send(200, self.injector.set_level(iid, level_db))
+        except INJ.InjectError as e:
+            return self._send(400, {"ok": False, "error": str(e)})
+
+    def _inject_stop(self, iid):
+        try:
+            if iid in Handler.inject_remote:
+                return self._send(200, self._inject_remote_call(iid, "DELETE"))
+            return self._send(200, self.injector.stop(iid))
+        except INJ.InjectError as e:
+            return self._send(404, {"ok": False, "error": str(e)})
+
+    def _restore(self, bundle):
+        """A hub backup -> this hub: files, nodes re-paired with this hub's registry, design re-applied."""
+        hub = self.dep.cfg.name
+        summary = BK.restore(bundle, hub)
+        book = NodeBook()
+        Handler.book = self.inv.book = book
+        me = {self.dep.cfg.ip, self._public_host().rsplit(":", 1)[0], "127.0.0.1", "localhost", hub}
+        paired = {}
+        for e in book.entries():
+            try:
+                r = book.add(e["url"], hub, self._registry_url(), self._hub_url(), me)
+                paired[e["host"]] = "paired" if r.get("paired") else f"added, not paired: {r.get('pair_error')}"
+            except NodeError as err:
+                paired[e["host"]] = f"not reachable now: {err}"
+        summary["nodes"] = paired
+        design = read_json(DESIGN, None)
+        if design:
+            self.inv.time = 0
+            try:
+                self.inv.refresh(0)
+                r = self.dep.apply(design, rollback=False, reason="restore", strict=False)
+                summary["deploy"] = {"ok": True, "pending": sorted((r or {}).get("pending") or [])}
+            except DeployError as err:
+                summary["deploy"] = {"ok": False, "error": str(err)}
+        log(f"restored the backup of hub {summary['from_hub']!r}: {', '.join(summary['restored'])}; nodes {paired}")
+        return dict(summary, ok=True)
+
     def do_DELETE(self):
         p = urlsplit(self.path).path
         try:
@@ -305,12 +518,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, r)
             if p.startswith("/api/dsp/presets/"):
                 return self._send(200, self.ctl.delete_preset(unquote(p[len("/api/dsp/presets/"):])))
+            if p.startswith("/api/dsp/inject/"):
+                return self._inject_stop(p[len("/api/dsp/inject/"):])
+            if p.startswith("/api/dsp/sounds/"):
+                try:
+                    name = unquote(p[len("/api/dsp/sounds/"):])
+                    self.player.stop_sound(name)
+                    r = self.sounds.delete(name)
+                except SND.SoundError as e:
+                    return self._send(404, {"ok": False, "error": str(e)})
+                self._sounds_changed(f"deleted {name}")
+                return self._send(200, r)
         except DeployError as e:
             return self._send(409, {"ok": False, "error": str(e)})
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
         p = urlsplit(self.path).path
+        if p == "/api/dsp/sounds":
+            return self._sound_upload()
         try:
             b = self._body()
             if p == "/api/dsp/nodes":
@@ -322,6 +548,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.inv.time = 0
                 log(f"node {r['host']} added by address ({r['url']}, owl-node {r.get('version')}, paired: {r['paired']})")
                 return self._send(200, r)
+            if p == "/api/dsp/inject":
+                return self._inject_start(b)
+            if p.startswith("/api/dsp/inject/"):
+                return self._inject_level(p[len("/api/dsp/inject/"):], b.get("level_db"))
+            if p == "/api/dsp/restore":
+                return self._send(200, self._restore(b.get("backup") if "backup" in b else b))
             if p == "/api/dsp/plan":
                 design = b.get("design") or b
                 r = self.dep.plan(design, strict=not b.get("allow_missing"))
@@ -382,9 +614,21 @@ def main():
     ctl = Controller(reg)
     inv = Inventory(cfg, ctl)
     inv.book = NodeBook()
+    sap = None
+    if os.environ.get("OWL_SAP", "on") not in ("off", "0", "no"):
+        sap = SAP.Listener(cfg.ip, log=log)            # third-party AES67 streams (Dante, ...) announced over SAP
+        inv.sap = sap.dir
     taps = Taps()
     dep = Deployer(cfg, inv, types, taps, ctl)
     controls = Controls(dep, types, inv, cfg)
+    controls.health = HL.Health(dep, inv)
+    library = SND.Library()
+
+    def sound_changed(bid, playing, source):
+        controls.bus.publish({"type": "sound", "block": bid, "playing": playing, "source": source})
+    player = SND.Player(dep, library, log=log, on_change=sound_changed)
+    controls.sounds, controls.player = library, player
+    Handler.sounds, Handler.player = library, player
     mqtt = Bridge(controls, cfg, controller_port=int(os.environ.get("OWL_CONTROLLER_PORT", "8361")))
     voice = None
     if os.environ.get("OWL_VOICE", "on") not in ("off", "0", "no"):
@@ -408,6 +652,9 @@ def main():
     mqtt.start()
     if voice:
         voice.start()
+    if sap:
+        sap.start()
+    Handler.sap = sap
 
     def loop():
         while not stopping:
@@ -417,15 +664,44 @@ def main():
                 log(f"reconcile: {type(e).__name__}: {e}")
             time.sleep(2)
     threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=push_backups, args=(cfg, inv, stopping), daemon=True).start()
     try:
         srv.serve_forever()
     finally:
+        Handler.injector.stop_all()
+        player.stop_all()
         if voice:
             voice.stop()
         mqtt.stop()
         controls.stop()
         dep.stop()
         log("stopped")
+
+
+BACKUP_PUSHED = {}       # satellite host -> {digest, at, error}: GET /api/dsp/status shows it
+
+
+def push_backups(cfg, inv, stopping, every=30):
+    """Keep the hub's backup on every satellite dsp role it talks to (sent when it changed or the satellite lacks it)."""
+    while not stopping:
+        try:
+            bundle = BK.make(cfg.name)
+            dig = BK.digest(bundle)
+            for host, c in list(inv.sats.items()):
+                if not c.ok or (BACKUP_PUSHED.get(host) or {}).get("digest") == dig:
+                    continue
+                try:
+                    code, r = sat_http("PUT", f"{c.url}/api/dsp/hub-backup", bundle, timeout=5)
+                    BACKUP_PUSHED[host] = {"digest": dig if code == 200 else None, "at": time.time(),
+                                           "error": None if code == 200 else f"HTTP {code} (owl-node there older than 0.8?)"}
+                except Exception as e:
+                    BACKUP_PUSHED[host] = {"digest": None, "at": time.time(), "error": f"{type(e).__name__}: {e}"}
+        except Exception as e:
+            log(f"backup push: {type(e).__name__}: {e}")
+        for _ in range(every):
+            if stopping:
+                return
+            time.sleep(1)
 
 
 def satellite_main(cfg):

@@ -15,6 +15,8 @@ RUN_DIR = os.environ.get("OWL_NODE_RUN", "/run/owl-node")
 NS = uuid.UUID("6f776c2d-6e6f-6465-2d6e-6d6f73000001")  # fixed namespace: IDs depend only on names
 
 AES67_PORT = 5004
+TX_MTU = 1280            # audio.py tx_conf net.mtu
+MAX_TX_CHANNELS = 8      # 8 ch x 48 samples x 3 bytes = 1152 bytes + RTP header per 1 ms packet: the most under TX_MTU
 JXS_PORT = 5010          # N4 JPEG XS RTP: sender n (and receiver n) default to 5010 + 2n
 JXS_ECHO_PORT = 9190     # N4 latency test: a sender's UDP echo socket (receivers send back each frame's stamp)
 # 8-bit 4:2:0 is what the test source and a UVC stick give; 4:2:2 10-bit is the ST 2110-22 / IPMX norm
@@ -101,12 +103,33 @@ def phc_index(ifname):
 
 
 def atomic_write(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
-    with os.fdopen(fd, "w") as f:
-        f.write(data if isinstance(data, str) else json.dumps(data, indent=1, sort_keys=True))
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
+    """Write-then-rename that survives a power cut: the data is fsync'd before the rename and the directory after it.
+    Without the fsyncs a cut (a Pi on an SD card) could leave an empty state.json / dsp-design.json, which read_json
+    then silently treats as "nothing saved"."""
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data, indent=1, sort_keys=True))
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass                # some filesystems refuse a directory fsync; the file itself is already on disk
 
 
 def read_json(path, default=None):
@@ -174,6 +197,9 @@ class Node:
                 "channels": int(s.get("channels", 2)),
                 "link_from": s.get("link_from"),
             })
+            if not 1 <= self.senders[-1]["channels"] <= MAX_TX_CHANNELS:
+                raise ValueError(f"audio sender {key}: channels must be 1..{MAX_TX_CHANNELS} (1 ms AES67 packets of "
+                                 f"L24 at 48 kHz fit the {TX_MTU}-byte MTU up to {MAX_TX_CHANNELS} channels)")
         for i, r in enumerate(a.get("receivers") or []):
             key = slug(r.get("id") or f"rx{i + 1}")
             self.receivers.append({

@@ -23,13 +23,14 @@ press **Deploy**, and the hub turns them into PipeWire links on each machine and
 
 [Features](#features) · [How it fits together](#how-it-fits-together) · [Requirements](#requirements) ·
 [Install](#install) · [Home Assistant](#connect-home-assistant) · [Your first design](#your-first-design) ·
-[Voice assistant](#echo-cancellation-and-the-voice-assistant) · [Cameras](#rtsp-cameras) · [Blocks](#blocks) ·
-[Updating](#updating) · [Ports](#network-ports) · [Troubleshooting](#troubleshooting) · [Status](#status-and-roadmap)
+[Voice assistant](#echo-cancellation-and-the-voice-assistant) · [Sounds and test signals](#sounds-and-test-signals) · [Cameras](#rtsp-cameras) ·
+[Dante and AES67 gear](#dante-and-other-aes67-gear) · [Blocks](#blocks) ·
+[Updating](#updating) · [Monitoring](#monitoring) · [If the hub fails](#if-the-hub-fails) · [Ports](#network-ports) · [Troubleshooting](#troubleshooting) · [Status](#status-and-roadmap)
 
 ## Features
 
 - **One canvas for every machine.** Add a machine by typing its IP; its inputs and outputs appear. Wires between
-  machines become AES67 streams (sample-accurate with PTP) and NMOS patches — you never pick a transport.
+  machines become AES67 streams (every machine on one PTP clock) and NMOS patches — you never pick a transport.
 - **Processing blocks**, live where it makes sense: parametric and DJ EQ, compressor, limiter, ducker, gain, delay,
   mixer, router, test tone, meters. They run on the hub or on any node. A block type is one YAML file.
 - **Echo cancellation for voice.** The WebRTC AEC3 block removes what the speakers and the TV play from the microphone,
@@ -41,8 +42,15 @@ press **Deploy**, and the hub turns them into PipeWire links on each machine and
 - **RTSP cameras.** Paste a camera link: its audio becomes a source you can wire anywhere, its video can be previewed
   and sent to any node's video receiver (hardware HEVC decoding on a Raspberry Pi 5).
 - **🎧 Listening probe.** Drag the probe onto any port, block or wire and hear that point on the computer you are using.
+- **🔊 Test signal injector.** Drag it onto any input, on any machine, and play pink or white noise or a sine into it at a
+  set level for a set time: check a signal path end to end without a source of your own.
+- **Sounds.** Upload doorbells, chimes and alarms in the designer; a **Sound player** block plays one when triggered
+  (a Panels button, a Home Assistant button, an automation) into any room.
 - **Safe deploys.** Every change is shown before it is applied, replacing a whole design is called out, and a failed
   deploy rolls back by itself.
+- **Dante and AES67 gear.** Streams that Dante devices (in AES67 mode) and other AES67 equipment announce on the
+  network appear as sources on the canvas, each channel pair wireable on its own; the hub can serve them the house
+  clock over UDP.
 - **Video (experimental):** H.264/HEVC over SRT and JPEG XS over RTP between nodes, with browser previews.
 
 <table>
@@ -96,8 +104,10 @@ flowchart LR
 - **Linux with PipeWire** on every machine (a desktop install has it; in use on Ubuntu 26.04 and on Raspberry Pi OS /
   Debian 12) and **Docker Engine with the compose plugin**.
 - **A wired network.** AES67 and PTP do not work over Wi-Fi. A network card with a **PTP hardware clock** (most Intel
-  i210/i225/i226 and the Raspberry Pi 5's built-in port) keeps every machine sample-accurate; without one a machine
-  still shows its devices but its network audio drifts.
+  i210/i225/i226 and the Raspberry Pi 5's built-in port) keeps every machine on the same clock; without one a machine
+  still shows its devices but its network audio drifts. Receivers play out adaptively by default: clean, but not
+  sample-aligned between rooms (one direction slips a 1 ms packet every ~11.5 s). Timestamp-locked playout
+  (`ts_direct: true` in `node.yaml`) is experimental: it is not yet reliable across restarts.
 - For the voice assistant: Home Assistant with an Assist pipeline, the **Wyoming** integration and a wake word engine
   (openWakeWord); for HA entities: an **MQTT broker** (the Mosquitto add-on).
 
@@ -110,9 +120,10 @@ git clone https://github.com/MorningstarOwl/owl-designer.git && cd owl-designer
 owl-node/install.sh --hub
 ```
 
-Run it as your desktop user (it asks for sudo itself). It finds the wired interface, the PTP clock and its role, builds
-the image (a few minutes on a PC), asks whether to start at boot and ends with the designer's address. Add
-`--dry-run` first to see every file it would write.
+Run it as your desktop user (it asks for sudo itself). It finds the wired interface, the PTP clock and its role, pulls
+the engine image for its version (amd64 or arm64, from `ghcr.io/morningstarowl/owl-node`; it builds it from the
+checkout instead when there is none, e.g. for an unreleased version: a few minutes on a PC, 20-40 on a Pi), asks
+whether to start at boot and ends with the designer's address. Add `--dry-run` first to see every file it would write.
 
 ### 2. Every other machine
 
@@ -121,8 +132,24 @@ git clone https://github.com/MorningstarOwl/owl-designer.git && cd owl-designer
 owl-node/install.sh
 ```
 
-Same detection, plus one AES67 sender and one receiver (building takes 20–40 minutes on a Pi). Then, in the hub's
+Same detection, plus one AES67 sender and one receiver. Then, in the hub's
 designer, type the machine's IP in **Nodes** and press **Add**: the hub pairs it and its inputs and outputs appear.
+
+Streams between machines work like Dante flows: a sender carries several sources side by side, each on its own
+channels (1-2, 3-4, …), and a receiving machine takes the stream once and plays only the channels wired to it. The
+hub's sender has 8 channels, so four different stereo sources can leave the hub at once (music to the kitchen, the
+news to the bedroom, …) over one stream; a node's sender is stereo. For more, re-run `install.sh` with its full list
+of streams, e.g. `--tx 'Living Room|channels=8' --rx 'Living Room RX 1'` (any `--tx`/`--rx`/`--vtx`/`--vrx`
+replaces all of them). With too few channels, Deploy warns and sources share channels, which mixes them. A hub
+installed before 0.8 keeps its stereo sender until it is re-installed that way. An 8-channel stream is about
+10 Mbit/s of multicast; a switch without IGMP snooping sends it to every port.
+
+Receivers buffer each stream for a few milliseconds (6 by default). **Network latency** in the designer's Design panel
+sets it for every stream the design uses (the same value everywhere keeps rooms in step; raise it if a busy network
+makes audio drop out), and a wire's inspector can set its own.
+
+A node with a PTP hardware clock also stands by as the network's clock: if the hub is off, one node takes over so the
+others stay in step (`--ptp backup`, the default; `--ptp follower` opts out).
 
 <p><img src="docs/images/nodes.png" alt="The Nodes box: two nodes added by IP, answering and paired" width="300"></p>
 
@@ -155,8 +182,11 @@ its wake word on the new device, then turn on the wake-word switch (on the Panel
    Wires between machines need nothing else.
 3. **Deploy…** shows exactly what will change — processes started, links made, patches set — and warns when a deploy
    would replace the whole design or cut off the voice assistant. Apply; a failure rolls back.
-4. **Run** shows live meters on every port and the state of every wire. Drag **🎧 Probe** onto anything to hear it.
+4. **Run** shows live meters on every port and the state of every wire. Drag **🎧 Probe** onto anything to hear it,
+   and **🔊 Inject** onto an input to play a test signal into it.
 5. **Panels** turn named controls into pages for your phone: drag controls onto a page, set ranges and labels.
+6. **Export** saves the canvas as a file, **Import…** opens one, and **History** (Design panel) lists the last 20
+   deployed designs: open one on the canvas, then Deploy… shows what it would change.
 
 <p><img src="docs/images/panels-phone.png" alt="A Panels page on a phone: volume, mute, preset, ducking, meters, push-to-talk" width="300"></p>
 
@@ -174,6 +204,22 @@ Wire the **Voice assistant** block's *reply* into the ducker's *sidechain* so an
 *Mic channels* to match the mic (Deploy warns when they differ). The microphone's placement matters more than any
 setting: close to where people talk, away from the speakers.
 
+## Sounds and test signals
+
+**Sounds.** Open **Sounds** in the Design panel and upload files (WAV, FLAC, Ogg Vorbis/Opus or MP3; up to 25 MB each,
+500 MB in all; they are kept on the hub). Add a **Sound player** block, pick its sound, wire its output where it should
+be heard (a speaker, another room, or the ducker's sidechain so the music dips like for an announcement) and deploy.
+Each player has **Play** and **Stop**: buttons in its inspector, in Panels and in Home Assistant
+(`button.owl_dsp_<hub>_<block id>_play`), and in the API (`POST /api/dsp/controls/set {"key": "<block>.play"}`). Its sound is
+also a select entity in Home Assistant, so an automation can choose the sound, then press Play. *Loop* repeats it
+until Stop (alarms). Sounds are not part of the hub backup: keep your originals.
+
+**Test signals.** Drag **🔊 Inject** onto an input (the left side of a block), a block, or a wire (its destination),
+choose pink noise, white noise or a sine, a level (RMS, dBFS) and a duration, and press Start. It plays on the machine
+that input belongs to, is added to whatever already plays there, and stops by itself when the time is up (at most 10
+minutes) even if you close the page; the level can be moved while it plays. Combine it with the probe or the Run-mode
+meters to follow the signal through the design. Start low: it goes wherever that input leads.
+
 ## RTSP cameras
 
 Add an **RTSP source** block and paste the camera's link (`rtsp://user:password@camera:554/stream` or `rtsps://…`;
@@ -186,6 +232,27 @@ UniFi Protect: enable RTSP on the camera and copy its `rtsps://…:7441/…` or 
 - The link is treated as a secret: masked in the designer, never logged, never an HA entity. Self-signed `rtsps`
   certificates are pinned on Deploy.
 
+## Dante and other AES67 gear
+
+The hub listens for SAP announcements (how AES67 devices advertise their streams): every playable stream it hears that
+is not an owl-node shows up on the canvas as an **AES67 stream** source (L16/L24, 44.1/48/96 kHz). Wire it into any
+input on any machine: Deploy patches an AES67 receiver there with the stream's own description. A stream with more
+than two channels (a Dante flow, a stagebox) also offers **channels 1-2, 3-4, …** as separate outputs, so you can send
+one pair to the kitchen and another to the deck. If the device re-announces with new settings, the design follows
+within a few seconds; a stream that stops being announced stays wired (greyed) until it returns.
+
+For Dante:
+
+- In Dante Controller, turn on **AES67 mode** for the device and create a **multicast flow** of the channels you want
+  (Dante only announces multicast AES67 flows).
+- Dante gear follows PTP over **UDP**, while owl-nodes use Ethernet-level PTP. Give the hub both:
+  `owl-node/install.sh --hub --ptp-udp` (a second, server-only PTP instance on the same clock; the hub's PTP hardware
+  clock must be on its media interface, not behind a bridge). Then the Dante device and the owl-nodes share one clock.
+- The other direction already works: owl-node senders are announced over SAP, so they appear in Dante Controller as
+  AES67 flows you can subscribe Dante receivers to.
+
+`OWL_SAP=off` in the hub's environment turns discovery off; `GET :8362/api/dsp/sap` lists what it hears.
+
 ## Blocks
 
 | Group | Block | |
@@ -194,6 +261,7 @@ UniFi Protect: enable RTSP on the camera and copy its `rtsps://…:7441/…` or 
 | Voice | **Voice assistant** | Home Assistant Wyoming satellite: *listen* and *reply* are its mic and speaker |
 | Sources | **RTSP source** | a camera or any RTSP stream: audio output, video output |
 | Sources | **App Input** | a named sink an app plays into (`squeezelite -o NAME`); its monitor is the output |
+| Sources | **Sound player** | plays a library sound when its Play control is triggered (doorbell, chime, alarm; loop for alarms) |
 | Dynamics | **Compressor** · **Limiter** · **Ducker** · **Gain** | all parameters live |
 | EQ | **Parametric EQ** · **DJ EQ** | shelves + 3 bands per channel · 3-band (a template for any LADSPA plugin) |
 | Routing | **Delay** · **Mixer 4x2** · **Router 4:1** | lip-sync and speaker alignment · four inputs to one · select one of four |
@@ -211,6 +279,42 @@ configuration with its ports, parameters and live controls. Adding a LADSPA plug
 - **Home Assistant add-on:** HA offers updates by itself when a new version is released.
 - Versions are plain `X.Y.Z` everywhere (the add-on, the image, the release tag `vX.Y.Z`).
 
+## Monitoring
+
+- **Home Assistant:** the hub's device has a **Needs attention** diagnostic sensor (a problem sensor) whose
+  attributes list what is wrong: a node whose PTP is not locked, packet loss on a receiver in the last minute, a
+  patched receiver that gets no packets, a block that restarted in the last 10 minutes, a node that does not answer,
+  a design that does not apply. Build a notification automation on it.
+- **Prometheus / Grafana:** `http://<hub>:8362/metrics` (PTP lock and offset per node, packets and losses per
+  receiver, block restarts, meter levels, the same health issues by kind).
+- **API:** `GET :8362/api/dsp/health` returns the issues as JSON.
+
+## If the hub fails
+
+**While it is off**, streams between nodes keep playing: each node keeps its own patches and its part of the design,
+and with PTP hardware clocks one node takes over as the network clock (`--ptp backup`), so they stay in step. What
+stops is what runs on the hub: its own sound devices and the blocks placed on it, wires that pass through it, the
+designer, Home Assistant controls, the voice assistant and the camera relay.
+
+**Replacing it.** Every node keeps a copy of the hub's latest backup (the hub refreshes it within about 30 seconds of
+any change: the design with its panels and presets, the previous design, the canvas draft, the nodes, the wake-word
+switch and the MQTT settings). On the replacement machine:
+
+```bash
+owl-node/install.sh --hub --restore-from 192.0.2.20      # the address of any node
+```
+
+or turn a node into the hub, from the copy it holds:
+
+```bash
+owl-node/install.sh --hub --restore-from /var/lib/owl-node/hub-backup.json
+```
+
+The designs come back and every node is paired with the new hub. Then redo what the backup leaves out: the MQTT
+password (`--mqtt …`; it is never copied to other machines), wires to the old hub's own sound devices if the new
+machine's are different (they show greyed until re-wired), and in Home Assistant the Wyoming satellite's address.
+`GET :8362/api/dsp/backup` downloads the backup at any time; `POST :8362/api/dsp/restore` restores one.
+
 ## Network ports
 
 | Port | | Port | |
@@ -219,7 +323,8 @@ configuration with its ports, parameters and live controls. Adding a LADSPA plug
 | 8010–8011/tcp | NMOS registry (hub) | 8360/tcp | NMOS node API (every machine) |
 | 10700/tcp | voice satellite (hub) | 5004/udp, 239.69.x.x | AES67 audio (multicast) |
 | 8889/tcp, 8189/udp | browser previews (WebRTC) | 8890/udp | SRT (video, camera relay) |
-| PTP | layer 2 (Ethernet), not IP | 1883/tcp | MQTT (to your broker) |
+| PTP | layer 2 (Ethernet); with `--ptp-udp` also 319–320/udp | 1883/tcp | MQTT (to your broker) |
+| 9875/udp, 239.255.255.255 | SAP stream announcements | | |
 
 ## Troubleshooting
 
@@ -260,8 +365,9 @@ with `install.sh --hub`.
 
 Used every day in one house — a hub, a Raspberry Pi 5 node, a PC node and Home Assistant — and still young. Planned:
 access control for the designer and the APIs (today they are open on your LAN; the HA sidebar is behind HA's login),
-prebuilt engine images, a local-engine mode for powerful Home Assistant hosts, and a zero-config MQTT link from the
-add-on. Issues and pull requests are welcome.
+sample-aligned (timestamp-locked) playout between rooms, a local-engine mode for powerful Home Assistant hosts, and a zero-config MQTT link from the
+add-on. Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md); how it is built:
+[docs/architecture.md](docs/architecture.md).
 
 ## License
 

@@ -114,7 +114,7 @@ def tx_conf(n, s, tp):
             source.ip = {esc(tp.get('source_ip') or n.ip)}
             destination.ip = {esc(tp.get('destination_ip') or s['group'])}
             destination.port = {int(tp.get('destination_port') or s['port'])}
-            net.mtu = 1280
+            net.mtu = {config.TX_MTU}
             net.ttl = {n.ttl}
             net.loop = {str(n.loopback).lower()}
             sess.min-ptime = 1
@@ -150,7 +150,8 @@ def tx_conf(n, s, tp):
 """
 
 
-def rx_conf(n, r, a):
+def rx_conf(n, r, a, latency_ms=None):
+    """latency_ms: the designer's setting for this receiver (agent x-owl/v1/receivers), else node.yaml's."""
     tp = a["transport_params"][0]
     f = a.get("format") or {}
     enc = f.get("encoding") or "L24"
@@ -162,7 +163,7 @@ def rx_conf(n, r, a):
             local.ifname = {esc(n.media_if)}
             source.ip = {esc(tp['multicast_ip'])}
             source.port = {int(tp.get('destination_port') or 5004)}
-            sess.latency.msec = {r['latency_ms']:g}
+            sess.latency.msec = {latency_ms if latency_ms is not None else r['latency_ms']:g}
             sess.ts-direct = {str(TS_DIRECT[0]).lower()}
             sess.ignore-ssrc = true
             audio.format = "{'S24BE' if enc == 'L24' else 'S16BE'}"
@@ -191,6 +192,7 @@ def rx_conf(n, r, a):
 class Proc:
     def __init__(self, name, conf):
         self.name, self.conf, self.p, self.since, self.restarts, self.next_try = name, conf, None, None, 0, 0
+        self.total_restarts = 0             # never reset (restarts is the backoff counter): metrics, health
         self.path = os.path.join(PW_DIR, f"{name}.conf")
 
     @property
@@ -228,6 +230,7 @@ class Proc:
             log(f"{self.name} exited with {self.p.returncode}")
             self.p = None
             self.restarts += 1
+            self.total_restarts += 1
             self.next_try = time.time() + min(30, 2 ** self.restarts)
         if time.time() >= self.next_try:
             self.start()
@@ -235,13 +238,15 @@ class Proc:
     def info(self):
         return {"running": self.running(), "pid": self.p.pid if self.running() else None,
                 "up_s": round(time.time() - self.since) if self.running() else 0, "restarts": self.restarts,
+                "total_restarts": self.total_restarts,
                 "conf": self.digest}
 
 
 def pw_nodes():
     try:
         out = subprocess.run(["pw-dump", "--no-colors"], capture_output=True, timeout=10, text=True).stdout
-        objs = json.loads(out or "[]")
+        out = (out or "").lstrip()
+        objs = json.JSONDecoder().raw_decode(out)[0] if out else []   # the snapshot; pw-dump may append changes
     except Exception:
         return None, {}
     nodes, ports = {}, {}
@@ -298,14 +303,19 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    last_mtime, last_dump, nodes = None, 0, {}
+    last_sig, last_read, last_dump, nodes, st = False, 0, 0, {}, {}
     while not stopping:
         base.check()
+        # the agent replaces state.json (new inode) on every activation: re-read when its identity changes, and every
+        # 5 s anyway (file timestamps can be coarser than two quick activations)
         try:
-            mt = os.stat(config.STATE).st_mtime
+            fs = os.stat(config.STATE)
+            sig = (fs.st_ino, fs.st_mtime_ns, fs.st_ctime_ns, fs.st_size)
         except OSError:
-            mt = None
-        st = read_json(config.STATE, {}) or {}
+            sig = None
+        if sig != last_sig or time.time() - last_read > 5:
+            last_sig, last_read = sig, time.time()
+            st = read_json(config.STATE, {}) or {}
         want = {}
         for s in n.senders:
             a = (st.get("senders") or {}).get(s["key"]) or {"master_enable": True, "transport_params": [{}]}
@@ -318,9 +328,7 @@ def main():
                 continue
             tp = a["transport_params"][0]
             if a.get("master_enable") and tp.get("rtp_enabled") and tp.get("multicast_ip"):
-                want[f"rx-{r['key']}"] = rx_conf(n, r, a)
-        if mt != last_mtime:
-            last_mtime = mt
+                want[f"rx-{r['key']}"] = rx_conf(n, r, a, (st.get("receiver_latency") or {}).get(r["key"]))
         for name in list(procs):
             if name not in want or procs[name].conf != want[name]:
                 procs.pop(name).stop()

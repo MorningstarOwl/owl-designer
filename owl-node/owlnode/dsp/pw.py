@@ -1,6 +1,7 @@
 """The hub's PipeWire graph through the command-line tools (pw-dump, pw-link, pw-cli): nodes, ports and links as
 plain dicts, and the three operations the deployer needs (link, unlink, set a filter control)."""
-import json, subprocess, time
+import json, subprocess, threading, time
+from collections import deque
 
 
 class Graph:
@@ -58,7 +59,17 @@ def dump(timeout=10):
     out = subprocess.run(["pw-dump", "--no-colors"], capture_output=True, timeout=timeout, text=True)
     if out.returncode != 0:
         raise RuntimeError(f"pw-dump: {out.stderr.strip()[:200]}")
-    return Graph(json.loads(out.stdout or "[]"))
+    return Graph(parse_dump(out.stdout))
+
+
+def parse_dump(text):
+    """pw-dump's snapshot: the first JSON array. When objects come or go while it runs, pw-dump appends a second
+    document with those changes ("Extra data" for json.loads, seen on a busy graph); the next dump catches them."""
+    text = (text or "").lstrip()
+    if not text:
+        return []
+    objs, _ = json.JSONDecoder().raw_decode(text)
+    return objs if isinstance(objs, list) else []
 
 
 def link(out_port_id, in_port_id):
@@ -116,3 +127,107 @@ def pair_ports(src_ports, dst_ports):
     if len(dst_ports) == 1:
         return [(s, dst_ports[0]) for s in src_ports]
     return list(zip(src_ports, dst_ports))
+
+
+def _fmt(v):
+    return f"{v:.6g}" if isinstance(v, float) else str(v)
+
+
+class PwCtl:
+    """Live filter-chain controls through ONE long-lived `pw-cli` fed `set-param` lines on stdin, instead of a
+    `pw-cli` process per control (~4 ms each, plus a full pw-dump to find the node: ~10 ms on an idle graph, far more on
+    a busy hub). A fader move or a fade step is a line written to a pipe. pw-cli answers each command by printing the
+    node's Props; a reader thread drains that and keeps the errors it reports (asynchronous, not tied to one command).
+    If pw-cli cannot run, every set falls back to a one-shot `pw-cli set-param`."""
+    NOISE = ("unsupported type",)                 # what pw-cli prints at start-up for object types it does not know
+
+    def __init__(self, argv=("pw-cli",)):
+        self.argv, self.p, self.lock = list(argv), None, threading.Lock()
+        self.errors, self.error_seq, self.sent, self.restarts, self.fallback = deque(maxlen=20), 0, 0, 0, False
+
+    def _start(self):
+        self.p = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, bufsize=1, start_new_session=True)
+        threading.Thread(target=self._drain, args=(self.p,), daemon=True, name="pw-cli").start()
+
+    def _drain(self, p):
+        try:
+            for line in p.stdout:
+                if "rror" in line and not any(n in line for n in self.NOISE):
+                    self.errors.append((time.time(), line.strip()[:200]))
+                    self.error_seq += 1
+        except (OSError, ValueError):
+            pass
+
+    def running(self):
+        return self.p is not None and self.p.poll() is None
+
+    def set(self, node_id, pairs):
+        """pairs: [(control name, value)] of one node, sent as one set-param. -> True when sent."""
+        if not pairs:
+            return True
+        body = " ".join(f'"{c}" {_fmt(v)}' for c, v in pairs)
+        line = f"set-param {int(node_id)} Props {{ params = [ {body} ] }}\n"
+        with self.lock:
+            for attempt in (0, 1):
+                if not self.fallback and not self.running():
+                    try:
+                        if self.p is not None:
+                            self.restarts += 1
+                        self._start()
+                    except OSError:
+                        self.fallback = True
+                if self.fallback:
+                    break
+                try:
+                    self.p.stdin.write(line)
+                    self.p.stdin.flush()
+                    self.sent += 1
+                    return True
+                except (OSError, ValueError):
+                    self.p = None                  # it died between the check and the write: start a new one once
+        r = subprocess.run(["pw-cli", "set-param", str(int(node_id)), "Props", f"{{ params = [ {body} ] }}"],
+                           capture_output=True, text=True, timeout=5)
+        self.sent += r.returncode == 0
+        return r.returncode == 0
+
+    def status(self):
+        return {"running": self.running(), "sent": self.sent, "restarts": self.restarts, "fallback": self.fallback,
+                "errors": [e for _, e in list(self.errors)[-3:]]}
+
+    def stop(self):
+        with self.lock:
+            if self.running():
+                try:
+                    self.p.stdin.close()
+                except OSError:
+                    pass
+                self.p.terminate()
+            self.p = None
+
+
+class Debounced:
+    """Run fn at most once per `delay` s: the first call of a burst schedules it `delay` later, the calls until then
+    ride along (a fader drag writes its file once a second, not per step); flush() runs a pending call now."""
+
+    def __init__(self, fn, delay=1.0):
+        self.fn, self.delay, self.timer, self.lock = fn, delay, None, threading.Lock()
+
+    def __call__(self):
+        with self.lock:
+            if self.timer is None:
+                self.timer = threading.Timer(self.delay, self._run)
+                self.timer.daemon = True
+                self.timer.start()
+
+    def _run(self):
+        with self.lock:
+            self.timer = None
+        self.fn()
+
+    def flush(self):
+        with self.lock:
+            t, self.timer = self.timer, None
+        if t is not None:
+            t.cancel()
+            self.fn()

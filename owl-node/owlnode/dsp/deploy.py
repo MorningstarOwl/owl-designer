@@ -24,6 +24,8 @@ DESIGN = os.path.join(config.STATE_DIR, "dsp-design.json")
 PREV = os.path.join(config.STATE_DIR, "dsp-design.prev.json")
 STATE = os.path.join(config.STATE_DIR, "dsp-state.json")
 DRAFT = os.path.join(config.STATE_DIR, "dsp-draft.json")
+HISTORY = os.path.join(config.STATE_DIR, "dsp-history")      # the last HISTORY_KEEP deployed designs, one file each
+HISTORY_KEEP = 20
 PW_DIR = os.path.join(config.RUN_DIR, "dsp")
 PATCH_GRACE = 15        # s a far end gets to restore its own patch before we re-patch
 SHARE_RETRY = 5         # s between pushes of a satellite's share while it does not match
@@ -90,13 +92,13 @@ class StreamWatcher(threading.Thread):
         self.want = {}                   # node name -> target node name
         self.on_event = on_event
         self.p, self.hits, self.started = None, 0, None
-        self._stop = threading.Event()
+        self._halt = threading.Event()
 
     def set(self, moves):
         self.want = {m["node"]: m["target"] for m in moves or []}
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 self.p = subprocess.Popen(["pw-mon", "-N", "-p", "-a"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                           text=True, start_new_session=True)
@@ -110,7 +112,7 @@ class StreamWatcher(threading.Thread):
                     block = []
             except Exception as e:
                 log(f"stream watcher: {type(e).__name__}: {e}")
-            self._stop.wait(2)
+            self._halt.wait(2)
 
     def _block(self, lines):
         if not lines or not lines[0].startswith("added:") or not any("type: PipeWire:Interface:Node" in l for l in lines):
@@ -134,7 +136,7 @@ class StreamWatcher(threading.Thread):
         return self.p is not None and self.p.poll() is None
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         if self.running():
             self.p.terminate()
 
@@ -145,6 +147,31 @@ class GraphOps:
 
     def __init__(self, taps):
         self.taps, self.procs = taps, {}
+        self.pwctl = pw.PwCtl()            # live controls: one long-lived pw-cli (pw.PwCtl)
+        self.node_ids = {}                 # node name -> PipeWire id, from the last graph dump
+
+    def remember(self, g):
+        """Node ids for live controls, from a graph dump the caller made anyway (reconcile, wait_nodes)."""
+        self.node_ids = {n["name"]: n["id"] for n in g.nodes.values() if n["name"]}
+        return g
+
+    def send_controls(self, controls):
+        """[(node name, control, value)] -> live, one set-param per node. Node ids come from the last dump; a node not
+        in it (a block that just started) costs one fresh dump. -> how many controls were sent."""
+        by_node = {}
+        for node, ctl, val in controls:
+            by_node.setdefault(node, []).append((ctl, val))
+        if any(n not in self.node_ids for n in by_node):
+            try:
+                self.remember(pw.dump())
+            except Exception:
+                pass
+        done = 0
+        for node, pairs in by_node.items():
+            nid = self.node_ids.get(node)
+            if nid is not None and self.pwctl.set(nid, pairs):
+                done += len(pairs)
+        return done
 
     def _full_conf(self, conf):
         return conf
@@ -167,6 +194,7 @@ class GraphOps:
             g = pw.dump()
             missing = [n for n in names if not g.node(n) or not g.ports.get(g.node(n)["id"])]
             if not missing or time.time() - t0 > timeout:
+                self.remember(g)
                 return g, missing
             time.sleep(0.3)
 
@@ -221,8 +249,14 @@ class GraphOps:
         return n
 
     def tap_links(self, taps):
-        return [{"src": {"node": t["node"], "monitor": t["monitor"], "ports": t.get("ports")},
-                 "dst": {"node": f"owl-meter-{name}", "ports": None}, "wire": f"meter:{name}"} for name, t in taps.items()]
+        """Links from every tapped node into its tap's channels of a meter bank (meters.Taps; call after want())."""
+        out = []
+        for name, t in taps.items():
+            tg = self.taps.target(name) if self.taps is not None else None
+            if tg:
+                out.append({"src": {"node": t["node"], "monitor": t["monitor"], "ports": t.get("ports")},
+                            "dst": {"node": tg[0], "ports": tg[1]}, "wire": f"meter:{name}"})
+        return out
 
     def tap_channels(self, g, taps):
         out = {}
@@ -238,6 +272,14 @@ class Deployer:
     def __init__(self, cfg, inv, types, taps, controller):
         self.cfg, self.inv, self.types, self.taps, self.ctl = cfg, inv, types, taps, controller
         self.lock = threading.RLock()
+        # Live parameter changes do not take self.lock (a deploy, or the 2 s reconcile with its HTTP calls, holds it for
+        # seconds): they read and replace self.design under dlock (held for microseconds; every replacement of
+        # self.design goes through it, copy-on-write), serialise per block, and bump nothing else. design_gen counts
+        # deploys, so a live change racing a deploy does not overwrite the new design.
+        self.dlock = threading.Lock()
+        self.design_gen = 0
+        self._block_locks, self._block_locks_guard = {}, threading.Lock()
+        self.persist_design = pw.Debounced(self._write_design, 1.0)
         self.ops = GraphOps(taps)
         self.sats = inv.sats                # host -> SatClient (satellite dsp roles found by the inventory)
         self.share_pending = {}             # host -> why its share is not applied (unreachable); reconcile retries
@@ -308,7 +350,8 @@ class Deployer:
 
     def _compile(self, design, strict=True):
         inv = self.inv.refresh(0)
-        return compile_design(design, inv, self.types, self.state.get("alloc"), strict=strict)
+        return compile_design(design, inv, self.types, self.state.get("alloc"), strict=strict,
+                              prev_tx_alloc=self.state.get("tx_alloc"))
 
     def _full_conf(self, conf):
         return conf
@@ -572,11 +615,23 @@ class Deployer:
         return bool(s.get("active")) and not s.get("sender_id")
 
     def _apply_raw_patches(self, desired, wait_s=8):
-        """Receivers wired from an RTSP block's video: patched with our own transport file when it changed or the
-        receiver is not playing it; receivers a previous design patched this way and this one does not are released."""
+        """Receivers patched with a transport file of our own (no NMOS sender behind it): wired from an RTSP block's
+        video (MediaMTX's relay), or from an AES67 stream announced over SAP (its own SDP, sap.py). Patched when the
+        file changed or the receiver is not playing it; receivers a previous design patched this way and this one does
+        not are released."""
         changes, applied = [], {}
         before = dict(self.state.get("raw_patches") or {})
         for rid, rp in (getattr(desired, "raw_patches", None) or {}).items():
+            if rp.get("sdp"):                                  # an announced AES67 stream
+                dig = __import__("hashlib").sha1(rp["sdp"].encode()).hexdigest()[:10]
+                applied[rid] = dig
+                if before.get(rid) == dig and self._raw_ok(rid):
+                    continue
+                code, resp = self.ctl.patch_sdp(rid, rp["sdp"], [{"rtp_enabled": True}])
+                if code not in (200, 202):
+                    raise DeployError(f"IS-05 patch of receiver {rid} <- {rp['label']} (AES67/SAP): HTTP {code} {str(resp)[:200]}")
+                changes.append(f"patched {rid[:8]} <- {rp['label']} (AES67/SAP)")
+                continue
             codec = self._rtsp_codec(rp, wait_s=wait_s)
             if codec is None:
                 codec = "h264"
@@ -598,6 +653,46 @@ class Deployer:
         self._raw_applied = applied
         return changes
 
+    def _rx_override(self, rid):
+        """The latency override an owl-node reports for one of its receivers (its /x-owl/v1/status), or '?' unknown."""
+        nst = (self.inv.nmos or {}).get("status") or {}
+        for st in nst.values():
+            r = ((st or {}).get("receivers") or {}).get(rid)
+            if r is not None:
+                return r.get("latency_override")
+        return "?"
+
+    def _apply_latency(self, desired, force=False):
+        """Receivers' playout latency (design / wire latency_ms) on their nodes; receivers a previous design set and
+        this one does not go back to their node's default. Best effort: a node that is down is retried by reconcile."""
+        changes, applied = [], {}
+        before = dict(self.state.get("rx_latency") or {})
+        want = dict(getattr(desired, "rx_latency", None) or {})
+        for rid in set(before) | set(want):
+            ms = want.get(rid)
+            cur = self._rx_override(rid)
+            if not force and cur != "?" and cur == ms:
+                if ms is not None:
+                    applied[rid] = ms
+                continue
+            if not force and cur == "?" and before.get(rid) == ms:
+                if ms is not None:
+                    applied[rid] = ms
+                continue
+            try:
+                code, resp = self.ctl.set_receiver_latency(rid, ms)
+            except Exception as e:
+                code, resp = 0, str(e)
+            if code == 200:
+                if ms is not None:
+                    applied[rid] = ms
+                changes.append(f"receiver {rid[:8]} latency " + (f"{ms:g} ms" if ms is not None else "back to its node's default"))
+            else:
+                applied[rid] = before.get(rid)           # not done (node down?): kept as it was, reconcile retries
+                self.event(f"latency of receiver {rid[:8]} not set (HTTP {code} {str(resp)[:120]}); retrying")
+        self.state["rx_latency"] = {k: v for k, v in applied.items() if v is not None}
+        return changes
+
     def _apply_patches(self, desired, owned_before, adopted):
         changes = []
         self.inv.refresh(0)
@@ -607,8 +702,9 @@ class Deployer:
                 if code not in (200, 202):
                     raise DeployError(f"IS-05 patch of receiver {rid} <- {sid}: HTTP {code} {str(resp)[:200]}")
                 changes.append(f"patched {rid[:8]} <- {sid[:8]}")
+        raw = getattr(desired, "raw_patches", None) or {}
         for rid in set(owned_before) | set(adopted):
-            if rid not in desired.patches and rid in self.inv.receivers and self._sub(rid) is not None:
+            if rid not in desired.patches and rid not in raw and rid in self.inv.receivers and self._sub(rid) is not None:
                 code, resp = self.ctl.patch(rid, None)
                 changes.append(f"disconnected {rid[:8]} -> {code}")
         return changes
@@ -679,8 +775,8 @@ class Deployer:
                 if rid not in new.patches and self._sub(rid):
                     diff["patches"]["clear"].append(f"{lab(rid)} (now <- {lab(self._sub(rid))})")
             taps = self._auto_taps(new)
-            diff["taps"]["start"] = [n for n in taps if n not in self.taps.taps]
-            diff["taps"]["stop"] = [n for n in self.taps.taps if n not in taps]
+            diff["taps"]["start"] = [n for n in taps if n not in self.taps.alloc]
+            diff["taps"]["stop"] = [n for n in self.taps.alloc if n not in taps]
             diff["moves"] = {"set": [], "clear": [], "keep": []}
             old_moves = {m["node"]: m["target"] for m in self.state.get("moves") or []}
             for m in new.moves:
@@ -692,7 +788,7 @@ class Deployer:
                     diff["moves"]["clear"].append(f"{node} (was -> {tgt}; back to its own output)")
             changes = sum(len(v) for sec in diff.values() for k, v in sec.items() if k != "keep")
             return {"ok": True, "errors": [], "warnings": new.warnings, "diff": diff, "changes": changes,
-                    "wires": new.wire_impl, "alloc": new.alloc, "pending": new.pending,
+                    "wires": new.wire_impl, "alloc": new.alloc, "tx_alloc": new.tx_alloc, "pending": new.pending,
                     "impact": self._impact(design, new)}
 
     def _impact(self, design, new):
@@ -763,14 +859,16 @@ class Deployer:
                 changes = self._apply_patches(new, owned_patches_before, adopted)
                 self._sync_mediamtx(new, refresh_pins=(reason == "deploy"))
                 changes += self._apply_raw_patches(new)
+                changes += self._apply_latency(new)
                 rx_nodes = [(self.inv.receivers[r].get("tags") or {}).get("urn:x-owl:pipewire-node", [None])[0]
-                            for r in new.patches if r in self.inv.receivers and r in {x["id"] for x in self.inv.hub_receivers}]
+                            for r in list(new.patches) + list(new.raw_patches)
+                            if r in self.inv.receivers and r in {x["id"] for x in self.inv.hub_receivers}]
                 g, missing = self.ops.wait_nodes([n for n in rx_nodes if n])
                 if missing:
                     raise DeployError(f"hub receiver nodes did not appear after patching: {', '.join(missing)}")
                 taps = self._auto_taps(new)
                 self.taps.want(self.ops.tap_channels(g, taps))
-                g, _ = self.ops.wait_nodes([f"owl-meter-{n}" for n in taps], timeout=4)
+                g, _ = self.ops.wait_nodes(self.taps.nodes(), timeout=4)
                 owned = []
                 missing, created, pending = self.ops.ensure_links(g, new.links + self.ops.tap_links(taps), owned)
                 if missing:
@@ -781,22 +879,28 @@ class Deployer:
                 self.watcher.set(new.moves)
                 self._device_setup(new, g)
                 changes += mv_changes
-                self.state = {"links": owned, "patches": dict(new.patches), "alloc": dict(new.alloc), "procs": sorted(new.procs),
+                self.state = {"links": owned, "patches": dict(new.patches), "alloc": dict(new.alloc),
+                              "tx_alloc": dict(new.tx_alloc), "procs": sorted(new.procs),
+                              "rx_latency": dict(self.state.get("rx_latency") or {}),
                               "taps": sorted(taps), "adopted": [], "deployed_at": time.time(), "name": design.get("name"),
                               "moves": mv_rec, "aliases": self.state.get("aliases") or {}, "shares": shares,
                               "raw_patches": dict(getattr(self, "_raw_applied", {}) or {}),
                               "fingerprints": dict(self.state.get("fingerprints") or {})}
-                self.desired = new
                 if reason == "deploy" and prev_design is not None and prev_design != design and not keep_prev:
                     atomic_write(PREV, prev_design)
                 if reason == "deploy":
                     self.state["aliases"] = control_aliases(prev_design, design, self.types)
                     atomic_write(STATE, self.state)
-                self.design = copy.deepcopy(design)
+                with self.dlock:
+                    self.desired = new
+                    self.design = copy.deepcopy(design)
+                    self.design_gen += 1
                 atomic_write(DESIGN, self.design)
                 atomic_write(STATE, self.state)
                 self.patch_bad_since = {}
                 self.recompile_next = time.time() + 5
+                if reason in ("deploy", "rollback", "restore"):
+                    self._remember(design, reason)
                 self._notify(reason)
                 self.event(f"{reason}: {design.get('name')!r} applied in {time.time() - t0:.1f} s: {len(new.procs)} block process(es), "
                            f"{created} link(s) made, {removed} removed, {len(changes)} patch change(s), {len(pending)} pending"
@@ -855,11 +959,24 @@ class Deployer:
                 except Exception as e:
                     self.event(f"recompile with pending wires failed: {e}")
             self._reconcile_shares()
+            sap = getattr(self.inv, "sap", None)
+            if sap is not None and time.time() >= getattr(self, "sap_next", 0):
+                self.sap_next = time.time() + 5
+                moved = [rp["label"] for rp in (self.desired.raw_patches or {}).values()
+                         if rp.get("sdp") and (sap.get(rp.get("stream")) or {}).get("sdp") not in (None, rp["sdp"])]
+                if moved:                          # re-announced with another SDP (a Dante reconfiguration, ...)
+                    self.event(f"AES67 stream(s) re-announced with a new SDP: {', '.join(moved)}: re-applying")
+                    try:
+                        self.inv.refresh(0)
+                        self.apply(self.design, rollback=False, reason="AES67 stream re-announced", strict=False)
+                    except Exception as e:
+                        self.event(f"re-apply after a re-announcement failed: {e}")
             if (getattr(self.desired, "rtsp_video", None) or getattr(self.desired, "raw_patches", None)) \
                     and time.time() >= getattr(self, "mtx_next", 0):
                 self.mtx_next = time.time() + 15               # RTSP relay: paths and receivers heal themselves
                 try:
-                    self._sync_mediamtx(self.desired)
+                    if self.desired.rtsp_video:
+                        self._sync_mediamtx(self.desired)
                     if self.desired.raw_patches:
                         self.inv.refresh(0)
                         if any(not self._raw_ok(r) for r in self.desired.raw_patches):
@@ -867,15 +984,18 @@ class Deployer:
                             self.state["raw_patches"] = dict(self._raw_applied)
                             atomic_write(STATE, self.state)
                             if ch:
-                                self.event("re-patched camera receiver(s): " + "; ".join(ch))
+                                self.event("re-patched receiver(s) (camera / AES67 stream): " + "; ".join(ch))
                 except Exception as e:
-                    self.event(f"RTSP relay check: {type(e).__name__}: {e}")
+                    self.event(f"own-SDP patches (camera / AES67 stream): {type(e).__name__}: {e}")
             try:
-                g = pw.dump()
+                g = self.ops.remember(pw.dump())
                 self.last_graph_error = None
             except Exception as e:
                 self.last_graph_error = str(e)
                 return
+            if self.ops.pwctl.error_seq != getattr(self, "_pw_err_seen", 0):
+                self._pw_err_seen = self.ops.pwctl.error_seq
+                self.event(f"live control: pw-cli said {self.ops.pwctl.errors[-1][1] if self.ops.pwctl.errors else '?'}")
             taps = self._auto_taps(self.desired)
             self.taps.want(self.ops.tap_channels(g, taps))
             self._device_setup(self.desired, g)
@@ -909,6 +1029,15 @@ class Deployer:
             except Exception:
                 return
             now = time.time()
+            if (self.desired.rx_latency or self.state.get("rx_latency")) and now >= getattr(self, "lat_next", 0):
+                self.lat_next = now + 15
+                want = self.desired.rx_latency or {}
+                if any(self._rx_override(r) not in ("?", want.get(r)) for r in set(want) | set(self.state.get("rx_latency") or {})) \
+                        or any(self.state.get("rx_latency", {}).get(r) != v for r, v in want.items()):
+                    ch = self._apply_latency(self.desired)
+                    atomic_write(STATE, self.state)
+                    if ch:
+                        self.event("receiver latency: " + "; ".join(ch))
             for rid, sid in self.desired.patches.items():
                 if rid not in self.inv.receivers:
                     continue                     # the node is gone (satellite down); nothing to patch yet
@@ -922,66 +1051,124 @@ class Deployer:
                     self.patch_bad_since[rid] = now + 30
 
     # ------------------------------------------------------------------ live controls
+    # ------------------------------------------------------------------ history
+    def _remember(self, design, reason):
+        """Keep a copy of a deployed design (the designer's History loads one back onto the canvas)."""
+        try:
+            os.makedirs(HISTORY, exist_ok=True)
+            ms = int(time.time() * 1000)
+            while any(f.startswith(f"{ms}-") for f in os.listdir(HISTORY)):
+                ms += 1                       # two in one millisecond (a failed deploy's automatic rollback): unique
+            hid = f"{ms}-{reason}"
+            atomic_write(os.path.join(HISTORY, hid + ".json"), {"id": hid, "reason": reason, "deployed_at": time.time(),
+                                                                 "design": design})
+            for old in sorted(f for f in os.listdir(HISTORY) if f.endswith(".json"))[:-HISTORY_KEEP]:
+                os.unlink(os.path.join(HISTORY, old))
+        except OSError as e:
+            self.event(f"design history: {e}")
+
+    def history(self):
+        out = []
+        try:
+            names = sorted((f for f in os.listdir(HISTORY) if f.endswith(".json")), reverse=True)
+        except OSError:
+            names = []
+        for f in names:
+            h = read_json(os.path.join(HISTORY, f), None)
+            if isinstance(h, dict) and isinstance(h.get("design"), dict):
+                d = h["design"]
+                out.append({"id": h["id"], "reason": h.get("reason"), "deployed_at": h.get("deployed_at"), "name": d.get("name"),
+                            "blocks": len(d.get("blocks") or []), "wires": len(d.get("wires") or [])})
+        return out
+
+    def history_item(self, hid):
+        if not hid or "/" in hid or hid.startswith("."):
+            raise DeployError("no such history entry")
+        h = read_json(os.path.join(HISTORY, hid + ".json"), None)
+        if not isinstance(h, dict):
+            raise DeployError("no such history entry")
+        return h
+
+    def _block_lock(self, bid):
+        with self._block_locks_guard:
+            return self._block_locks.setdefault(bid, threading.Lock())
+
+    def _write_design(self):
+        with self.dlock:
+            d = self.design
+        if d:
+            atomic_write(DESIGN, d)
+
     def set_param(self, bid, name, value, persist=True, source="api", quiet=False):
-        """persist=False: a fade step (the design file is written on the last step); quiet: no change notification."""
-        with self.lock:
-            if not self.design:
+        """A block parameter. A live one takes the fast path: no deployer lock, node ids from the last graph dump, the
+        long-lived pw-cli (GraphOps.send_controls), the design file written at most once a second. Any other parameter
+        restarts the block through a deploy. persist=False: a fade step (the last step persists); quiet: no notice."""
+        with self._block_lock(bid):
+            with self.dlock:
+                design, gen, desired = self.design, self.design_gen, self.desired
+            if not design:
                 raise DeployError("nothing deployed")
-            blk = next((b for b in self.design.get("blocks", []) if b["id"] == bid), None)
+            blk = next((b for b in design.get("blocks", []) if b["id"] == bid), None)
             if not blk:
                 raise DeployError(f"no block {bid} in the deployed design")
             bt = self.types.get(blk["type"])
             if not bt or name not in bt.params:
                 raise DeployError(f"block {bid} has no param {name}")
-            design = copy.deepcopy(self.design)
-            b2 = next(b for b in design["blocks"] if b["id"] == bid)
-            b2.setdefault("params", {})[name] = value
-            if name in bt.live_params():
-                ctx = bt.ctx(bid, blk.get("label"), b2["params"])
-                host = self.desired.block_host.get(bid, self.cfg.name) if self.desired else self.cfg.name
-                done = 0
-                if host != self.cfg.name:
-                    c = self.sats.get(host)
-                    if not c or not c.ok:
-                        raise DeployError(f"satellite {host} is unreachable")
-                    conf = bt.render_conf(ctx)
-                    ok, r = c.control([list(x) for x in bt.controls(ctx)], {bid: conf})
-                    if not ok:
-                        raise DeployError(f"satellite {host}: {r}")
-                    done = (r or {}).get("controls_set", 0)
-                    sh = self.desired.shares.get(host)
-                    if sh:
-                        sh["procs"][bid] = conf
-                        new_ctl = {(n_, c_): v_ for n_, c_, v_ in bt.controls(ctx)}
-                        sh["controls"] = [c_ for c_ in sh["controls"] if (c_[0], c_[1]) not in new_ctl] + [[n_, c_, v_] for (n_, c_), v_ in new_ctl.items()]
-                        sh["digest"] = share_digest(sh)
-                else:
-                    g = pw.dump()
-                    for node, ctl, val in bt.controls(ctx):
-                        n = g.node(node)
-                        if n:
-                            ok, err = pw.set_control(n["id"], ctl, val)
-                            done += ok
-                self.design = design
-                if persist:
-                    atomic_write(DESIGN, design)
+            if name not in bt.live_params():
+                return self._set_param_by_deploy(bid, name, value, source)
+            ctx = bt.ctx(bid, blk.get("label"), dict(blk.get("params") or {}, **{name: value}))
+            controls, conf = bt.controls(ctx), bt.render_conf(ctx)
+            host = desired.block_host.get(bid, self.cfg.name) if desired else self.cfg.name
+            if host != self.cfg.name:
+                c = self.sats.get(host)
+                if not c or not c.ok:
+                    raise DeployError(f"satellite {host} is unreachable")
+                ok, r = c.control([list(x) for x in controls], {bid: conf})
+                if not ok:
+                    raise DeployError(f"satellite {host}: {r}")
+                done = (r or {}).get("controls_set", 0)
+            else:
+                done = self.ops.send_controls(controls)
+            with self.dlock:
+                if self.design_gen != gen:
+                    # a deploy replaced the design meanwhile and set every control to its own values
+                    return {"ok": True, "live": True, "controls_set": done, "superseded": True}
+                cur = self.design
+                self.design = dict(cur, blocks=[dict(b, params=dict(b.get("params") or {}, **{name: value}))
+                                                if b["id"] == bid else b for b in cur.get("blocks", [])])
                 if self.desired:
-                    self.desired._design = design
+                    self.desired._design = self.design
                     if host == self.cfg.name:
-                        self.desired.procs[bid] = bt.render_conf(ctx)
+                        self.desired.procs[bid] = conf
+                    else:
+                        sh = self.desired.shares.get(host)
+                        if sh:
+                            sh["procs"][bid] = conf
+                            new_ctl = {(n_, c_): v_ for n_, c_, v_ in controls}
+                            sh["controls"] = [c_ for c_ in sh["controls"] if (c_[0], c_[1]) not in new_ctl] + [[n_, c_, v_] for (n_, c_), v_ in new_ctl.items()]
+                            sh["digest"] = share_digest(sh)
                 p = self.procs.get(bid)
                 if p:
                     # keep the process record at the live values: a later deploy of this design is then a no-op for
                     # the block (2026-11-10: the ducker and volume restarted on a deploy that changed nothing of theirs,
                     # because their records still held the values of the last apply), and a crash restart comes back
                     # with the current values instead of the old ones
-                    p.conf = self._full_conf(bt.render_conf(ctx))
-                if not quiet:
-                    self._notify("param", block=bid, param=name, source=source)
-                return {"ok": True, "live": True, "controls_set": done}
-            r = self.apply(design, rollback=True, reason=f"param {bid}.{name}")
+                    p.conf = self._full_conf(conf)
+        if persist:
+            self.persist_design()
+        if not quiet:
             self._notify("param", block=bid, param=name, source=source)
-            return r
+        return {"ok": True, "live": True, "controls_set": done}
+
+    def _set_param_by_deploy(self, bid, name, value, source):
+        """A parameter that is not live (the AEC's module arguments, a block's channel count): a deploy restarts it."""
+        with self.lock:
+            design = copy.deepcopy(self.design)
+            b2 = next(b for b in design["blocks"] if b["id"] == bid)
+            b2.setdefault("params", {})[name] = value
+            r = self.apply(design, rollback=True, reason=f"param {bid}.{name}")
+        self._notify("param", block=bid, param=name, source=source)
+        return r
 
     def update_design(self, panels=None, presets=None):
         """Panels and presets live in the design but change no audio: edit the deployed design (and the draft, so
@@ -989,10 +1176,13 @@ class Deployer:
         with self.lock:
             if not self.design:
                 raise DeployError("nothing deployed")
-            if panels is not None:
-                self.design["panels"] = panels
-            if presets is not None:
-                self.design["presets"] = presets
+            with self.dlock:
+                d = dict(self.design)
+                if panels is not None:
+                    d["panels"] = panels
+                if presets is not None:
+                    d["presets"] = presets
+                self.design = d
             atomic_write(DESIGN, self.design)
             draft = read_json(DRAFT, None)
             if isinstance(draft, dict) and draft.get("wires") is not None:
@@ -1062,7 +1252,8 @@ class Deployer:
                         w["detail"].append("the receiver is not registered (its node is down?)")
                     elif not self._raw_ok(rid):
                         w["state"] = "missing"
-                        w["detail"].append("the receiver is not playing the camera (re-patched within 15 s)")
+                        w["detail"].append("the receiver is not playing " + ("the stream" if rp.get("sdp") else "the camera")
+                                           + " (re-patched within 15 s)")
                 for wid, node in (getattr(self.desired, "voice_wires", None) or {}).items():   # the assistant's listen/reply
                     w = wires.setdefault(wid, {"state": "ok", "detail": []})
                     if not g.node(node):
@@ -1092,8 +1283,9 @@ class Deployer:
                         continue
                     w = wires.setdefault(wid, {"state": "ok", "detail": []})
                     st_ = tstats.get(name) or {}
-                    mn = g.node(f"owl-meter-{name}")
-                    linked = mn and any(l["in_node"] == f"owl-meter-{name}" for l in g.links)
+                    tg = self.taps.target(name)
+                    mn = tg and g.node(tg[0])
+                    linked = mn and any(l["in_node"] == tg[0] and l["out_node"] == t["node"] for l in g.links)
                     if not st_.get("running") or not mn:
                         w["state"], w["detail"] = "pending", ["meter tap starting"]
                     elif not linked:
@@ -1156,6 +1348,8 @@ class Deployer:
                 "meta": {"adopted": adopted, "baseline": True}}
 
     def stop(self):
+        self.persist_design.flush()
+        self.ops.pwctl.stop()
         with self.lock:
             self.watcher.stop()
             for p in self.procs.values():

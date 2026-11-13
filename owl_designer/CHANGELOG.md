@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.11.0
+- Designer: **🔊 Inject** next to the probe: drag it onto any input, on any machine, to play pink/white noise or a sine
+  at a set level for a set time. **Sounds** in the Design panel: upload doorbells, chimes and alarms; a new **Sound
+  player** block plays one when its Play button is pressed (inspector, Panels, Home Assistant). Needs owl-node 0.11.0.
+
+## 0.10.0
+- Designer: **Export** / **Import…** design files and a **History** of the last 20 deployed designs (Design panel)
+  to open on the canvas (needs owl-node 0.10.0 on the hub).
+- Engine (owl-node 0.10.0): faders and fades respond at once (one long-lived PipeWire control connection instead of a
+  process per change; 10 ms fade steps); all meters run in one process; a **Needs attention** sensor in Home Assistant
+  and Prometheus metrics at `:8362/metrics`.
+
+## 0.9.0
+- Designer: **Network latency** in the Design panel (how long receivers buffer streams between machines; one value
+  keeps rooms in step) and a latency per wire in its inspector (needs owl-node 0.9.0 on the hub and the nodes).
+- Engine (owl-node 0.9.0): every node keeps a backup of the hub; `install.sh --hub --restore-from <node>` brings the
+  designs, panels, presets and nodes back on a replacement hub.
+
+## 0.8.0
+- Designer: AES67 streams that Dante devices (AES67 mode) and other AES67 gear announce on the network appear as
+  sources, with each channel pair of a multichannel flow as its own output (needs the hub on owl-node 0.8.0).
+- Engine (owl-node 0.8.0): one sender carries several sources side by side on separate channels (Dante-style flows);
+  a hub's sender has 8 channels, so four stereo streams leave the hub over one stream; `install.sh --ptp-udp` serves the
+  house clock to Dante gear.
+
+## 0.7.3
+- Routing page: video previews show whether they are live again (the add-on now asks the hub's engine, owl-node 0.7.3
+  or later, instead of MediaMTX's API, which only listens on the hub itself).
+- Engine (owl-node 0.7.3): different sources wired to different rooms get their own AES67 senders instead of being
+  mixed into one; nodes stand by as the network clock when the hub is off; IS-05 activations can no longer deadlock;
+  saved state survives power cuts.
+
 ## 0.7.2
 - Documentation tab rewritten, with a picture and first steps.
 - Designer: Panels pages fit phone screens (a row of page tabs made them wider than the screen); auto-placed blocks no

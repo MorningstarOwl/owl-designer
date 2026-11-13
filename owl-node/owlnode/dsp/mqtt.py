@@ -58,7 +58,7 @@ class Bridge(threading.Thread):
         self.published = set((read_json(PUBLISHED, {}) or {}).get("objects") or [])
         self.entities = 0
         self.port = controller_port
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self._last_meter = {}
         self._last_sys = {}
         self._discovery_version = -1
@@ -98,7 +98,7 @@ class Bridge(threading.Thread):
         self.client = cl
         q = self.ctl.bus.subscribe()
         threading.Thread(target=self._events, args=(q,), daemon=True).start()
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 cl.connect(self.conf["host"], self.conf["port"], keepalive=30)
                 cl.loop_forever(retry_first_connection=True)
@@ -106,7 +106,7 @@ class Bridge(threading.Thread):
                 self.error = f"{type(e).__name__}: {e}"
                 self.connected = False
                 log(f"connect to {self.conf['host']}:{self.conf['port']} failed: {self.error}; retry in 10 s")
-                self._stop.wait(10)
+                self._halt.wait(10)
 
     def _on_connect(self, cl, userdata, flags, rc, props=None):
         if getattr(rc, "is_failure", False) or (isinstance(rc, int) and rc != 0):
@@ -215,6 +215,10 @@ class Bridge(threading.Thread):
             elif c["type"] == "select":
                 comp = "select"
                 base["options"] = [str(x) for x in c.get("options") or []]
+            elif c["type"] == "trigger":              # a Sound player's Play / Stop
+                comp = "button"
+                base.pop("state_topic", None)
+                base.update({"payload_press": "PRESS", "icon": "mdi:play" if c.get("action") == "play" else "mdi:stop"})
             else:
                 comp = "text"
             out.append((o, comp, base))
@@ -245,6 +249,12 @@ class Bridge(threading.Thread):
                 cfg["unit_of_measurement"] = unit
                 cfg["state_class"] = "measurement"
             out.append((o, "sensor", cfg))
+        # one problem sensor for the whole system: ON when something needs attention, the list in its attributes
+        out.append(("health", "binary_sensor", {"name": "Needs attention", "unique_id": f"{self.node_id}_health",
+                                                "object_id": f"{self.node_id}_health", "device": dev, "availability": avail,
+                                                "state_topic": f"{self.base}/system/health/state", "device_class": "problem",
+                                                "payload_on": "ON", "payload_off": "OFF", "entity_category": "diagnostic",
+                                                "json_attributes_topic": f"{self.base}/system/health/attributes"}))
         return out
 
     def publish_all(self):
@@ -308,7 +318,9 @@ class Bridge(threading.Thread):
                 "design_state": (s["design.state"], {"error": s["design.error"], "repairs": s["dsp.repairs"]}),
                 "ptp_state": (s["ptp.state"], {"offset_ns": s["ptp.offset_ns"]}),
                 "ptp_offset_ns": (s["ptp.offset_ns"] if s["ptp.offset_ns"] is not None else "unknown", {}),
-                "registry_nodes": (s["registry.nodes"], {"error": s["registry.error"]})}
+                "registry_nodes": (s["registry.nodes"], {"error": s["registry.error"]}),
+                "health": ("OFF" if s.get("health.ok", True) else "ON", {"issues": s.get("health.issues") or [],
+                                                                         "count": len(s.get("health.issues") or [])})}
         for o, (st, attrs) in vals.items():
             if force or self._last_sys.get(o) != (st, json.dumps(attrs, sort_keys=True)):
                 self._last_sys[o] = (st, json.dumps(attrs, sort_keys=True))
@@ -318,7 +330,7 @@ class Bridge(threading.Thread):
     def _events(self, q):
         """Bus events -> state topics; meters at 1 Hz; system every 10 s; discovery when the design changes."""
         last_m = last_s = 0
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 ev = q.get(timeout=0.5)
             except Exception:
@@ -348,7 +360,7 @@ class Bridge(threading.Thread):
                 log(f"publish: {type(e).__name__}: {e}")
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         if self.client and self.connected:
             try:
                 self.client.publish(f"{self.base}/availability", "offline", qos=1, retain=True)

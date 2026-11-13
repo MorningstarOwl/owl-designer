@@ -24,7 +24,6 @@ Share format (built by the compiler, see compiler.Desired.shares; `digest` ident
 import hashlib, json, os, threading, time, urllib.error, urllib.request
 
 from .. import config
-from ..audio import Proc
 from ..config import atomic_write, read_json
 from . import pw
 
@@ -58,7 +57,7 @@ def graph_objects(timeout=10):
     if out.returncode != 0:
         raise RuntimeError(f"pw-dump: {out.stderr.strip()[:200]}")
     objs = []
-    for o in json.loads(out.stdout or "[]"):
+    for o in pw.parse_dump(out.stdout):
         t = o.get("type")
         info = o.get("info") or {}
         if t == "PipeWire:Interface:Node":
@@ -90,11 +89,11 @@ class SatClient(threading.Thread):
         self.status, self.graph, self.graph_time = None, None, 0
         self.ok, self.error, self.last_ok, self.seen = False, None, 0, False
         self.version = None
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self.lock = threading.Lock()
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 code, st = http("GET", f"{self.url}/api/dsp/status", timeout=1.5)
                 if code == 200 and isinstance(st, dict) and st.get("mode") == "satellite":
@@ -110,7 +109,7 @@ class SatClient(threading.Thread):
                     self._fail(f"HTTP {code}" if code != 200 else "not a satellite dsp role")
             except Exception as e:
                 self._fail(f"{type(e).__name__}: {str(e)[:80]}")
-            self._stop.wait(0.5 if self.ok else 5.0)
+            self._halt.wait(0.5 if self.ok else 5.0)
 
     def _fail(self, why):
         with self.lock:
@@ -119,7 +118,7 @@ class SatClient(threading.Thread):
             self.ok, self.error = False, why
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
     def put_share(self, share, timeout=30):
         try:
@@ -168,6 +167,7 @@ class ShareDeployer:
         self.ops = GraphOps(taps)
         self.cfg, self.taps = cfg, taps
         self.lock = threading.RLock()
+        self.persist_share = pw.Debounced(self._write_share, 1.0)      # live controls: the file once a second
         self.share = read_json(SHARE, None) or empty_share(cfg.name)
         self.share.setdefault("digest", share_digest(self.share))
         self.applied_at, self.error, self.events, self.repairs = None, None, [], 0
@@ -207,7 +207,7 @@ class ShareDeployer:
             if missing and not restore:
                 raise RuntimeError(f"block nodes did not appear: {', '.join(missing)}")
             self.taps.want(self._taps_for(share, g))
-            g, _ = self.ops.wait_nodes([f"owl-meter-{n}" for n in (share.get("taps") or {})], timeout=4)
+            g, _ = self.ops.wait_nodes(self.taps.nodes(), timeout=4)
             owned = []
             links = list(share.get("links") or []) + self.ops.tap_links(share.get("taps") or {})
             miss, created, pending = self.ops.ensure_links(g, links, owned)
@@ -231,15 +231,14 @@ class ShareDeployer:
     def clear(self):
         return self.apply(empty_share(self.cfg.name))
 
-    def control(self, sets, procs):
+    def _write_share(self):
         with self.lock:
-            g = pw.dump()
-            done = 0
-            for node, ctl, val in sets or []:
-                n = g.node(node)
-                if n:
-                    ok, _ = pw.set_control(n["id"], ctl, val)
-                    done += ok
+            atomic_write(SHARE, self.share)
+
+    def control(self, sets, procs):
+        # live: straight to PipeWire (cached node ids, the long-lived pw-cli), not behind the reconcile's lock
+        done = self.ops.send_controls([tuple(x) for x in sets or []])
+        with self.lock:
             # the running process record and the saved share follow the live values (no restart; a crash restart or
             # a reboot comes back with them)
             for bid, conf in (procs or {}).items():
@@ -250,8 +249,8 @@ class ShareDeployer:
                 cs = self.share.setdefault("controls", [])
                 cs[:] = [c for c in cs if not (c[0] == node and c[1] == ctl)] + [[node, ctl, val]]
             self.share["digest"] = share_digest(self.share)
-            atomic_write(SHARE, self.share)
-            return {"ok": True, "controls_set": done, "digest": self.share["digest"]}
+        self.persist_share()
+        return {"ok": True, "controls_set": done, "digest": self.share["digest"]}
 
     def reconcile(self):
         with self.lock:
@@ -261,7 +260,7 @@ class ShareDeployer:
                 if not was and p.running():
                     self.event(f"block process {p.name} restarted")
             try:
-                g = pw.dump()
+                g = self.ops.remember(pw.dump())
                 self.last_graph_error = None
             except Exception as e:
                 self.last_graph_error = str(e)
@@ -309,6 +308,8 @@ class ShareDeployer:
                     "pw_error": self.last_graph_error}
 
     def stop(self):
+        self.persist_share.flush()
+        self.ops.pwctl.stop()
         with self.lock:
             for p in self.procs.values():
                 p.stop()

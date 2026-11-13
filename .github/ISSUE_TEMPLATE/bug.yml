@@ -1,0 +1,39 @@
+name: Bug report
+description: Something does not work as described
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen
+      description: The design (Export in the designer gives a JSON file you can attach), the wires and blocks involved, what you pressed.
+  - type: input
+    id: version
+    attributes:
+      label: owl-node version
+      description: "`docker run --rm owl-node:<tag> version`, or the designer's /api/info"
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      multiple: true
+      options: [hub, node (satellite), Home Assistant add-on, designer page, install.sh]
+  - type: textarea
+    id: machines
+    attributes:
+      label: Machines
+      description: Distribution and version, PipeWire version (`pw-cli info 0`), network card / PTP clock, Raspberry Pi model.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and status
+      description: "`docker compose logs dsp agent audio` around the time, and `curl -s http://<hub>:8362/api/dsp/health`. Remove passwords and camera links."
+      render: text
