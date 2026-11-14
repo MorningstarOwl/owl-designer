@@ -3,6 +3,12 @@
 The engine (the `owl-node` image, `install.sh`, the designer pages). The Home Assistant add-on has its own:
 [owl_designer/CHANGELOG.md](../owl_designer/CHANGELOG.md). Versions are shared: one `X.Y.Z` for both.
 
+## 0.11.3
+- `install.sh` finds the PTP hardware clock on Debian 13 / Raspberry Pi OS trixie: newer ethtool reports it as
+  "Hardware timestamp provider index", so a Raspberry Pi 5 node fell back to the system clock and its audio drifted.
+- Troubleshooting for DAC HATs on a node: the overlay, more ALSA headroom, and a receiver latency above the card's
+  delay.
+
 ## 0.11.2
 - Home Assistant: a voice reply (or what was heard) longer than 255 characters no longer turns the Reply / Heard
   sensor "unknown": the state is shortened with an ellipsis and the whole text is the sensor's `text` attribute.
