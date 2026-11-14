@@ -31,6 +31,10 @@ press **Deploy**, and the hub turns them into PipeWire links on each machine and
 
 - **One canvas for every machine.** Add a machine by typing its IP; its inputs and outputs appear. Wires between
   machines become AES67 streams (every machine on one PTP clock) and NMOS patches — you never pick a transport.
+- **A canvas that stays readable.** Wires run at right angles around the blocks, in lanes where they share a channel;
+  **Organize** lines a whole design up left to right. Coloured boxes and sticky notes structure it, long wires can
+  become named signals, unwired devices wait in a drawer, selecting anything traces its signal path. Undo, multi-select,
+  copy/paste, snapping, search and a minimap as you would expect.
 - **Processing blocks**, live where it makes sense: parametric and DJ EQ, compressor, limiter, ducker, gain, delay,
   mixer, router, test tone, meters. They run on the hub or on any node. A block type is one YAML file.
 - **Echo cancellation for voice.** The WebRTC AEC3 block removes what the speakers and the TV play from the microphone,

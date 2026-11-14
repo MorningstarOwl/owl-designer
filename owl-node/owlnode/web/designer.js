@@ -266,7 +266,99 @@ function portsOf(t, params) {
   return { inputs: (t.inputs || []).map(mk), outputs: (t.outputs || []).map(mk) };
 }
 
-const nodeTypes = { device: DeviceNode, proc: ProcNode };
+// ------------------------------------------------------------------ boxes and notes
+// Things that organize the canvas and change nothing in the room: coloured boxes behind groups of blocks, and notes.
+// They live in design.canvas (with which devices sit on the canvas and which wires are drawn as signal names), so they
+// travel with the design: draft, deploy, history, export.
+const TINTS = { blue: "#3b82c4", green: "#3f9d63", amber: "#d99a2b", purple: "#7d67c9", teal: "#1f9aa5", red: "#cf5b50", grey: "#8a8983" };
+const WIRE_COLORS = ["#e07a3f", "#3b8fd9", "#4caf6e", "#c95fb8", "#d1a52c", "#1fa5a8", "#8c7ae6", "#d9534f", "#6b9e2e", "#5c7cfa"];
+const isAnnot = (id) => id.startsWith("box:") || id.startsWith("note:");
+function BoxNode({ data, selected }) {
+  return h("div", { className: `cbox${selected ? " selected" : ""}`, style: { "--tint": TINTS[data.color] || TINTS.blue } },
+    !data.run && h(RF.NodeResizer, { isVisible: !!selected, minWidth: 160, minHeight: 90 }),
+    h("div", { className: "cbox-hd", title: "Drag to move the box and what is in it" }, data.title || "Group"));
+}
+function NoteNode({ data, selected }) {
+  return h("div", { className: `cnote${selected ? " selected" : ""}`, style: { "--tint": TINTS[data.color] || TINTS.amber } },
+    !data.run && h(RF.NodeResizer, { isVisible: !!selected, minWidth: 120, minHeight: 60 }),
+    h("div", { className: "cnote-tx" }, data.text || "Note"));
+}
+function AnnotInfo({ a, kind, run, set, remove }) {
+  return h("div", { className: "insp" },
+    h("h3", null, kind === "box" ? "Group box" : "Note"),
+    kind === "box" ? [h("label", { key: "l" }, "Title"), h("input", { key: "i", type: "text", value: a.title || "", onChange: (e) => set("title", e.target.value) })]
+      : [h("label", { key: "l" }, "Text"), h("textarea", { key: "i", rows: 9, value: a.text || "", onChange: (e) => set("text", e.target.value) })],
+    h("label", null, "Colour"),
+    h("div", { className: "swatches" }, Object.keys(TINTS).map((k) => h("button", { key: k, className: a.color === k ? "on" : "", style: { background: TINTS[k] }, title: k, onClick: () => set("color", k) }))),
+    h("p", { className: "help" }, kind === "box" ? "Drag the title to move the box with everything in it; drag an edge to resize it. Organize keeps the blocks of a box together and fits the box around them. A box changes nothing in the room."
+      : "Drag it anywhere; drag an edge to resize it. A note inside a box moves with the box."),
+    !run && h("button", { className: "btn danger", onClick: remove, style: { marginTop: 8 } }, kind === "box" ? "Delete box (keeps the blocks)" : "Delete note"));
+}
+// a wire drawn as a signal name: nothing changes for the engine, the canvas shows a tag on both ports instead of a line
+function SignalRow({ name, defName, run, set }) {
+  return h("div", { className: "insp" },
+    h("label", { className: "row", style: { marginTop: 8 } }, h("input", { type: "checkbox", checked: name != null, onChange: (e) => set(e.target.checked ? defName : null) }), "Show as a signal name (no line)"),
+    name != null ? h("input", { type: "text", value: name, placeholder: "signal name", onChange: (e) => set(e.target.value) }) : null,
+    h("p", { className: "help" }, "For long runs and loops: the wire stays and deploys the same, but the canvas shows a name tag on both ports instead of drawing it. Other inputs can pick the name up: select a block, Signals."));
+}
+function SignalPick({ inputs, named, connect }) {
+  if (!named.length || !inputs.length) return null;
+  return h("div", { className: "insp" },
+    h("h3", null, "Signals"),
+    inputs.map((p) => h("div", { key: p.id, className: "row", style: { marginBottom: 4 } }, h("span", { style: { width: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12 } }, p.label),
+      h("select", { value: "", onChange: (e) => { if (e.target.value !== "") connect(named[Number(e.target.value)], p.id); } },
+        h("option", { value: "" }, "— connect a signal —"), named.map((n, i) => h("option", { key: i, value: i }, n.name || "signal"))))),
+    h("p", { className: "help" }, "Connects a named signal to an input without drawing a wire across the canvas."));
+}
+function Guides({ guides }) {                 // the lines a dragged block snaps to
+  const { x, y, zoom } = RF.useViewport();
+  if (!guides.length) return null;
+  return h("div", { className: "guides" }, guides.map((g_, i) => (g_.h != null ? h("i", { key: i, className: "gh", style: { top: g_.h * zoom + y } }) : h("i", { key: i, className: "gv", style: { left: g_.v * zoom + x } }))));
+}
+
+const nodeTypes = { device: DeviceNode, proc: ProcNode, box: BoxNode, note: NoteNode };
+
+// ------------------------------------------------------------------ wires
+// Every wire is routed by wires.js: right angles, around the blocks, parallel wires in lanes. The routes of all wires
+// are worked out together (they make room for each other), once per change of the canvas, from what React Flow measured.
+const blockGeometry = (n) => {
+  const hb = (n[RF.internalsSymbol] || {}).handleBounds || {}, p = n.positionAbsolute || n.position;
+  const ports = {};
+  for (const b of hb.source || []) ports["s:" + b.id] = { x: b.x + b.width, y: b.y + b.height / 2 };
+  for (const b of hb.target || []) ports["t:" + b.id] = { x: b.x, y: b.y + b.height / 2 };
+  return { id: n.id, x: p.x, y: p.y, w: n.width, h: n.height, ports };
+};
+let routeMemo = { nodes: null, edges: null, sig: "", routes: new Map() };
+const routesOf = (s) => {
+  if (routeMemo.nodes === s.nodeInternals && routeMemo.edges === s.edges) return routeMemo.routes;
+  const ns = [], geo = {};
+  for (const n of s.nodeInternals.values()) if (n.width && n.height && !n.hidden && n.type !== "box" && n.type !== "note") { const g_ = blockGeometry(n); geo[n.id] = g_; ns.push(g_); }
+  const es = [];
+  for (const e of s.edges) {
+    if (e.data && e.data.signal != null) continue;           // drawn as two name tags, not routed
+    const a = geo[e.source], b = geo[e.target], sp = a && a.ports["s:" + e.sourceHandle], tp = b && b.ports["t:" + e.targetHandle];
+    if (sp && tp) es.push({ id: e.id, net: e.source + "|" + e.sourceHandle, s: { node: a.id, x: a.x + sp.x, y: a.y + sp.y }, t: { node: b.id, x: b.x + tp.x, y: b.y + tp.y } });
+  }
+  const sig = JSON.stringify([ns.map((n) => [n.id, n.x, n.y, n.w, n.h]), es]);
+  const routes = sig === routeMemo.sig ? routeMemo.routes : OwlWires.route(ns, es);
+  routeMemo = { nodes: s.nodeInternals, edges: s.edges, sig, routes };
+  return routes;
+};
+function WireEdge({ id, data, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, label, labelStyle, labelBgStyle, markerEnd, style }) {
+  const r = RF.useStore((s) => routesOf(s).get(id), (a, b) => a === b || (!!a && !!b && a.d === b.d));
+  if (data && data.signal != null) {
+    const full = data.signal || "signal", name = full.length > 24 ? full.slice(0, 23) + "…" : full, w = 16 + name.length * 6.1, col = style && style.stroke ? { stroke: style.stroke } : null;
+    const tag = (x, y, key) => h("g", { key }, h("title", null, full), h("rect", { className: "sigtag", x, y: y - 9, width: w, height: 18, rx: 9, style: col }), h("text", { className: "sigtext", x: x + w / 2, y: y + 3.5, textAnchor: "middle" }, name));
+    return h("g", { className: "sigtags" },
+      h("path", { className: "react-flow__edge-path", d: `M${sourceX},${sourceY} h10`, style }), tag(sourceX + 10, sourceY, "s"),
+      h("path", { className: "react-flow__edge-path", d: `M${targetX - 14},${targetY} H${targetX}`, style, markerEnd }), tag(targetX - 14 - w, targetY, "t"));
+  }
+  let path, lx, ly;
+  if (r) { path = r.d; lx = r.lx; ly = r.ly; }
+  else [path, lx, ly] = RF.getSmoothStepPath({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition });   // not measured yet
+  return h(RF.BaseEdge, { path, labelX: lx, labelY: ly, label, labelStyle, labelShowBg: true, labelBgStyle, labelBgPadding: [4, 2], labelBgBorderRadius: 3, markerEnd, style, interactionWidth: 14 });
+}
+const edgeTypes = { wire: WireEdge };
 
 // ------------------------------------------------------------------ layout
 function autoPlace(block, index, counts, hub) {
@@ -291,7 +383,15 @@ function App() {
   const [design, setDesign] = useState(null);          // the draft on the canvas
   const [deployedName, setDeployedName] = useState(null);
   const [status, setStatus] = useState(null);
-  const [sel, setSel] = useState(null);                 // {kind: node|edge, id}
+  const [selNodes, setSelNodes] = useState([]);         // what is selected on the canvas: blocks, boxes, notes (ids) ...
+  const [selEdge, setSelEdge] = useState(null);         // ... or one wire
+  const sel = useMemo(() => (selEdge ? { kind: "edge", id: selEdge } : selNodes.length === 1 ? { kind: "node", id: selNodes[0] } : null), [selNodes, selEdge]);   // the one thing the inspector shows
+  const setSel = (v) => { if (!v) { setSelNodes([]); setSelEdge(null); } else if (v.kind === "edge") { setSelEdge(v.id); setSelNodes([]); } else { setSelNodes([v.id]); setSelEdge(null); } };
+  const [view, setViewState] = useState(() => { const d = { color: "source", trace: true, snap: true, minimap: true }; try { return { ...d, ...JSON.parse(lsGet("owl.view") || "{}") }; } catch (e) { return d; } });
+  const setView = (k, v) => setViewState((o) => { const n = { ...o, [k]: v }; lsSet("owl.view", JSON.stringify(n)); return n; });
+  const viewRef = useRef(view); viewRef.current = view;
+  const [guides, setGuides] = useState([]);             // lines a dragged block snapped to
+  const [find, setFind] = useState(null);               // Ctrl+F: {q, i}
   const [plan, setPlan] = useState(null);               // the diff modal
   const [toast, setToast] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -338,6 +438,12 @@ function App() {
           if (draft.based_on && draft.based_on.deployed_at === st.deployed_at) open = draft;
           else { lsSet("owl.setAside", JSON.stringify(draft)); setNotice({ kind: "stale", draft }); }
         } else if (draft && !d.deployed) open = draft;
+        // moving blocks, boxes, notes and signal names are no "changes": they are kept in the draft and survive a reload
+        if (open === d.design && draft && d.deployed && draft.based_on && draft.based_on.deployed_at === st.deployed_at)
+          open = { ...d.design, layout: draft.layout || d.design.layout, ...(draft.canvas ? { canvas: draft.canvas } : {}), based_on: draft.based_on };
+        // what is opened from the running design is based on THIS deploy (the deployed file still carries the stamp of
+        // the draft it was deployed from, which made the next draft look like an old one)
+        if (open === d.design && d.deployed) open = { ...d.design, based_on: { name: d.design.name, deployed_at: st.deployed_at } };
         setDesign(open);
         setErr(null);
       } catch (e) { setErr("dsp API: " + e.message); }
@@ -354,11 +460,17 @@ function App() {
   }, [run]);
   // draft -> server (debounced) + localStorage
   const saveT = useRef(null);
+  const save = (nd) => { clearTimeout(saveT.current); saveT.current = setTimeout(() => { api("PUT", "api/dsp/draft", { draft: { ...nd, based_on: nd.based_on || { name: deployedRef.current && deployedRef.current.name, deployed_at: deployedAtRef.current }, saved_at: Date.now() / 1000 } }).catch(() => {}); }, 800); };
+  // every edit goes through update(): it is saved as the draft and can be undone. Edits in quick succession (a slider
+  // being dragged, typing a name) are one undo step.
+  const hist = useRef({ past: [], future: [], t: 0, seen: null });
   const update = useCallback((fn) => {
     setDesign((d) => {
       const nd = typeof fn === "function" ? fn(d) : fn;
-      clearTimeout(saveT.current);
-      saveT.current = setTimeout(() => { api("PUT", "api/dsp/draft", { draft: { ...nd, based_on: nd.based_on || { name: deployedRef.current && deployedRef.current.name, deployed_at: deployedAtRef.current }, saved_at: Date.now() / 1000 } }).catch(() => {}); }, 800);
+      if (nd === d) return d;
+      const H = hist.current, now = Date.now();
+      if (d && H.seen !== d) { if (now - H.t > 500) { H.past.push(d); if (H.past.length > 100) H.past.shift(); } H.future = []; H.t = now; H.seen = d; }
+      save(nd);
       return nd;
     });
   }, []);
@@ -389,21 +501,25 @@ function App() {
 
 
   // ---- nodes & edges from inventory + design
-  const blocks = useMemo(() => {
-    if (!inv || !design) return [];
+  const [blocks, drawer] = useMemo(() => {
+    if (!inv || !design) return [[], []];
     const names = design.devices || {};
     const wired = new Set(); for (const w of design.wires || []) { wired.add(w.from.split("|")[0]); wired.add(w.to.split("|")[0]); }
     // the system's names are often ambiguous ("Ryzen HD Audio Controller Pro" twice: the speaker and the internal mic;
     // a USB mic that also has a headphone jack): drop the " Pro" of the pro-audio profile and say in/out when two share one
     const base = (b) => (b.label || "").replace(/ Pro$/, "").replace(/ Analog Stereo$/, "");
     const count = {}; for (const b of inv.blocks) if (b.source === "pipewire") { const k = b.host + "|" + base(b); count[k] = (count[k] || 0) + 1; }
-    const out = [];
+    const shown = (design.canvas || {}).shown || {};
+    const out = [], off = [];
     for (const b0 of inv.blocks) {
       const o = names[b0.id] || {};
       let label = base(b0) || b0.label;
       if (b0.source === "pipewire" && count[b0.host + "|" + label] > 1) label += b0.class === "source" ? " (input)" : b0.class === "sink" ? " (output)" : "";
       const b = { ...b0, kind: "device", sysLabel: b0.label, label: o.label || label, hidden: !!o.hidden };
       if (b.hidden && !wired.has(b.id) && !showHidden) continue;
+      b.wired = wired.has(b.id);
+      // on the canvas: what is wired, and what was put there. The rest waits in the drawer (left panel, Devices)
+      if (!b.wired && !shown[b.id]) { off.push(b); continue; }
       out.push(b);
     }
     for (const b of design.blocks || []) if (types[b.type]) out.push({ ...b, kind: "proc" });
@@ -415,7 +531,8 @@ function App() {
         ? { id: bid, kind: "device", source: "sap", host: "aes67", label: "AES67 stream", sub: "not announced now (its device is off, or stopped announcing)", class: "gone", inputs: [], outputs: [], live: false }
         : { id: bid, kind: "device", source: bid.startsWith("nmos:") ? "nmos" : "pipewire", host: bid.split(":")[1] || "?", label: bid.split(":").pop(), sub: "not present", class: "gone", inputs: [], outputs: [], live: false }); }
     }
-    return out;
+    off.sort((a, b) => (a.host || "").localeCompare(b.host || "") || (a.label || "").localeCompare(b.label || ""));
+    return [out, off];
   }, [inv, design, types, showHidden]);
 
   const meterFor = useMemo(() => {
@@ -440,6 +557,25 @@ function App() {
   }, [status, run]);
 
   const [positions, setPositions] = useState({});      // live drag positions (layout saved on drag end)
+  // the size React Flow measured for each node, handed back with every render: a node that comes back without it counts
+  // as not measured yet, and is hidden, not clickable and not routed until the next measurement
+  const dims = useRef({});
+  const rf = useReactFlow(), rfStore = RF.useStoreApi();
+  // the signal path through what is selected: everything upstream of it and everything it feeds (the rest is dimmed)
+  const trace = useMemo(() => {
+    if (!design || !sel || !view.trace || (sel.kind === "node" && isAnnot(sel.id))) return null;
+    const wires = design.wires || [], proc = new Set((design.blocks || []).map((b) => b.id));
+    const W = new Set(), B = new Set(), seenUp = new Set(), seenDown = new Set();
+    // a processing block passes signal on; a device does not (what a satellite plays is not what its microphone sends)
+    const up = (bid) => { for (const w of wires) if (w.to.split("|")[0] === bid && !seenUp.has(w.id)) { seenUp.add(w.id); W.add(w.id); const o = w.from.split("|")[0]; B.add(o); if (proc.has(o)) up(o); } };
+    const down = (bid) => { for (const w of wires) if (w.from.split("|")[0] === bid && !seenDown.has(w.id)) { seenDown.add(w.id); W.add(w.id); const o = w.to.split("|")[0]; B.add(o); if (proc.has(o)) down(o); } };
+    if (sel.kind === "edge") {
+      const w = wires.find((x) => x.id === sel.id); if (!w) return null;
+      const a = w.from.split("|")[0], b = w.to.split("|")[0];
+      W.add(w.id); B.add(a); B.add(b); if (proc.has(a)) up(a); if (proc.has(b)) down(b);
+    } else { B.add(sel.id); up(sel.id); down(sel.id); }
+    return W.size ? { W, B } : null;
+  }, [design, sel, view.trace]);
   const nodes = useMemo(() => {
     const counts = {};
     const layout = (design && design.layout) || {};
@@ -447,38 +583,52 @@ function App() {
     // fresh auto-placement in the same column used to stack two blocks exactly on top of each other)
     const taken = blocks.map((b) => positions[b.id] || layout[b.id]).filter(Boolean);
     const free = (p) => { let q = { ...p }; while (taken.some((t) => Math.abs(t.x - q.x) < 160 && Math.abs(t.y - q.y) < 120)) q = { x: q.x, y: q.y + 150 }; taken.push(q); return q; };
-    return blocks.map((b, i) => {
+    const cv = (design && design.canvas) || {};
+    const annots = [];
+    const sized = (n) => { const d = dims.current[n.id]; if (d) { n.width = d.width; n.height = d.height; } return n; };
+    for (const bx of cv.boxes || []) annots.push({ id: bx.id, type: "box", position: positions[bx.id] || layout[bx.id] || { x: 0, y: 0 }, style: { width: bx.w, height: bx.h }, zIndex: -1,
+      draggable: !run, deletable: !run, dragHandle: ".cbox-hd", selected: selNodes.includes(bx.id), data: { title: bx.title, color: bx.color, run } });
+    for (const nt of cv.notes || []) annots.push({ id: nt.id, type: "note", position: positions[nt.id] || layout[nt.id] || { x: 0, y: 0 }, style: { width: nt.w, height: nt.h },
+      draggable: !run, deletable: !run, selected: selNodes.includes(nt.id), data: { text: nt.text, color: nt.color, run } });
+    return annots.map(sized).concat(blocks.map((b, i) => {
       const pos = positions[b.id] || layout[b.id] || free(autoPlace(b, i, counts, inv.hub));
       if (!layout[b.id] && !positions[b.id]) layout[b.id] = pos;
       const meters = {};
       for (const p of (b.kind === "proc" ? portsOf(types[b.type], b.params).inputs.concat(portsOf(types[b.type], b.params).outputs) : b.inputs.concat(b.outputs))) meters[p.id] = meterFor(b, p);
-      return { id: b.id, type: b.kind === "proc" ? "proc" : "device", position: pos, deletable: b.kind === "proc", draggable: !run,
+      return sized({ id: b.id, type: b.kind === "proc" ? "proc" : "device", position: pos, deletable: !run && (b.kind === "proc" || !b.wired), draggable: !run,
                data: { block: b, type: types[b.type], run, meters, hub: inv && inv.hub, proc: status && status.procs && status.procs[b.id], voice: status && status.voice,
                        probed: probe && probe.block === b.id && probe.state !== "error" && probe.state !== "stopped" ? probe.port : null },
-               className: probe && probe.block === b.id && probe.state === "playing" ? "probed" : "",
-               selected: sel && sel.kind === "node" && sel.id === b.id };
-    });
-  }, [blocks, positions, design, run, meterFor, types, status, sel, inv, probe]);
+               className: (probe && probe.block === b.id && probe.state === "playing" ? "probed" : "") + (trace && !trace.B.has(b.id) ? " dim" : ""),
+               selected: selNodes.includes(b.id) });
+    }));
+  }, [blocks, positions, design, run, meterFor, types, status, selNodes, inv, probe, trace]);
 
   const edges = useMemo(() => {
     if (!design) return [];
     const ws = (status && status.wires) || {};
+    const signals = (design.canvas || {}).signals || {};
+    // a colour per source (or per machine), so a wire can be followed by eye; in Run mode the wire's state has the say
+    const srcs = [...new Set((design.wires || []).map((w) => w.from.split("|")[0]))].sort();
+    const hosts = [...new Set(blocks.map((b) => b.host || (inv && inv.hub) || ""))].sort();
+    const colorOf = (sb, sblk) => (view.color === "none" ? null : view.color === "host" ? WIRE_COLORS[Math.max(0, hosts.indexOf((sblk && sblk.host) || (inv && inv.hub) || "")) % WIRE_COLORS.length] : WIRE_COLORS[srcs.indexOf(sb) % WIRE_COLORS.length]);
     const out = (design.wires || []).map((w) => {
       const [sb, sp] = w.from.split("|"), [tb, tp] = w.to.split("|");
       const st = ws[w.id];
       const sblk = blocks.find((b) => b.id === sb);
       const media = sblk && sblk.kind === "proc" && types[sblk.type] ? ((portsOf(types[sblk.type], sblk.params).outputs.find((p) => p.id === sp) || {}).media || "audio")
         : /^tx:/.test(sp) ? ((sblk || { outputs: [] }).outputs.find((p) => p.id === sp) || {}).media : "audio";
-      const cls = (run && st ? st.state : "") + (media === "video" ? " video" : "");
+      const col = run && st ? null : colorOf(sb, sblk);
+      const hl = trace ? trace.W.has(w.id) : !!(sel && sel.kind === "node" && (sel.id === sb || sel.id === tb));
+      const cls = (run && st ? st.state : "") + (media === "video" ? " video" : "") + (hl ? " hl" : "") + (trace && !hl ? " dim" : "") + (col ? " tinted" : "");
       let label;
       if (run && st && st.rx) label = `${st.rx.pkts_per_s ?? 0} pkt/s${st.rx.lost ? ` · lost ${st.rx.lost}` : ""}`;
       else if (run && st && st.state !== "ok") label = st.detail[0];
       else if (w.move) label = "moved";
-      return { id: w.id, source: sb, sourceHandle: sp, target: tb, targetHandle: tp, className: cls, label, labelStyle: { fontSize: 10, fill: "var(--muted)" }, labelBgStyle: { fill: "var(--panel)" },
-               selected: sel && sel.kind === "edge" && sel.id === w.id, markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14 } };
+      return { id: w.id, type: "wire", zIndex: hl ? 1 : 0, source: sb, sourceHandle: sp, target: tb, targetHandle: tp, className: cls, label, labelStyle: { fontSize: 10, fill: "var(--muted)" }, labelBgStyle: { fill: "var(--panel)" },
+               data: w.id in signals ? { signal: signals[w.id] || "" } : undefined, style: col ? { stroke: col } : undefined,
+               selected: selEdge === w.id, markerEnd: { type: MarkerType.ArrowClosed, width: 14, height: 14, ...(col ? { color: col } : {}) } };
     });
     // links on the hub made by others (WirePlumber, apps), read-only
-    const hub = inv && inv.hub;
     const have = new Set(out.map((e) => `${e.source}|${e.sourceHandle}>${e.target}|${e.targetHandle}`));
     const byNode = {}; for (const b of blocks) if (b.node) byNode[b.node] = b;
     for (const l of (status && status.external_links) || []) {
@@ -487,26 +637,104 @@ function App() {
       const sp = /^monitor/.test(l.out_port) ? "monitor" : "out";
       const key = `${sb.id}|${sp}>${tb.id}|in`;
       if (have.has(key)) continue; have.add(key);
-      out.push({ id: "ext:" + key, source: sb.id, sourceHandle: sp, target: tb.id, targetHandle: "in", className: "ext", deletable: false, selectable: true, label: "existing link", labelStyle: { fontSize: 10, fill: "var(--muted)" }, labelBgStyle: { fill: "var(--panel)" } });
+      out.push({ id: "ext:" + key, type: "wire", source: sb.id, sourceHandle: sp, target: tb.id, targetHandle: "in", className: "ext" + (trace ? " dim" : ""), deletable: false, selectable: true, label: "existing link", labelStyle: { fontSize: 10, fill: "var(--muted)" }, labelBgStyle: { fill: "var(--panel)" } });
     }
     return out;
-  }, [design, status, run, sel, blocks, inv, types]);
+  }, [design, status, run, sel, selEdge, blocks, inv, types, trace, view.color]);
 
   // ---- editing
-  const onNodesChange = useCallback((changes) => {
-    for (const c of changes) {
-      if (c.type === "position" && c.position) setPositions((p) => ({ ...p, [c.id]: c.position }));
-      if (c.type === "position" && c.dragging === false) {
-        setPositions((p) => { const pos = p[c.id]; if (pos) update((d) => ({ ...d, layout: { ...(d.layout || {}), [c.id]: pos } })); const np = { ...p }; delete np[c.id]; return np; });
-      }
-      if (c.type === "select") setSel(c.selected ? { kind: "node", id: c.id } : (s) => (s && s.id === c.id ? null : s));
-      if (c.type === "remove") update((d) => ({ ...d, blocks: d.blocks.filter((b) => b.id !== c.id), wires: d.wires.filter((w) => !w.from.startsWith(c.id + "|") && !w.to.startsWith(c.id + "|")) }));
+  const setCanvas = (fn) => update((d) => ({ ...d, canvas: fn(d.canvas || {}) }));
+  const geoOf = (id) => { const n = rfStore.getState().nodeInternals.get(id); return n && n.width ? blockGeometry(n) : null; };
+  // drag end / resize end: the live position becomes the layout
+  const commit = (ids) => setPositions((p) => {
+    const got = {}; for (const id of ids) if (p[id]) got[id] = p[id];
+    if (Object.keys(got).length) update((d) => ({ ...d, layout: { ...(d.layout || {}), ...got } }));
+    const np = { ...p }; for (const id of ids) delete np[id]; return np;
+  });
+  // a box takes along what sits in it: blocks and notes whose middle is inside, boxes that are wholly inside
+  const boxDrag = useRef(null);
+  const boxMembers = (id) => {
+    const st = rfStore.getState().nodeInternals, bx = st.get(id), p = bx.positionAbsolute || bx.position, members = [];
+    for (const n of st.values()) {
+      if (n.id === id || n.selected || !n.width) continue;
+      const q = n.positionAbsolute || n.position, cx = q.x + n.width / 2, cy = q.y + n.height / 2;
+      if (n.type === "box" ? (q.x >= p.x && q.y >= p.y && q.x + n.width <= p.x + bx.width && q.y + n.height <= p.y + bx.height) : (cx > p.x && cx < p.x + bx.width && cy > p.y && cy < p.y + bx.height)) members.push({ id: n.id, x: q.x, y: q.y });
     }
-  }, [update]);
+    return { id, x: p.x, y: p.y, members };
+  };
+  // a dragged block snaps where a wire to a neighbour would run dead straight, else where it lines up with another block
+  const snapDrag = (id, pos) => {
+    const st = rfStore.getState().nodeInternals, me = st.get(id), T = 6;
+    if (!me || !me.width) return { pos, guides: [] };
+    const g = blockGeometry(me), gs = [];
+    let x = pos.x, y = pos.y, best = null;
+    for (const w of (designRef.current && designRef.current.wires) || []) {
+      const [sb, sp] = w.from.split("|"), [tb, tp] = w.to.split("|");
+      if ((sb === id) === (tb === id)) continue;
+      const o = st.get(sb === id ? tb : sb); if (!o || !o.width) continue;
+      const og = blockGeometry(o), mp = g.ports[sb === id ? "s:" + sp : "t:" + tp], op = og.ports[sb === id ? "t:" + tp : "s:" + sp];
+      if (!mp || !op) continue;
+      const wy = og.y + op.y - mp.y, d = Math.abs(wy - pos.y);
+      if (d < T && (!best || d < best.d)) best = { d, y: wy, line: og.y + op.y };
+    }
+    if (best) { y = best.y; gs.push({ h: best.line }); }
+    let bx = null;
+    for (const o of st.values()) {
+      if (o.id === id || !o.width || o.type === "box" || o.type === "note") continue;
+      const q = o.positionAbsolute || o.position;
+      if (!best && Math.abs(q.y - pos.y) < T && !gs.length) { y = q.y; gs.push({ h: q.y }); }
+      for (const [mine, theirs, line] of [[pos.x, q.x, q.x], [pos.x + me.width, q.x + o.width, q.x + o.width]]) { const d = Math.abs(mine - theirs); if (d < T && (!bx || d < bx.d)) bx = { d, x: pos.x + theirs - mine, line }; }
+    }
+    if (bx) { x = bx.x; gs.push({ v: bx.line }); }
+    return { pos: { x, y }, guides: gs };
+  };
+  const removeIds = (d, ids) => {
+    const gone = new Set(ids), cv = d.canvas || {};
+    const wires = d.wires.filter((w) => !gone.has(w.from.split("|")[0]) && !gone.has(w.to.split("|")[0]));
+    const next = { ...d, blocks: d.blocks.filter((b) => !gone.has(b.id)), wires };
+    if (d.canvas) {
+      const left = new Set(wires.map((w) => w.id));
+      next.canvas = { ...cv, boxes: (cv.boxes || []).filter((b) => !gone.has(b.id)), notes: (cv.notes || []).filter((b) => !gone.has(b.id)),
+        shown: Object.fromEntries(Object.entries(cv.shown || {}).filter(([k]) => !gone.has(k))), signals: Object.fromEntries(Object.entries(cv.signals || {}).filter(([k]) => left.has(k))) };
+    }
+    return next;
+  };
+  const nodesChange = useRef(null);
+  nodesChange.current = (changes) => {
+    const moving = changes.filter((c) => c.type === "position" && c.dragging).length, gone = [];
+    for (const c of changes) {
+      if (c.type === "dimensions" && c.dimensions) dims.current[c.id] = c.dimensions;
+      if (c.type === "position" && c.position) {
+        let pos = c.position;
+        if (c.dragging && moving === 1 && !isAnnot(c.id) && viewRef.current.snap) { const s_ = snapDrag(c.id, pos); pos = s_.pos; setGuides(s_.guides); }
+        const move = { [c.id]: pos };
+        if (c.dragging && c.id.startsWith("box:")) {
+          if (!boxDrag.current || boxDrag.current.id !== c.id) boxDrag.current = boxMembers(c.id);
+          const bd = boxDrag.current;
+          for (const m of bd.members) move[m.id] = { x: m.x + pos.x - bd.x, y: m.y + pos.y - bd.y };
+        }
+        setPositions((p) => ({ ...p, ...move }));
+      }
+      if (c.type === "position" && c.dragging === false) {
+        setGuides([]);
+        const bd = boxDrag.current && boxDrag.current.id === c.id ? boxDrag.current : null;
+        commit([c.id, ...(bd ? bd.members.map((m) => m.id) : [])]);
+        if (bd) boxDrag.current = null;
+      }
+      if (c.type === "dimensions" && c.resizing !== undefined && isAnnot(c.id)) {          // a box or a note being resized
+        if (c.dimensions) { const w = Math.round(c.dimensions.width), h_ = Math.round(c.dimensions.height); setCanvas((cv) => ({ ...cv, boxes: (cv.boxes || []).map((b) => (b.id === c.id ? { ...b, w, h: h_ } : b)), notes: (cv.notes || []).map((b) => (b.id === c.id ? { ...b, w, h: h_ } : b)) })); }
+        if (c.resizing === false) commit([c.id]);
+      }
+      if (c.type === "select") { setSelNodes((s) => (c.selected ? (s.includes(c.id) ? s : [...s, c.id]) : s.filter((x) => x !== c.id))); if (c.selected) setSelEdge(null); }
+      if (c.type === "remove") gone.push(c.id);
+    }
+    if (gone.length) { update((d) => removeIds(d, gone)); setSelNodes((s) => s.filter((x) => !gone.includes(x))); }
+  };
+  const onNodesChange = useCallback((changes) => nodesChange.current(changes), []);
   const onEdgesChange = useCallback((changes) => {
     for (const c of changes) {
-      if (c.type === "select") setSel(c.selected ? { kind: "edge", id: c.id } : (s) => (s && s.id === c.id ? null : s));
-      if (c.type === "remove" && !c.id.startsWith("ext:")) update((d) => ({ ...d, wires: d.wires.filter((w) => w.id !== c.id) }));
+      if (c.type === "select") setSelEdge((cur) => (c.selected ? c.id : cur === c.id ? null : cur));
+      if (c.type === "remove" && !c.id.startsWith("ext:")) update((d) => removeIds({ ...d, wires: d.wires.filter((w) => w.id !== c.id) }, []));
     }
   }, [update]);
   const portMedia = (bid, pid) => {
@@ -526,11 +754,23 @@ function App() {
       return { ...d, wires: [...d.wires, { id: newId("w", new Set(d.wires.map((w) => w.id))), from, to }] };
     });
   }, [update, isValidConnection]);
-  const addBlock = (t) => {
+  // the middle of what the canvas shows now, a little lower each time so two new things do not hide each other
+  const viewCentre = () => {
+    const el = document.querySelector(".canvas");
+    if (!el || !el.offsetWidth) return null;
+    const r = el.getBoundingClientRect(), k = ((design.blocks || []).length + Object.keys((design.canvas || {}).shown || {}).length + ((design.canvas || {}).notes || []).length) % 5;
+    const at = rf.project({ x: r.width / 2 - 110 + k * 24, y: r.height / 3 + k * 24 });
+    // ... and not on top of a block that is already there: down until there is room
+    const busy = [...rfStore.getState().nodeInternals.values()].filter((n) => n.width && n.type !== "box");
+    for (let i = 0; i < 30 && busy.some((n) => at.x < n.position.x + n.width + 20 && at.x + 240 > n.position.x - 20 && at.y < n.position.y + n.height + 20 && at.y + 110 > n.position.y - 20); i++) at.y += 40;
+    return at;
+  };
+  const addBlock = (t, where) => {
+    const at = where || viewCentre();
     update((d) => {
       const id = newId(t.type, new Set(d.blocks.map((b) => b.id)));
       const layout = { ...(d.layout || {}) };
-      layout[id] = { x: 420 + (d.blocks.length % 2) * 40, y: 60 + d.blocks.length * 160 };
+      layout[id] = at || { x: 420 + (d.blocks.length % 2) * 40, y: 60 + d.blocks.length * 160 };
       return { ...d, blocks: [...d.blocks, { id, type: t.type, label: t.label, params: { ...t.defaults } }], layout };
     });
     setSheet(null);
@@ -544,6 +784,138 @@ function App() {
     if (deployedName) { try { const r = await api("POST", "api/dsp/control", { block: bid, param: k, value: v }); if (!r.live) say(`${bid} restarted with ${k} = ${v}`); } catch (e) { say("control: " + e.message, true); } }
   };
 
+  // ---- Organize: wires.js works out a tidy left-to-right arrangement from the blocks' measured sizes and ports
+  const frame = () => setTimeout(() => rf.fitView({ padding: 0.12, duration: 350, nodes: [...usedIds].map((id) => ({ id })) }), 80);
+  const organize = () => {
+    const lay = design.layout || {}, cv = design.canvas || {};
+    const boxes = (cv.boxes || []).map((bx) => ({ ...bx, ...(lay[bx.id] || { x: 0, y: 0 }) })).sort((a, b) => a.w * a.h - b.w * b.h);
+    const within = (q, cx, cy) => cx > q.x && cx < q.x + q.w && cy > q.y && cy < q.y + q.h;
+    const ns = blocks.map((b) => {
+      const g_ = geoOf(b.id) || { x: 0, y: 0, w: 240, h: 120, ports: {} };
+      const bx = boxes.find((q) => within(q, g_.x + g_.w / 2, g_.y + g_.h / 2));       // the smallest box it sits in
+      return { id: b.id, x: g_.x, y: g_.y, w: g_.w, h: g_.h, kind: b.kind, host: b.host || "", label: b.label || "", group: bx ? bx.id : null,
+               ports: Object.fromEntries(Object.entries(g_.ports).map(([k, p]) => [k, p.y])) };
+    });
+    // wires shown as signal names do not pull blocks together: that is what they are for
+    const next = OwlWires.organize(ns, edges.filter((e) => !(e.data && e.data.signal != null)).map((e) => ({ s: e.source, sp: e.sourceHandle, t: e.target, tp: e.targetHandle })));
+    const P = OwlWires.BOX, sizes = {};
+    for (const bx of boxes) {                 // a box follows its blocks and fits around them; its notes come along
+      const ms = ns.filter((n) => n.group === bx.id);
+      if (!ms.length) continue;
+      const x0 = Math.min(...ms.map((n) => next[n.id].x)) - P.side, y0 = Math.min(...ms.map((n) => next[n.id].y)) - P.top;
+      const x1 = Math.max(...ms.map((n) => next[n.id].x + n.w)) + P.side, y1 = Math.max(...ms.map((n) => next[n.id].y + n.h)) + P.bottom;
+      for (const nt of cv.notes || []) { const p = lay[nt.id]; if (p && !next[nt.id] && within(bx, p.x + nt.w / 2, p.y + nt.h / 2)) next[nt.id] = { x: p.x + x0 - bx.x, y: p.y + y0 - bx.y }; }
+      next[bx.id] = { x: x0, y: y0 }; sizes[bx.id] = { w: Math.round(x1 - x0), h: Math.round(y1 - y0) };
+    }
+    setPositions({});
+    update((d) => ({ ...d, layout: { ...(d.layout || {}), ...next }, ...(d.canvas ? { canvas: { ...d.canvas, boxes: (d.canvas.boxes || []).map((bx) => (sizes[bx.id] ? { ...bx, ...sizes[bx.id] } : bx)) } } : {}) }));
+    frame();
+  };
+  // ---- undo / redo
+  const stepHistory = (from, to) => {
+    const H = hist.current, cur = designRef.current;
+    if (!H[from].length || run) return;
+    const d = H[from].pop(); H[to].push(cur); H.t = 0; H.seen = null;
+    setDesign(d); save(d); setPositions({}); setSelNodes([]); setSelEdge(null);
+  };
+  const undo = () => stepHistory("past", "future"), redo = () => stepHistory("future", "past");
+  // ---- boxes, notes, devices from the drawer
+  const addBox = () => {
+    const picked = selNodes.map(geoOf).filter(Boolean), P = OwlWires.BOX, c = viewCentre() || { x: 0, y: 0 };
+    const r = picked.length ? { x: Math.min(...picked.map((g) => g.x)) - P.side, y: Math.min(...picked.map((g) => g.y)) - P.top, x1: Math.max(...picked.map((g) => g.x + g.w)) + P.side, y1: Math.max(...picked.map((g) => g.y + g.h)) + P.bottom }
+      : { x: c.x - 80, y: c.y - 60, x1: c.x + 380, y1: c.y + 220 };
+    const cv = design.canvas || {}, id = newId("box:", new Set((cv.boxes || []).map((b) => b.id)));
+    update((d) => ({ ...d, layout: { ...(d.layout || {}), [id]: { x: r.x, y: r.y } }, canvas: { ...(d.canvas || {}), boxes: [...((d.canvas || {}).boxes || []), { id, w: Math.round(r.x1 - r.x), h: Math.round(r.y1 - r.y), title: "Group", color: Object.keys(TINTS)[(cv.boxes || []).length % 6] }] } }));
+    setSel({ kind: "node", id }); setSheet(null);
+  };
+  const addNote = (where) => {
+    const c = where || viewCentre() || { x: 0, y: 0 }, cv = design.canvas || {}, id = newId("note:", new Set((cv.notes || []).map((b) => b.id)));
+    update((d) => ({ ...d, layout: { ...(d.layout || {}), [id]: c }, canvas: { ...(d.canvas || {}), notes: [...((d.canvas || {}).notes || []), { id, w: 200, h: 120, text: "", color: "amber" }] } }));
+    setSel({ kind: "node", id }); setSheet(null);
+  };
+  const setAnnot = (id, k, v) => setCanvas((cv) => ({ ...cv, boxes: (cv.boxes || []).map((b) => (b.id === id ? { ...b, [k]: v } : b)), notes: (cv.notes || []).map((b) => (b.id === id ? { ...b, [k]: v } : b)) }));
+  const showDevice = (id, where) => {
+    const at = where || viewCentre();
+    update((d) => ({ ...d, layout: at ? { ...(d.layout || {}), [id]: at } : d.layout, canvas: { ...(d.canvas || {}), shown: { ...((d.canvas || {}).shown || {}), [id]: true } } }));
+    setSel({ kind: "node", id }); setSheet(null);
+  };
+  const onDrop = (e) => {                    // a block type or a device dragged from the left panel
+    let m = null; try { m = JSON.parse(e.dataTransfer.getData("application/x-owl") || "null"); } catch (err) {}
+    if (!m || run) return;
+    e.preventDefault();
+    const r = e.currentTarget.getBoundingClientRect(), at = rf.project({ x: e.clientX - r.left - 100, y: e.clientY - r.top - 20 });
+    if (m.block && types[m.block]) addBlock(types[m.block], at); else if (m.device) showDevice(m.device, at);
+  };
+  const dragFrom = (what) => ({ draggable: !run, onDragStart: (e) => { e.dataTransfer.setData("application/x-owl", JSON.stringify(what)); e.dataTransfer.effectAllowed = "copy"; } });
+  // ---- signal names
+  const setSignal = (wid, name) => setCanvas((cv) => { const sg = { ...(cv.signals || {}) }; if (name == null) delete sg[wid]; else sg[wid] = name; return { ...cv, signals: sg }; });
+  const connectSignal = (n, to) => {
+    const [sb, sp] = n.from.split("|"), [tb, tp] = to.split("|");
+    if (!isValidConnection({ source: sb, sourceHandle: sp, target: tb, targetHandle: tp })) return say("That signal does not fit this input (audio and video do not mix)", true);
+    update((d) => {
+      if (d.wires.some((w) => w.from === n.from && w.to === to)) return d;
+      const id = newId("w", new Set(d.wires.map((w) => w.id)));
+      return { ...d, wires: [...d.wires, { id, from: n.from, to }], canvas: { ...(d.canvas || {}), signals: { ...((d.canvas || {}).signals || {}), [id]: n.name } } };
+    });
+  };
+  // ---- several blocks at once: line up, spread out, copy
+  const align = (how) => {
+    const ns = selNodes.map(geoOf).filter(Boolean);
+    if (ns.length < 2) return;
+    const next = {}, X = how === "left" || how === "right" || how === "spread-x";
+    const lo = Math.min(...ns.map((n) => (X ? n.x : n.y))), hi = Math.max(...ns.map((n) => (X ? n.x + n.w : n.y + n.h)));
+    if (how.startsWith("spread")) {
+      const sorted = ns.slice().sort((a, b) => (X ? a.x - b.x : a.y - b.y)), used = ns.reduce((a, n) => a + (X ? n.w : n.h), 0), gap = Math.max(12, (hi - lo - used) / (ns.length - 1));
+      let at = lo; for (const n of sorted) { next[n.id] = X ? { x: at, y: n.y } : { x: n.x, y: at }; at += (X ? n.w : n.h) + gap; }
+    } else for (const n of ns) next[n.id] = how === "left" ? { x: lo, y: n.y } : how === "right" ? { x: hi - n.w, y: n.y } : how === "top" ? { x: n.x, y: lo } : { x: n.x, y: hi - n.h };
+    setPositions({}); update((d) => ({ ...d, layout: { ...(d.layout || {}), ...next } }));
+  };
+  const clip = useRef(null);
+  const copySel = (quiet) => {
+    const d = designRef.current, ids = new Set(selNodes), bl = (d.blocks || []).filter((b) => ids.has(b.id));
+    if (!bl.length) return false;
+    clip.current = { blocks: bl, wires: d.wires.filter((w) => ids.has(w.from.split("|")[0]) && ids.has(w.to.split("|")[0])), layout: Object.fromEntries(bl.map((b) => [b.id, (d.layout || {})[b.id] || { x: 0, y: 0 }])), n: 0 };
+    if (!quiet) say(`Copied ${bl.length} block${bl.length === 1 ? "" : "s"}: Ctrl+V pastes`);
+    return true;
+  };
+  const pasteClip = () => {
+    const c = clip.current, d = designRef.current;
+    if (!c || run || !d) return;
+    c.n++;
+    const taken = new Set(d.blocks.map((b) => b.id)), wt = new Set(d.wires.map((w) => w.id)), map = {}, lay = {};
+    const nb = c.blocks.filter((b) => types[b.type]).map((b) => { const id = newId(b.type, taken); taken.add(id); map[b.id] = id; lay[id] = { x: c.layout[b.id].x + 40 * c.n, y: c.layout[b.id].y + 40 * c.n }; return { ...b, id, label: b.label ? `${b.label} copy` : b.label, params: { ...(b.params || {}) } }; });
+    const nw = c.wires.filter((w) => map[w.from.split("|")[0]] && map[w.to.split("|")[0]]).map((w) => { const id = newId("w", wt); wt.add(id); const [sb, sp] = w.from.split("|"), [tb, tp] = w.to.split("|"); return { id, from: `${map[sb]}|${sp}`, to: `${map[tb]}|${tp}` }; });
+    update((x) => ({ ...x, blocks: [...x.blocks, ...nb], wires: [...x.wires, ...nw], layout: { ...(x.layout || {}), ...lay } }));
+    setSelNodes(nb.map((b) => b.id)); setSelEdge(null);
+  };
+  // ---- find (Ctrl+F)
+  const findHits = find && find.q.trim() ? blocks.filter((b) => `${b.label || ""} ${(types[b.type] || {}).label || ""} ${b.type || ""} ${b.id} ${b.host || ""}`.toLowerCase().includes(find.q.trim().toLowerCase())) : [];
+  const findGo = (i) => {
+    if (!findHits.length) return;
+    const b = findHits[((i % findHits.length) + findHits.length) % findHits.length], g = geoOf(b.id);
+    if (g) rf.setCenter(g.x + g.w / 2, g.y + g.h / 2, { zoom: Math.max(rf.getZoom(), 0.9), duration: 300 });
+    setSel({ kind: "node", id: b.id });
+  };
+  const keys = useRef(null);
+  keys.current = { undo, redo, copySel, pasteClip, mode, find: () => setFind((f) => f || { q: "", i: 0 }) };
+  useEffect(() => {
+    const on = (e) => {
+      const k = keys.current, key = (e.key || "").toLowerCase();
+      if (!(e.ctrlKey || e.metaKey) || (k.mode !== "design" && k.mode !== "run")) return;
+      if (key === "f") { e.preventDefault(); k.find(); setTimeout(() => { const el = document.querySelector(".findbox input"); if (el) { el.focus(); el.select(); } }, 30); return; }
+      const t = e.target;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+      if (key === "z") { e.preventDefault(); if (e.shiftKey) k.redo(); else k.undo(); }
+      else if (key === "y") { e.preventDefault(); k.redo(); }
+      else if (key === "c") { if (!String(window.getSelection && window.getSelection())) k.copySel(); }
+      else if (key === "v") k.pasteClip();
+      else if (key === "d") { e.preventDefault(); if (k.copySel(true)) k.pasteClip(); }
+    };
+    window.addEventListener("keydown", on);
+    return () => window.removeEventListener("keydown", on);
+  }, []);
+
+  // ---- deploy / rollback
   // ---- deploy / rollback
   const doPlan = async () => {
     setBusy(true);
@@ -711,13 +1083,17 @@ function App() {
   if (!design || !inv) return h("div", { className: "page" }, "loading…");
 
   const selBlock = sel && sel.kind === "node" ? blocks.find((b) => b.id === sel.id) : null;
+  const cv = design.canvas || {};
+  const selAnnot = sel && sel.kind === "node" && isAnnot(sel.id) ? (cv.boxes || []).concat(cv.notes || []).find((a) => a.id === sel.id) : null;
+  const signals = cv.signals || {};
+  const namedSignals = []; for (const w of design.wires || []) if (w.id in signals && !namedSignals.some((n) => n.from === w.from && n.name === signals[w.id])) namedSignals.push({ from: w.from, name: signals[w.id] });
   const selWire = sel && sel.kind === "edge" ? (design.wires || []).find((w) => w.id === sel.id) : null;
   const changes = deployed ? designDiff(design, deployed) : [];
   const changesChip = deployedName ? h("span", { className: "chip ok", title: "The design running in the room now" }, `running: ${deployedName}`) : h("span", { className: "chip warn" }, "nothing deployed");
   const draftChip = deployed && (changes.length
     ? h("span", { className: "chip warn", title: "Not deployed yet:\n" + changes.join("\n") }, `draft: ${changes.length} change${changes.length === 1 ? "" : "s"} not deployed`)
     : h("span", { className: "chip", title: "The canvas shows exactly what is running" }, "canvas = running"));
-  const usedIds = new Set(blocks.filter((b) => b.kind === "proc" || (focusHost && b.host === focusHost) || (design.wires || []).some((w) => w.from.split("|")[0] === b.id || w.to.split("|")[0] === b.id)).map((b) => b.id));
+  const usedIds = new Set(blocks.filter((b) => b.kind === "proc" || (focusHost && b.host === focusHost) || (design.wires || []).some((w) => w.from.split("|")[0] === b.id || w.to.split("|")[0] === b.id)).map((b) => b.id).concat((cv.boxes || []).map((b) => b.id), (cv.notes || []).map((b) => b.id)));
   const nHidden = Object.values(design.devices || {}).filter((o) => o.hidden).length;
   const bar = (cls, content) => h("div", { className: `bar ${cls}` }, content);
   let noticeBar = null;
@@ -744,6 +1120,9 @@ function App() {
       (mode === "design" || mode === "run") && h("span", { className: `btn probe-tool ${inject && inject.state === "playing" ? "primary" : ""}`, title: "Drag onto an input, a block or a wire to play a test signal (noise, tone) into it",
         onPointerDown: onInjectDown }, "🔊 Inject"),
       (mode === "design" || mode === "run") && h("button", { className: "btn sheet-tab", onClick: () => setSheet(sheet === "palette" ? null : "palette") }, "＋ Block"),
+      (mode === "design" || mode === "run") && h("button", { className: "btn", disabled: run || !hist.current.past.length, onClick: undo, title: "Undo (Ctrl+Z)" }, "↶"),
+      (mode === "design" || mode === "run") && h("button", { className: "btn", disabled: run || !hist.current.future.length, onClick: redo, title: "Redo (Ctrl+Shift+Z)" }, "↷"),
+      (mode === "design" || mode === "run") && h("button", { className: "btn", onClick: organize, title: "Tidy the canvas: signal flows left to right, wires run straight where they can, the blocks of a box stay together. Changes only where things sit, not the design. Ctrl+Z puts it back." }, "Organize"),
       (mode === "design" || mode === "run") && h("button", { className: "btn", disabled: busy, onClick: () => { if (!changes.length || confirm(`Discard ${changes.length} undeployed change(s) and show the running design?\n\n${changes.join("\n")}`)) resetToDeployed(); }, title: "Discard the draft, show what is running" }, "Reset"),
       (mode === "design" || mode === "run") && h("button", { className: "btn", disabled: busy || !(status && status.has_prev), onClick: doRollback }, "Rollback"),
       (mode === "design" || mode === "run") && h("button", { className: "btn primary", disabled: busy, onClick: doPlan }, "Deploy…")),
@@ -766,29 +1145,62 @@ function App() {
         h("h3", null, "Nodes"),
         h(NodesPanel, { hub: inv.hub, onChange: (host) => { setFocusHost(host); setTimeout(() => setFlowKey((k) => k + 1), 3500); } }),
         h("h3", null, "Blocks"),
-        h("div", { className: "pal" }, palette.map((t) => h("button", { key: t.type, onClick: () => addBlock(t), disabled: run }, t.label, h("small", null, t.group + " · " + t.description)))),
+        h("div", { className: "pal" }, palette.map((t) => h("button", { key: t.type, onClick: () => addBlock(t), disabled: run, ...dragFrom({ block: t.type }) }, t.label, h("small", null, t.group + " · " + t.description)))),
+        h("h3", null, "Canvas"),
+        h("div", { className: "row", style: { display: "flex", gap: 6 } },
+          h("button", { className: "btn", disabled: run, onClick: addBox, title: "A coloured box behind a group of blocks (around the selected ones, if any)" }, "＋ Box"),
+          h("button", { className: "btn", disabled: run, onClick: () => addNote(), title: "A note on the canvas" }, "＋ Note")),
+        h("div", { className: "viewopts" },
+          h("label", null, "Wire colours ", h("select", { value: view.color, onChange: (e) => setView("color", e.target.value) }, h("option", { value: "source" }, "by source"), h("option", { value: "host" }, "by machine"), h("option", { value: "none" }, "plain"))),
+          h("label", null, h("input", { type: "checkbox", checked: view.trace, onChange: (e) => setView("trace", e.target.checked) }), "Trace the signal path of what is selected"),
+          h("label", null, h("input", { type: "checkbox", checked: view.snap, onChange: (e) => setView("snap", e.target.checked) }), "Snap blocks into line while dragging"),
+          h("label", null, h("input", { type: "checkbox", checked: view.minimap, onChange: (e) => setView("minimap", e.target.checked) }), "Minimap")),
+        h("p", { className: "help", style: { fontSize: 11, color: "var(--muted)", margin: "4px 0 0" } }, "Shift+drag selects several blocks; Ctrl+C / Ctrl+V / Ctrl+D copy them; Ctrl+F finds a block; Ctrl+Z undoes."),
         h("h3", null, "Devices"),
+        h("p", { className: "help", style: { fontSize: 11, color: "var(--muted)", margin: "0 0 4px" } }, drawer.length ? "On the canvas: what is wired. Click or drag one of these to add it." : "Every device is on the canvas."),
+        h("div", { className: "pal" }, drawer.map((b) => h("button", { key: b.id, disabled: run, onClick: () => showDevice(b.id), title: b.sub || b.sysLabel || "", ...dragFrom({ device: b.id }) }, b.label, h("small", null, `${b.host}${b.class ? " · " + b.class : ""}`)))),
         nHidden ? h("label", { className: "row insp", style: { fontSize: 12, gap: 6, display: "flex", alignItems: "center", marginBottom: 4 } }, h("input", { type: "checkbox", checked: showHidden, onChange: (e) => { setShowHidden(e.target.checked); setFlowKey((k) => k + 1); } }), `Show ${nHidden} hidden device${nHidden === 1 ? "" : "s"}`) : null,
         h("div", { className: "insp kv" }, `${inv.blocks.filter((b) => b.source === "pipewire" && b.host === inv.hub).length} on the hub (${inv.hub}), ${inv.blocks.filter((b) => b.source === "nmos" && !b.is_hub).length} satellite node(s)`,
           Object.keys(inv.satellites || {}).length ? h("div", null, "Satellite DSP: " + Object.values(inv.satellites).map((s) => `${s.host} (${s.ok ? "owl-node " + s.version : "unreachable"}${s.share && s.share.blocks && s.share.blocks.length ? `, ${s.share.blocks.length} block(s)` : ""})`).join(", ")) : null),
         status && status.events && status.events.length ? [h("h3", { key: "eh" }, "Events"), h("div", { key: "ev", className: "events" }, status.events.slice(0, 8).map((e, i) => h("div", { key: i }, new Date(e.time * 1000).toLocaleTimeString() + " " + e.msg)))] : null),
-      (mode === "design" || mode === "run") && h("div", { className: `canvas${dragProbe ? " drop-probe" : ""}` },
-        h(Flow, { key: flowKey, nodes, edges, nodeTypes, onNodesChange, onEdgesChange, onConnect, isValidConnection, fitView: true,
+      (mode === "design" || mode === "run") && h("div", { className: `canvas${dragProbe ? " drop-probe" : ""}`, onDragOver: (e) => { if (!run) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } }, onDrop },
+        selNodes.length > 1 && !run && h("div", { className: "multibar" },
+          h("span", null, `${selNodes.length} selected`),
+          [["left", "⇤", "Line up the left edges"], ["right", "⇥", "Line up the right edges"], ["top", "⤒", "Line up the tops"], ["bottom", "⤓", "Line up the bottoms"], ["spread-x", "↔", "Spread out evenly, left to right"], ["spread-y", "↕", "Spread out evenly, top to bottom"]]
+            .map(([k, icon, title]) => h("button", { key: k, className: "btn", title, onClick: () => align(k) }, icon)),
+          h("button", { className: "btn", onClick: addBox, title: "A coloured box around the selection" }, "Box"),
+          h("button", { className: "btn", onClick: () => { if (copySel(true)) pasteClip(); }, title: "Duplicate the selected processing blocks and the wires between them (Ctrl+D)" }, "Duplicate")),
+        find && h("div", { className: "findbox" },
+          h("input", { type: "search", autoFocus: true, placeholder: "Find a block…", value: find.q, onChange: (e) => setFind({ q: e.target.value, i: 0 }),
+            onKeyDown: (e) => { if (e.key === "Enter") { findGo(find.i + (e.shiftKey ? -1 : 0)); setFind((f) => ({ ...f, i: f.i + (e.shiftKey ? -1 : 1) })); } else if (e.key === "Escape") setFind(null); } }),
+          h("span", null, find.q.trim() ? `${findHits.length} found` : "Enter: next"),
+          h("button", { className: "btn", onClick: () => setFind(null) }, "✕")),
+        h(Flow, { key: flowKey, nodes, edges, nodeTypes, edgeTypes, connectionLineType: "smoothstep", onNodesChange, onEdgesChange, onConnect, isValidConnection, fitView: true,
                   fitViewOptions: { padding: 0.15, nodes: usedIds.size ? [...usedIds].map((id) => ({ id })) : undefined },
                   minZoom: 0.2, maxZoom: 2, nodesConnectable: !run, elementsSelectable: true, deleteKeyCode: run ? null : ["Backspace", "Delete"],
                   onPaneClick: () => { setSel(null); setSheet(null); }, proOptions: { hideAttribution: true }, connectionRadius: 24 },
-          h(Background, { gap: 24, size: 1 }), h(Controls, { showInteractive: false }))),
-      (mode === "design" || mode === "run") && (selBlock || selWire) && h("div", { className: "side right" },
+          h(Background, { gap: 24, size: 1 }), h(Controls, { showInteractive: false }), h(Guides, { guides }),
+          view.minimap ? h(RF.MiniMap, { pannable: true, zoomable: true, nodeClassName: (n) => "mm-" + n.type, maskColor: "rgba(128,128,128,.22)", nodeStrokeWidth: 0 }) : null)),
+      (mode === "design" || mode === "run") && (selBlock || selWire || selAnnot || selNodes.length > 1) && h("div", { className: "side right" },
+        // (the panel stays while more blocks are added to the selection: a canvas that changes width under the pointer
+        // turns the click into a click on the background, which clears the selection)
+        selNodes.length > 1 && h("div", { className: "insp" }, h("h3", null, `${selNodes.length} selected`),
+          h("p", { className: "help" }, "Drag one to move them all. The bar above the canvas lines them up, spreads them out, puts a box around them or duplicates them. Delete removes the processing blocks among them; Ctrl+C copies them.")),
+        selAnnot && h(AnnotInfo, { a: selAnnot, kind: selAnnot.id.startsWith("box:") ? "box" : "note", run, set: (k, v) => setAnnot(selAnnot.id, k, v), remove: () => { update((d) => removeIds(d, [selAnnot.id])); setSel(null); } }),
         selBlock && selBlock.kind === "proc" && h(Inspector, { b: selBlock, t: types[selBlock.type], run, deployed: !!deployedName, voice: status && status.voice, sounds, say, setParam, setLabel, setHost, hub: inv.hub, sats: Object.values(inv.satellites || {}), liveSet, proc: status && status.procs && status.procs[selBlock.id],
-          remove: () => { update((d) => ({ ...d, blocks: d.blocks.filter((b) => b.id !== selBlock.id), wires: d.wires.filter((w) => !w.from.startsWith(selBlock.id + "|") && !w.to.startsWith(selBlock.id + "|")) })); setSel(null); } }),
+          remove: () => { update((d) => removeIds(d, [selBlock.id])); setSel(null); } }),
+        selBlock && !run && h(SignalPick, { inputs: portsFor(selBlock).inputs, named: namedSignals.filter((n) => n.from.split("|")[0] !== selBlock.id), connect: (n, pid) => connectSignal(n, `${selBlock.id}|${pid}`) }),
+        selBlock && selBlock.kind === "device" && !selBlock.wired && !run && h("div", { className: "insp" }, h("button", { className: "btn", onClick: () => { update((d) => removeIds(d, [selBlock.id])); setSel(null); }, title: "Back to the Devices list on the left; it stays available" }, "Take off the canvas")),
         selBlock && h(ListenRow, { b: selBlock, ports: portsFor(selBlock), probe, startProbe }),
         selBlock && selBlock.kind === "device" && h(DeviceInfo, { b: selBlock, hub: inv.hub, run, setDevice, override: (design.devices || {})[selBlock.id] || {} }),
         selWire && h("div", { className: "insp" }, h("button", { className: "btn", style: { marginBottom: 6 }, onClick: () => { const [b_, p_] = selWire.from.split("|"); startProbe(b_, p_); } }, "🎧 Listen to this wire")),
+        selWire && h(SignalRow, { name: selWire.id in signals ? signals[selWire.id] : null, run, set: (v) => setSignal(selWire.id, v),
+          defName: (() => { const [bid, pid] = selWire.from.split("|"), b = blocks.find((x) => x.id === bid), ps = b ? portsFor(b).outputs : [], p = ps.find((x) => x.id === pid); return b ? (b.label || (types[b.type] || {}).label || bid) + (ps.length > 1 && p ? ` · ${p.label}` : "") : bid; })() }),
         selWire && h(WireInfo, { w: selWire, blocks, st: status && status.wires && status.wires[selWire.id], plan, run,
           setMove: (v) => update((d) => ({ ...d, wires: d.wires.map((w) => (w.id === selWire.id ? (v ? { ...w, move: true } : (({ move, ...rest }) => rest)(w)) : w)) })),
           designLatency: design.latency_ms,
           setLatency: (v) => update((d) => ({ ...d, wires: d.wires.map((w) => (w.id === selWire.id ? (v === "" ? (({ latency_ms, ...rest }) => rest)(w) : { ...w, latency_ms: Number(v) }) : w)) })),
-          remove: () => { update((d) => ({ ...d, wires: d.wires.filter((w) => w.id !== selWire.id) })); setSel(null); } }),
+          remove: () => { update((d) => removeIds({ ...d, wires: d.wires.filter((w) => w.id !== selWire.id) }, [])); setSel(null); } }),
         sel && sel.kind === "edge" && !selWire && h("div", { className: "insp" }, h("h3", null, "Existing link"), h("p", { className: "help" }, "Made by WirePlumber or an app, not by a design. The designer never removes it."))),
       mode === "panels" && h(Panels, { design, update, deployed: !!deployedName, live, say }),
       mode === "routing" && h("div", { className: "page", style: { padding: 0 } }, h("iframe", { src: "routing", title: "Routing" })),

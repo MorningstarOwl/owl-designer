@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.12.0
+The designer canvas, reworked. Nothing here changes what a design does in the room: boxes, notes, signal names and
+where things sit are saved with the design (draft, deploy, history, export) under `canvas` and `layout`.
+- **Wires are routed.** Every wire runs at right angles AROUND the blocks instead of in a curve through them; wires
+  that share a channel get their own lanes, ordered so they cross as little as possible; the wires of one output share
+  a trunk; a wire hops over one it crosses. Routes follow a block while it is dragged.
+- **Organize** (top bar) tidies the canvas: signal flows left to right (sources left, outputs right), blocks are
+  ordered and lined up so most wires run straight. The blocks of a box stay together and the box fits around them.
+- **Boxes and notes.** A coloured, titled box behind a group of blocks (drag its title: everything in it moves along;
+  "Box" with several blocks selected draws it around them), and sticky notes for what a design does not say by itself.
+- **Signal names.** A wire can be shown as a name tag on both ports instead of a line (select the wire): for long runs
+  and loops. Another input picks a named signal up from its block's panel, without a wire across the canvas. The wire
+  itself is unchanged and deploys the same.
+- **Device drawer.** Only what is wired sits on the canvas; every other device waits in the left panel's Devices list
+  and is added with a click or by dragging it onto the canvas (block types can be dragged in too).
+- **Undo / redo** (Ctrl+Z, Ctrl+Shift+Z, top bar) for every edit of the draft, up to 100 steps.
+- **Signal trace.** Selecting a block or a wire lights up its whole path, upstream to the sources and downstream to
+  every output, and dims the rest (it can be turned off).
+- **Several blocks at once.** Shift+drag or Ctrl+click selects; drag one to move all; line up, spread out, box, or
+  duplicate them from the bar that appears; Ctrl+C / Ctrl+V / Ctrl+D copy processing blocks with the wires between them.
+- **Wire colours** by source or by machine (or plain); in Run mode the wire's state keeps the say.
+- A dragged block snaps where a wire to its neighbour runs dead straight, or in line with another block (guide lines
+  show it). Ctrl+F finds a block by name, type or machine. A minimap. A new block lands in a free spot in view.
+- Fixed: moving blocks without changing the design (so also Organize) was forgotten on reload until the next deploy;
+  and a draft started on the running design could come back as "an older draft" (it carried the previous deploy's stamp).
+- Fixed: the page handed blocks back to the canvas without their measured size, so every refresh hid and re-measured
+  all of them for a moment (clicks could fall through to the background).
+
 ## 0.11.3
 - `install.sh` finds the PTP hardware clock on Debian 13 / Raspberry Pi OS trixie: newer ethtool reports it as
   "Hardware timestamp provider index", so a Raspberry Pi 5 node fell back to the system clock and its audio drifted.
