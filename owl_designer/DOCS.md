@@ -31,6 +31,8 @@ Assistant's login.
 1. Set `engine_url`, start the add-on, enable **Show in sidebar**, open **Owl Designer**.
 2. **Nodes** → type each machine's IP → **Add**. Its devices appear on the canvas.
 3. Add blocks from the palette, wire them, press **Deploy…** (it shows every change first and rolls back on failure).
+   Devices are added to the canvas from the **Devices** list on the left. **Organize** tidies the canvas; boxes, notes
+   and signal names (select a wire) keep a large design readable. Ctrl+Z undoes.
 4. **Run** shows live meters; drag **🎧 Probe** onto any port to hear it in your browser; **Panels** make phone pages
    of controls.
 

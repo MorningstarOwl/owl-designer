@@ -30,6 +30,10 @@ class Static(unittest.TestCase):
         self.assertEqual(ct, "application/javascript")
         self.assertIn("function InjectPanel", js)
         self.assertEqual(self.get("/designer.css")[0], "text/css")
+        self.assertIn('src="wires.js"', html)
+        ct, js = self.get("/wires.js")
+        self.assertEqual(ct, "application/javascript")
+        self.assertIn("function organize", js)
 
     def test_nothing_outside_the_web_folder(self):
         for p in ("/vendor/../../controller.py", "/vendor/%2e%2e/%2e%2e/controller.py", "/controller.py"):
