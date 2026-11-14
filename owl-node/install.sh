@@ -54,7 +54,7 @@
 #                          node being promoted to hub: /var/lib/owl-node/hub-backup.json). Designs, panels, presets and
 #                          nodes come back; the nodes are paired with this hub (see the README: Replacing the hub)
 #   --registry none        a node: drop the registry of an earlier install; the hub pairs it from the designer instead
-#   --image TAG            owl-node image already loaded on this host (default owl-node:0.11.2)
+#   --image TAG            owl-node image already loaded on this host (default owl-node:0.11.3)
 #                          When it is not on this host, the released image is pulled from ghcr.io/morningstarowl/owl-node
 #                          (amd64 and arm64; OWL_NODE_REGISTRY to use another), else it is built here from this checkout
 #   --build / --no-build   always build the image here (local changes) / never build (fail if it is not loaded)
@@ -69,7 +69,7 @@
 # Never touches the host's PipeWire/WirePlumber daemons or their config.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.11.2 MQTT_URL=""
+NAME="" LABEL="" AREA="" ROLES="" MEDIA_IF="" PHC_IF="" REGISTRY="" PTP="" IMAGE=owl-node:0.11.3 MQTT_URL=""
 TX=() RX=() VTX=() VRX=() VDEV=() DRY=0 REMOVE=0 ENABLE="" START=1 REPLACE_N1=0 YES=0 MODE="" BUILD=auto PTP_UDP="" RESTORE_FROM=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -166,8 +166,12 @@ wired_ok() { # a real wired interface (not loopback, Wi-Fi, Docker/VM bridges, V
   ip -4 -o addr show dev "$i" 2>/dev/null | grep -q inet
 }
 phc_of() { # /dev/ptpN of an interface, or nothing
+  # the PHC index: sysfs where the driver exposes it (igc), else ethtool (macb on the Pi 5 does not). ethtool before
+  # 6.x prints "PTP Hardware Clock: N"; newer ones (Debian 13 / Raspberry Pi OS trixie) "Hardware timestamp provider
+  # index: N"
   local n; n=$(ls "/sys/class/net/$1/device/ptp" 2>/dev/null | head -1 || true)
-  [ -n "$n" ] || n=$( (/usr/sbin/ethtool -T "$1" 2>/dev/null || ethtool -T "$1" 2>/dev/null || true) | awk -F': *' '/PTP Hardware Clock/ && $2 ~ /^[0-9]+$/ {print "ptp" $2}')
+  [ -n "$n" ] || n=$( (/usr/sbin/ethtool -T "$1" 2>/dev/null || ethtool -T "$1" 2>/dev/null || true) |
+    awk -F': *' '/^(PTP Hardware Clock|Hardware timestamp provider index):/ && $2 ~ /^[0-9]+$/ {print "ptp" $2; exit}')
   [ -n "$n" ] && [ -e "/dev/$n" ] && echo "/dev/$n"
 }
 if [ -z "$MEDIA_IF" ]; then
@@ -194,11 +198,7 @@ IP=$(ip -4 -o addr show dev "$MEDIA_IF" 2>/dev/null | awk '{print $4}' | cut -d/
 case "$MEDIA_IF${PHC_IF}" in *wl*) echo "refusing a Wi-Fi interface: AES67 and PTP are wired-only" >&2; exit 1;; esac
 PHC_DEV=/dev/null
 if [ -n "$PHC_IF" ] && [ "$PHC_IF" != none ]; then
-  # the PHC index: sysfs where the driver exposes it (igc on the box), else ethtool (macb on the Pi 5 does not)
-  n=$(ls "/sys/class/net/$PHC_IF/device/ptp" 2>/dev/null | head -1 || true)
-  [ -n "$n" ] || n=$( (/usr/sbin/ethtool -T "$PHC_IF" 2>/dev/null || true) | awk -F': *' '/PTP Hardware Clock/ && $2 ~ /^[0-9]+$/ {print "ptp" $2}')
-  [ -n "$n" ] && [ -e "/dev/$n" ] || { echo "$PHC_IF has no PTP hardware clock" >&2; exit 1; }
-  PHC_DEV=/dev/$n
+  PHC_DEV=$(phc_of "$PHC_IF") || { echo "$PHC_IF has no PTP hardware clock" >&2; exit 1; }
 else PHC_IF=none; fi
 HUB=0; [[ ",$ROLES," == *",hub,"* ]] && HUB=1
 # E2: a node needs no registry up front: the hub's designer pairs it (Nodes -> Add writes the hub's registry to

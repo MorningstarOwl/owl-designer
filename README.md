@@ -101,8 +101,8 @@ flowchart LR
 
 ## Requirements
 
-- **Linux with PipeWire** on every machine (a desktop install has it; in use on Ubuntu 26.04 and on Raspberry Pi OS /
-  Debian 12) and **Docker Engine with the compose plugin**.
+- **Linux with PipeWire** on every machine (a desktop install has it; in use on Ubuntu 26.04 and on Raspberry Pi OS
+  64-bit, Debian 12 and 13) and **Docker Engine with the compose plugin**.
 - **A wired network.** AES67 and PTP do not work over Wi-Fi. A network card with a **PTP hardware clock** (most Intel
   i210/i225/i226 and the Raspberry Pi 5's built-in port) keeps every machine on the same clock; without one a machine
   still shows its devices but its network audio drifts. Receivers play out adaptively by default: clean, but not
@@ -340,6 +340,27 @@ means you typed a hub's address.
 Check **Routing**: each node should show **PTP locked**. A node on Wi-Fi or without a PTP hardware clock shows *system
 clock*; its audio drifts. Multicast must be allowed on your switch (most home switches pass it; some mesh Wi-Fi
 systems flood or drop it).
+</details>
+
+<details><summary><b>A node's sound card is silent or crackles (DAC HATs)</b></summary>
+
+An I2S DAC HAT on a Raspberry Pi without an ID EEPROM needs its overlay in `/boot/firmware/config.txt` (the maker's
+documentation names it, e.g. `dtoverlay=hifiberry-dacplus-std`) and a reboot before it shows up as a sound card.
+The network clock paces the node's audio in small 128-frame cycles; a sound card that under-runs at that pace
+(crackles, a climbing ERR count in `pw-top`) needs more buffer. A WirePlumber rule in
+`~/.config/wireplumber/wireplumber.conf.d/` does it:
+
+```
+monitor.alsa.rules = [
+  { matches = [ { node.name = "~alsa_output.platform-.*" } ]
+    actions = { update-props = { api.alsa.period-size = 1024, api.alsa.headroom = 1024 } } }
+]
+```
+
+then `systemctl --user restart wireplumber` (the node re-makes its links). A bigger buffer delays the card, and a
+receiver drops audio when the card's delay is longer than its own buffer: the node's audio log then repeats
+*Delay to device (N) is higher than the target buffer size*. Raise the latency of the wire into that card (its
+inspector; 20 ms is enough for 1024 frames of headroom), or the design's **Network latency**.
 </details>
 
 <details><summary><b>The wake word stops working</b></summary>
