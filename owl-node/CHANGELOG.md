@@ -3,6 +3,15 @@
 The engine (the `owl-node` image, `install.sh`, the designer pages). The Home Assistant add-on has its own:
 [owl_designer/CHANGELOG.md](../owl_designer/CHANGELOG.md). Versions are shared: one `X.Y.Z` for both.
 
+## 0.12.1
+- **The first live control after a start is no longer lost.** The long-lived `pw-cli` behind live controls starts on
+  the first one, and PipeWire tells it about the graph's nodes only after it has started reading commands: a preset
+  recalled right after a hub boot failed with "unknown global" while the design (and Home Assistant) showed it as
+  applied, so the audio kept the old routing. Each node is now confirmed with `info` before its first `set-param` (once
+  per node), and a node that never shows up goes to a one-shot `pw-cli`.
+- The one-shot `pw-cli set-param` exits 0 even when it fails: its output decides now, and a failure counts as an error.
+- A live control that does not fully reach PipeWire is logged as a hub event ("only N of M control(s) reached PipeWire").
+
 ## 0.12.0
 The designer canvas, reworked. Nothing here changes what a design does in the room: boxes, notes, signal names and
 where things sit are saved with the design (draft, deploy, history, export) under `canvas` and `layout`.

@@ -57,6 +57,7 @@ class LiveControls(unittest.TestCase):
         return TYPES["gain"].controls(TYPES["gain"].ctx("tvol", "Volume", {"gain_db": db}))
 
     def test_values_land_and_are_fast(self):
+        self.ops.send_controls(self.controls(-40))     # a fresh pw-cli first learns the node (PwCtl._knows): not timed
         t0 = time.perf_counter()
         for i in range(200):
             self.assertEqual(self.ops.send_controls(self.controls(-40 + i * 0.1)), 2)
@@ -80,6 +81,16 @@ class LiveControls(unittest.TestCase):
         self.ops.send_controls(self.controls(-12.0))
         time.sleep(0.5)
         self.assertAlmostEqual(gain_values(self.ops.node_ids["owl-tvol-in"])["g0:Gain 1"], 10 ** (-12 / 20), places=4)
+
+    def test_a_fresh_pw_cli_applies_its_first_control(self):
+        # 2026-11-14: the first control after a hub boot was written before pw-cli had the node in its registry
+        for db in (-9.0, -15.0, -21.0):
+            self.ops.pwctl.stop()
+            self.ops.pwctl = pw.PwCtl()
+            self.assertEqual(self.ops.send_controls(self.controls(db)), 2)
+            time.sleep(0.3)
+            self.assertAlmostEqual(gain_values(self.ops.node_ids["owl-tvol-in"])["g0:Gain 1"], 10 ** (db / 20), places=4)
+            self.assertEqual(self.ops.pwctl.error_seq, 0, self.ops.pwctl.status())
 
     def test_a_stale_id_is_reported(self):
         seq = self.ops.pwctl.error_seq
