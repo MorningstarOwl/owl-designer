@@ -1129,6 +1129,11 @@ class Deployer:
                 done = (r or {}).get("controls_set", 0)
             else:
                 done = self.ops.send_controls(controls)
+            if done < len(controls):
+                # the value is still recorded (a block that is restarting picks it up from its conf), but say so: the
+                # 2026-11-14 dropped preset showed TV in Home Assistant and in the design while the audio stayed on Music
+                self.event(f"live control {bid}.{name}={value}: only {done} of {len(controls)} control(s) reached PipeWire"
+                           + (f" on {host}" if host != self.cfg.name else ""))
             with self.dlock:
                 if self.design_gen != gen:
                     # a deploy replaced the design meanwhile and set every control to its own values
@@ -1158,7 +1163,7 @@ class Deployer:
             self.persist_design()
         if not quiet:
             self._notify("param", block=bid, param=name, source=source)
-        return {"ok": True, "live": True, "controls_set": done}
+        return {"ok": True, "live": True, "controls_set": done, "applied": done >= len(controls)}
 
     def _set_param_by_deploy(self, bid, name, value, source):
         """A parameter that is not live (the AEC's module arguments, a block's channel count): a deploy restarts it."""

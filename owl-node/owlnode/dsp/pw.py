@@ -1,6 +1,6 @@
 """The hub's PipeWire graph through the command-line tools (pw-dump, pw-link, pw-cli): nodes, ports and links as
 plain dicts, and the three operations the deployer needs (link, unlink, set a filter control)."""
-import json, subprocess, threading, time
+import json, re, subprocess, threading, time
 from collections import deque
 
 
@@ -138,36 +138,97 @@ class PwCtl:
     `pw-cli` process per control (~4 ms each, plus a full pw-dump to find the node: ~10 ms on an idle graph, far more on
     a busy hub). A fader move or a fade step is a line written to a pipe. pw-cli answers each command by printing the
     node's Props; a reader thread drains that and keeps the errors it reports (asynchronous, not tied to one command).
-    If pw-cli cannot run, every set falls back to a one-shot `pw-cli set-param`."""
+    If pw-cli cannot run, every set falls back to a one-shot `pw-cli set-param`.
+
+    pw-cli learns the graph's objects from registry events that arrive AFTER it starts reading commands, so a
+    `set-param` written to a fresh pw-cli fails with "unknown global" (2026-11-14: the first control after a hub boot,
+    a preset recall from Home Assistant, was dropped while the design recorded it as applied). So the first set to a
+    node in each pw-cli waits until `info <id>` finds it there; a node it never finds goes to the one-shot command,
+    which does its own round trip and reports a real failure."""
     NOISE = ("unsupported type",)                 # what pw-cli prints at start-up for object types it does not know
+    PROBE_S = 1.5                                 # how long a fresh pw-cli gets to learn a node (the burst takes ~5-150 ms)
+    _ID = re.compile(r"^\s*id: (\d+)\s*$")
+    _GONE = re.compile(r"removed global:\s*id (\d+)\b")
 
     def __init__(self, argv=("pw-cli",)):
         self.argv, self.p, self.lock = list(argv), None, threading.Lock()
         self.errors, self.error_seq, self.sent, self.restarts, self.fallback = deque(maxlen=20), 0, 0, 0, False
+        self.known = set()                        # node ids this pw-cli has answered `info` for
+        self.probes = self.probe_waits = 0
+        self._probe_id, self._probe_ok, self._probe_ev = None, False, threading.Event()
 
     def _start(self):
+        self.known = set()
         self.p = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, bufsize=1, start_new_session=True)
         threading.Thread(target=self._drain, args=(self.p,), daemon=True, name="pw-cli").start()
 
+    def _error(self, msg):
+        self.errors.append((time.time(), msg[:200]))
+        self.error_seq += 1
+
     def _drain(self, p):
         try:
             for line in p.stdout:
+                probe = self._probe_id
+                m = self._ID.match(line)
+                if m:
+                    if probe is not None and int(m.group(1)) == probe:
+                        self._probe_ok = True
+                        self._probe_ev.set()
+                    continue
+                if "info: unknown global" in line:
+                    if probe is not None and f"'{probe}'" in line:
+                        self._probe_ok = False
+                        self._probe_ev.set()
+                    continue                      # our own probe asking too early: not an error
+                m = self._GONE.search(line)
+                if m:
+                    self.known.discard(int(m.group(1)))
+                    continue
                 if "rror" in line and not any(n in line for n in self.NOISE):
-                    self.errors.append((time.time(), line.strip()[:200]))
-                    self.error_seq += 1
+                    self._error(line.strip())
         except (OSError, ValueError):
             pass
+
+    def _knows(self, node_id):
+        """Caller holds self.lock and pw-cli runs. -> True once this pw-cli has the node in its registry."""
+        if node_id in self.known:
+            return True
+        self.probes += 1
+        deadline = time.monotonic() + self.PROBE_S
+        tries = 0
+        while time.monotonic() < deadline:
+            self._probe_ok = False
+            self._probe_ev.clear()
+            self._probe_id = node_id
+            try:
+                self.p.stdin.write(f"info {node_id}\n")
+                self.p.stdin.flush()
+            except (OSError, ValueError):
+                break
+            got = self._probe_ev.wait(max(0.0, min(0.5, deadline - time.monotonic())))
+            self._probe_id = None
+            if got and self._probe_ok:
+                self.known.add(node_id)
+                self.probe_waits += tries > 0
+                return True
+            tries += 1
+            time.sleep(0.02)
+        self._probe_id = None
+        return False
 
     def running(self):
         return self.p is not None and self.p.poll() is None
 
     def set(self, node_id, pairs):
-        """pairs: [(control name, value)] of one node, sent as one set-param. -> True when sent."""
+        """pairs: [(control name, value)] of one node, sent as one set-param. -> True when sent (a one-shot that
+        failed -> False)."""
         if not pairs:
             return True
+        node_id = int(node_id)
         body = " ".join(f'"{c}" {_fmt(v)}' for c, v in pairs)
-        line = f"set-param {int(node_id)} Props {{ params = [ {body} ] }}\n"
+        line = f"set-param {node_id} Props {{ params = [ {body} ] }}\n"
         with self.lock:
             for attempt in (0, 1):
                 if not self.fallback and not self.running():
@@ -179,6 +240,11 @@ class PwCtl:
                         self.fallback = True
                 if self.fallback:
                     break
+                if not self._knows(node_id):
+                    if not self.running():
+                        self.p = None
+                        continue          # it died while we waited: start a new one once
+                    break                 # it never learned the node: the one-shot below gives the real answer
                 try:
                     self.p.stdin.write(line)
                     self.p.stdin.flush()
@@ -186,13 +252,20 @@ class PwCtl:
                     return True
                 except (OSError, ValueError):
                     self.p = None                  # it died between the check and the write: start a new one once
-        r = subprocess.run(["pw-cli", "set-param", str(int(node_id)), "Props", f"{{ params = [ {body} ] }}"],
+        r = subprocess.run(["pw-cli", "set-param", str(node_id), "Props", f"{{ params = [ {body} ] }}"],
                            capture_output=True, text=True, timeout=5)
-        self.sent += r.returncode == 0
-        return r.returncode == 0
+        # pw-cli exits 0 even when it prints `Error: "set-param: unknown global ..."`: judge by what it says
+        errs = [ln.strip() for ln in ((r.stdout or "") + (r.stderr or "")).splitlines()
+                if "rror" in ln and not any(n in ln for n in self.NOISE)]
+        if r.returncode == 0 and not errs:
+            self.sent += 1
+            return True
+        self._error(errs[-1] if errs else f"set-param {node_id}: pw-cli exited {r.returncode}")
+        return False
 
     def status(self):
         return {"running": self.running(), "sent": self.sent, "restarts": self.restarts, "fallback": self.fallback,
+                "probes": self.probes, "probe_waits": self.probe_waits,
                 "errors": [e for _, e in list(self.errors)[-3:]]}
 
     def stop(self):
